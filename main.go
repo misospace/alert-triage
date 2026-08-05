@@ -112,34 +112,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if cfg.WebhookToken != "" && r.Header.Get("X-Webhook-Token") != cfg.WebhookToken {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		defer r.Body.Close()
-		var p Payload
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&p); err != nil {
-			logf("webhook: decode: %v", err)
-			http.Error(w, "bad payload", http.StatusBadRequest)
-			return
-		}
-		firing := p.Alerts[:0]
-		for _, a := range p.Alerts {
-			if a.Status != "resolved" {
-				firing = append(firing, a)
-			}
-		}
-		if len(firing) > 0 {
-			buf.add(firing)
-		}
-		// Ack immediately; Alertmanager should never block on triage work.
-		w.WriteHeader(http.StatusAccepted)
-	})
+	mux.HandleFunc("/webhook", handleWebhook(cfg, buf))
 
 	go runFlushLoop(cfg, buf, k, hist)
 	go runCompactLoop(hist)
@@ -195,6 +168,40 @@ func process(cfg Config, alerts []Alert, k *kube, hist *History) {
 		if err := Deliver(cfg, r); err != nil {
 			logf("deliver %s: %v", g.Key, err)
 		}
+	}
+}
+
+// handleWebhook returns an HTTP handler for the /webhook endpoint.
+// It validates the shared secret (if configured), decodes the Alertmanager
+// payload, filters to firing alerts only, and buffers them for correlation.
+func handleWebhook(cfg Config, buf *buffer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if cfg.WebhookToken != "" && r.Header.Get("X-Webhook-Token") != cfg.WebhookToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		defer r.Body.Close()
+		var p Payload
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&p); err != nil {
+			logf("webhook: decode: %v", err)
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+		firing := p.Alerts[:0]
+		for _, a := range p.Alerts {
+			if a.Status != "resolved" {
+				firing = append(firing, a)
+			}
+		}
+		if len(firing) > 0 {
+			buf.add(firing)
+		}
+		// Ack immediately; Alertmanager should never block on triage work.
+		w.WriteHeader(http.StatusAccepted)
 	}
 }
 
