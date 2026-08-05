@@ -99,16 +99,33 @@ func (r *recent) snapshot() []DigestRecord {
 type buffer struct {
 	mu      sync.Mutex
 	alerts  []Alert
+	seen    map[string]bool
 	firstAt time.Time
 }
 
+// add buffers alerts that are not already in the window. Alertmanager re-sends
+// a firing group whenever its membership changes, and retries on failure, so
+// the same alert can arrive several times before the window closes. Ingesting
+// each copy duplicates its bullet in the digest and inflates every count the
+// operator reads, including "processing N alerts into M groups". The first
+// copy is kept, so StartsAt stays the one correlation windowing expects.
 func (b *buffer) add(alerts []Alert) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.alerts) == 0 {
 		b.firstAt = time.Now()
 	}
-	b.alerts = append(b.alerts, alerts...)
+	if b.seen == nil {
+		b.seen = make(map[string]bool, len(alerts))
+	}
+	for _, a := range alerts {
+		id := a.identity()
+		if b.seen[id] {
+			continue
+		}
+		b.seen[id] = true
+		b.alerts = append(b.alerts, a)
+	}
 }
 
 // take returns the buffered alerts if the window is due, clearing the buffer.
@@ -123,7 +140,7 @@ func (b *buffer) take(now time.Time, flushDelay, maxWindow time.Duration) []Aler
 		return nil
 	}
 	out := b.alerts
-	b.alerts = nil
+	b.alerts, b.seen = nil, nil
 	return out
 }
 
