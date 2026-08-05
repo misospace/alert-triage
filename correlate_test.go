@@ -42,7 +42,7 @@ func TestCorrelateEmpty(t *testing.T) {
 
 func TestSignatureGroupsStorageAcrossNamespaces(t *testing.T) {
 	alerts := []Alert{
-		alert("NFSMountFailed", "media", "critical", 0, "nfs export voyager unreachable"),
+		alert("NFSMountFailed", "media", "critical", 0, "nfs export unreachable"),
 		alert("PodCrashLooping", "downloads", "warning", time.Minute, "volume mount failed"),
 		alert("KubePersistentVolumeErrors", "llm", "warning", 2*time.Minute, "pvc pending"),
 		alert("LiteLLMHighLatency", "llm", "warning", time.Minute, "p99 latency high"),
