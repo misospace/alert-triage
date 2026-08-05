@@ -92,13 +92,66 @@ func TestBufferFlushDelay(t *testing.T) {
 func TestBufferMultipleItems(t *testing.T) {
 	b := &buffer{}
 	b.firstAt = time.Now().Add(-1 * time.Second)
-	for i := 0; i < 5; i++ {
-		b.add([]Alert{{Fingerprint: "a"}})
+	for _, fp := range []string{"a", "b", "c", "d", "e"} {
+		b.add([]Alert{{Fingerprint: fp}})
 	}
 
 	got := b.take(time.Now(), 0, 10*time.Second)
 	if len(got) != 5 {
 		t.Errorf("expected 5 alerts, got %d", len(got))
+	}
+}
+
+// Alertmanager re-sends a firing group on every membership change, so the same
+// fingerprint arrives repeatedly inside one window. Each copy used to be
+// buffered, duplicating the alert in the digest and inflating group counts.
+func TestBufferDedupesRepeatDeliveries(t *testing.T) {
+	b := &buffer{}
+	first := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+
+	b.add([]Alert{{Fingerprint: "dup", StartsAt: first}, {Fingerprint: "other", StartsAt: first}})
+	b.add([]Alert{{Fingerprint: "dup", StartsAt: first.Add(10 * time.Minute)}})
+	b.firstAt = time.Now().Add(-time.Second)
+
+	got := b.take(time.Now(), 0, 10*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 alerts after dedup, got %d", len(got))
+	}
+	if !got[0].StartsAt.Equal(first) {
+		t.Errorf("StartsAt = %v, want the first occurrence %v", got[0].StartsAt, first)
+	}
+}
+
+// A window that has been taken starts clean, or an alert that fires again an
+// hour later would be dropped as a duplicate of the one already reported.
+func TestBufferDedupeResetsAfterTake(t *testing.T) {
+	b := &buffer{}
+	b.add([]Alert{{Fingerprint: "a"}})
+	b.firstAt = time.Now().Add(-time.Second)
+	if got := b.take(time.Now(), 0, 10*time.Second); len(got) != 1 {
+		t.Fatalf("expected 1 alert in the first window, got %d", len(got))
+	}
+
+	b.add([]Alert{{Fingerprint: "a"}})
+	b.firstAt = time.Now().Add(-time.Second)
+	if got := b.take(time.Now(), 0, 10*time.Second); len(got) != 1 {
+		t.Errorf("expected the alert again in a later window, got %d", len(got))
+	}
+}
+
+// Replayed and hand-built payloads often carry no fingerprint. Falling back to
+// the labels keeps unrelated alerts apart while still collapsing real copies.
+func TestBufferDedupesWithoutFingerprints(t *testing.T) {
+	mk := func(name string) Alert {
+		return Alert{Labels: map[string]string{"alertname": name, "namespace": "llm"}}
+	}
+	b := &buffer{}
+	b.add([]Alert{mk("A"), mk("B"), mk("A")})
+	b.firstAt = time.Now().Add(-time.Second)
+
+	got := b.take(time.Now(), 0, 10*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 distinct alerts, got %d", len(got))
 	}
 }
 

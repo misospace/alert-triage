@@ -122,6 +122,31 @@ func TestEveryAlertLandsInExactlyOneGroup(t *testing.T) {
 	}
 }
 
+// Claiming used to compare fingerprints, so alerts sharing one — copies, or a
+// replayed payload where every fingerprint is empty — could be marked claimed
+// without joining a group, and then went unreported entirely.
+func TestAlertExcludedForNoOverlapIsStillReported(t *testing.T) {
+	strip := func(a Alert) Alert { a.Fingerprint = ""; return a }
+	alerts := []Alert{
+		strip(alert("A", "llm", "warning", 0)),
+		strip(alert("B", "llm", "warning", time.Minute)),
+		strip(alert("C", "llm", "warning", 6*time.Hour)),
+	}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	seen := map[string]int{}
+	for _, g := range groups {
+		for _, a := range g.Alerts {
+			seen[a.name()]++
+		}
+	}
+	for _, name := range []string{"A", "B", "C"} {
+		if seen[name] != 1 {
+			t.Errorf("%s appeared in %d groups, want exactly 1", name, seen[name])
+		}
+	}
+}
+
 func TestSignatureIsStableAcrossFirings(t *testing.T) {
 	mk := func(offset time.Duration) Group {
 		return Correlate([]Alert{

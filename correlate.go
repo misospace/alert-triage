@@ -29,6 +29,30 @@ func (a Alert) name() string      { return a.Labels["alertname"] }
 func (a Alert) namespace() string { return alertNamespace(a) }
 func (a Alert) severity() string  { return a.Labels["severity"] }
 
+// identity distinguishes one alert from another. Alertmanager sends a
+// fingerprint, but replayed and hand-built payloads routinely omit it, and an
+// empty fingerprint shared by every alert would make unrelated alerts look like
+// copies of one. Fall back to the labels, which are what a fingerprint hashes.
+func (a Alert) identity() string {
+	if a.Fingerprint != "" {
+		return a.Fingerprint
+	}
+	keys := make([]string, 0, len(a.Labels))
+	for k := range a.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(a.Labels[k])
+		b.WriteString("\x00")
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return "labels:" + hex.EncodeToString(sum[:8])
+}
+
 // Group is a set of alerts believed to share a root cause.
 type Group struct {
 	Key        string
@@ -157,25 +181,22 @@ func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack
 			continue
 		}
 		var members []Alert
+		var chosen []int
 		for i, a := range alerts {
 			if !claimed[i] && sig.Scope(*trigger, a) {
-				claimed[i] = true
 				members = append(members, a)
+				chosen = append(chosen, i)
 			}
 		}
 		// A signature that matched only its own trigger explains nothing, so
 		// leave the alert for a later rule rather than reporting a one-alert
-		// "root cause".
+		// "root cause". Claiming happens only once the group is kept, so there
+		// is nothing to undo.
 		if len(members) > 1 {
-			groups = append(groups, newGroup("signature/"+sig.Name, sig.Reason, members, nodeOf))
-		} else {
-			for i := range alerts {
-				for _, m := range members {
-					if alerts[i].Fingerprint == m.Fingerprint {
-						claimed[i] = false
-					}
-				}
+			for _, i := range chosen {
+				claimed[i] = true
 			}
+			groups = append(groups, newGroup("signature/"+sig.Name, sig.Reason, members, nodeOf))
 		}
 	}
 
@@ -226,21 +247,22 @@ func groupBy(alerts []Alert, claimed []bool, slack time.Duration, kind string, n
 			continue
 		}
 		var members []Alert
+		var chosen []int
 		for _, i := range idx {
 			if len(members) > 0 && !overlaps(members[0], alerts[i], slack) {
 				continue
 			}
 			members = append(members, alerts[i])
+			chosen = append(chosen, i)
 		}
 		if len(members) < 2 {
 			continue
 		}
-		for _, i := range idx {
-			for _, m := range members {
-				if alerts[i].Fingerprint == m.Fingerprint {
-					claimed[i] = true
-				}
-			}
+		// Claim by index, not by fingerprint: an alert excluded above for not
+		// overlapping must stay unclaimed so a later rule or the isolated-alert
+		// fallback still reports it.
+		for _, i := range chosen {
+			claimed[i] = true
 		}
 		out = append(out, newGroup(kind+"/"+k, "Alerts share "+kind+" "+k+" within one window", members, nodeOf))
 	}
