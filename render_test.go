@@ -63,3 +63,25 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 		t.Error("evidence block still implies nothing was checked")
 	}
 }
+
+// Ambient context must be fenced off from findings. A digest once ended with
+// "dozens of PVs are attached to node eula, so if any model backends run there
+// it is worth verifying" - a coincidence offered as a cause.
+func TestAmbientContextIsFencedOff(t *testing.T) {
+	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
+	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{
+		Scope:   "cluster-wide",
+		Ambient: []string{"VolumeFailedDelete PersistentVolume/pvc-123: still attached to node eula"},
+	}})
+
+	if !strings.Contains(out, "BACKGROUND") {
+		t.Fatalf("ambient items must be under their own heading:\n%s", out)
+	}
+	if !strings.Contains(out, "NOT known to involve the alert") {
+		t.Error("ambient section must disclaim relevance")
+	}
+	idx := strings.Index(out, "BACKGROUND")
+	if strings.Index(out, "node eula") < idx {
+		t.Error("ambient item leaked into the findings section")
+	}
+}

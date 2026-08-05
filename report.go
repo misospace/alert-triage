@@ -43,6 +43,11 @@ Rules:
   do not pad.
 - Name a cause only where the evidence or the alert supports one. If several are
   plausible, give the likeliest and say what would distinguish them.
+- Anything under BACKGROUND is unrelated noise until proven otherwise. Never
+  speculate that it might be connected, and never write a sentence of the form
+  "if X also runs there, it may be worth checking". Mention it only when it
+  names the same resource, node or namespace as the alert - and then say plainly
+  that it does. Otherwise leave it out entirely.
 - If a Flux resource reconciled or went NotReady near the alert, say so - a
   recent deploy is the first thing worth ruling out.
 - No preamble, no bullet points, no markdown headers. Plain prose only.`
@@ -154,6 +159,16 @@ func renderEvidence(r Report) string {
 	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
 	writeFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.RecentChanges, "no reconciles or failures in the window, so a recent deploy is unlikely")
+
+	if len(r.Enrichment.Ambient) > 0 {
+		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
+		b.WriteString("This is NOT known to involve the alert above. A homelab always has\n")
+		b.WriteString("unrelated noise in flight; do not offer any of it as a cause unless it\n")
+		b.WriteString("names the same resource, node or namespace as the alert.\n")
+		for _, s := range r.Enrichment.Ambient {
+			fmt.Fprintf(&b, "- %s\n", s)
+		}
+	}
 	return b.String()
 }
 
@@ -262,6 +277,7 @@ func Deliver(cfg Config, r Report) error {
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
+	writeDiscordSection(&desc, "Elsewhere in the cluster (may be unrelated)", r.Enrichment.Ambient)
 
 	embed := discordEmbed{
 		Title:       r.Group.Title(),

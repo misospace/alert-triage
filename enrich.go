@@ -148,6 +148,10 @@ type Enrichment struct {
 	UnhealthyPods []string
 	Events        []string
 	RecentChanges []string
+	// Ambient is cluster-wide context gathered when the alert names no subject
+	// to scope to. It is NOT known to concern the alert, and is kept apart so a
+	// coincidence is not read as a cause.
+	Ambient []string
 	// Scope records what was actually inspected, so the narrative can
 	// distinguish "nothing is wrong" from "nothing was looked at".
 	Scope string
@@ -155,7 +159,7 @@ type Enrichment struct {
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.Events) == 0 && len(e.RecentChanges) == 0
+		len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -221,16 +225,20 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	}
 	since := time.Now().Add(-window)
 
+	// Node health is reported as a direct finding regardless of scope: a node in
+	// trouble plausibly explains almost any alert, and healthy nodes rule that out.
 	e.Nodes = k.unhealthyNodes()
-	e.RecentChanges = append(e.RecentChanges, k.fluxNotReady("", since)...)
 
 	if len(g.Namespaces) == 0 {
-		// Nothing namespace-scoped to look at, so widen to recent cluster-wide
-		// warnings rather than reporting no evidence.
-		e.Events = append(e.Events, k.warningEvents("", since)...)
-		e.Scope = "cluster-wide (alert carries no namespace)"
+		// Nothing namespace-scoped to inspect, so widen to the whole cluster
+		// rather than reporting no evidence. What comes back is context, not
+		// findings about this alert, and is kept separate so it cannot be
+		// mistaken for one.
+		e.Ambient = append(e.Ambient, k.warningEvents("", since)...)
+		e.Ambient = append(e.Ambient, k.fluxNotReady("", since)...)
+		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
 	} else {
-		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster state"
+		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
 	}
 
 	for _, ns := range g.Namespaces {
@@ -264,12 +272,14 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 		}
 
 		e.Events = append(e.Events, k.warningEvents(esc, since)...)
+		e.RecentChanges = append(e.RecentChanges, k.fluxNotReady(esc, since)...)
 	}
 
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.Events = capList(dedupe(e.Events), 8)
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
+	e.Ambient = capList(dedupe(e.Ambient), 6)
 	return e
 }
 
