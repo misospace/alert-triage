@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -28,6 +29,14 @@ Rules:
 - Never comment on your own limitations. Do not say you did not check the
   cluster, cannot access it, or lack information. The evidence below IS the
   check. If it is thin, reason from the alert itself instead.
+- An alert name uses the vocabulary of whatever emitted it, which is often not
+  Kubernetes. Read the labels and annotation before assuming a word means the
+  Kubernetes object of the same name: "deployment" may mean an upstream routing
+  target, "node" a database member, "cluster" an application's own cluster. The
+  labels say which subject is meant - trust them over the name.
+- Alerts from an application concern that application's internal state, not the
+  health of the pods running it. Do not infer that a workload is down because it
+  reported a fault in something it manages.
 - "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
   Use them to rule causes out.
 - Some alerts are self-describing. Restate what it means operationally and stop;
@@ -135,6 +144,9 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, ": %s", s)
 		}
 		b.WriteString("\n")
+		if l := contextLabels(a); l != "" {
+			fmt.Fprintf(&b, "  labels: %s\n", l)
+		}
 	}
 
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
@@ -163,6 +175,34 @@ func orUnknown(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// boilerplateLabels carry no meaning for a reader; everything else is shown,
+// because the label that disambiguates an alert is often domain-specific
+// (litellm_model_name, device, mountpoint) and cannot be enumerated up front.
+var boilerplateLabels = map[string]bool{
+	"alertname": true, "severity": true, "prometheus": true, "__name__": true,
+	"endpoint": true, "container": true, "pod_template_hash": true,
+	"prometheus_replica": true, "service": true,
+}
+
+// contextLabels renders the labels that help interpret an alert. Without these
+// the model sees only the alert name, and alert names use the vocabulary of
+// whatever emitted them rather than Kubernetes'.
+func contextLabels(a Alert) string {
+	keys := make([]string, 0, len(a.Labels))
+	for k, v := range a.Labels {
+		if v == "" || boilerplateLabels[k] {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+a.Labels[k])
+	}
+	return strings.Join(parts, " ")
 }
 
 func firstAnnotation(a Alert) string {

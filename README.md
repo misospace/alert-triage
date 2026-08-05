@@ -67,3 +67,18 @@ Read-only, cluster-wide: `pods` and `events` in `""`, `helmreleases` in
 
 - `POST /webhook` — Alertmanager receiver
 - `GET /healthz` — liveness
+- `GET /recent` — the last 20 delivered digests as JSON, including the evidence
+  the model was given and the narrative it wrote
+
+## Reviewing what it said
+
+Judging triage quality means reading the narratives, which otherwise only exist
+in a chat client. Two ways to get at them without one:
+
+```sh
+kubectl port-forward -n observability svc/alert-triage 8080:8080
+curl -s localhost:8080/recent | jq '.[] | {key, title, narrative}'
+```
+
+Each digest is also logged as a single line (`digest <key> [severity] <title> |
+<narrative>`), so the history survives a restart wherever logs are shipped.

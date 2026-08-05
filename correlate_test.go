@@ -151,3 +151,66 @@ func TestTitleSummarisesMultiple(t *testing.T) {
 		t.Errorf("want 'A +1 more', got %q", got)
 	}
 }
+
+// Regression: the node signature once triggered on any alert whose text merely
+// contained "node" (KubePodNotReady, CephNodeDiskspaceWarning) and then scoped
+// to everything, fusing an entire window of unrelated alerts into one incident.
+// Replays the shape of a real 24h window.
+func TestNoSignatureSwallowsUnrelatedAlerts(t *testing.T) {
+	alerts := []Alert{
+		alert("KubePodNotReady", "media", "warning", 0),
+		alert("CephNodeDiskspaceWarning", "observability", "warning", time.Minute),
+		alert("etcdDatabaseHighFragmentationRatio", "kube-system", "warning", time.Minute),
+		alert("TalosUpgradeStuck", "kube-tools", "warning", 2*time.Minute),
+		alert("LiteLLMDeploymentOutage", "", "warning", 2*time.Minute),
+	}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	for _, g := range groups {
+		if len(g.Alerts) > 2 {
+			t.Errorf("group %s fused %d unrelated alerts: %s", g.Key, len(g.Alerts), g.Title())
+		}
+	}
+	if len(groups) < 4 {
+		t.Errorf("expected these alerts to stay mostly separate, got %d groups", len(groups))
+	}
+}
+
+// A node signature must key on the node label, not on the word "node".
+func TestNodeSignatureScopesToItsNode(t *testing.T) {
+	a := alert("KubeNodeNotReady", "", "critical", 0, "node not ready")
+	a.Labels["node"] = "node-a"
+	b := alert("KubePodCrashLooping", "llm", "warning", time.Minute)
+	b.Labels["node"] = "node-a"
+	c := alert("KubePodCrashLooping", "media", "warning", time.Minute)
+	c.Labels["node"] = "node-b"
+
+	groups := Correlate([]Alert{a, b, c}, nil, DefaultSignatures(), 5*time.Minute)
+	g := groupFor(t, groups, a.Fingerprint)
+	if g.Key != "signature/node" {
+		t.Fatalf("want signature/node, got %s", g.Key)
+	}
+	if len(g.Alerts) != 2 {
+		t.Errorf("want only same-node alerts grouped, got %d", len(g.Alerts))
+	}
+	for _, m := range g.Alerts {
+		if m.Fingerprint == c.Fingerprint {
+			t.Error("alert from a different node was pulled in")
+		}
+	}
+}
+
+// The same alert across namespaces is one story about a shared cause.
+func TestSameAlertAcrossNamespacesGroups(t *testing.T) {
+	var alerts []Alert
+	for i, ns := range []string{"media", "downloads", "storage", "llm"} {
+		alerts = append(alerts, alert("KubeHpaMaxedOut", ns, "warning", time.Duration(i)*time.Minute))
+	}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("want 1 group for one alert across namespaces, got %d", len(groups))
+	}
+	if groups[0].Key != "alert/KubeHpaMaxedOut" {
+		t.Errorf("want alert/KubeHpaMaxedOut, got %s", groups[0].Key)
+	}
+}

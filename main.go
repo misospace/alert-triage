@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,6 +43,51 @@ func loadConfig() Config {
 		Retention:      envDuration("RETENTION", 7*24*time.Hour),
 		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
 	}
+}
+
+// recent keeps the last few delivered digests in memory so they can be read
+// back over HTTP. Reviewing what the model actually wrote is the only way to
+// judge triage quality, and requiring a human to relay it out of a chat client
+// makes that loop slow and lossy.
+type recent struct {
+	mu    sync.Mutex
+	max   int
+	items []DigestRecord
+}
+
+// DigestRecord is one delivered digest, as served by /recent.
+type DigestRecord struct {
+	At         time.Time `json:"at"`
+	Key        string    `json:"key"`
+	Title      string    `json:"title"`
+	Severity   string    `json:"severity"`
+	Alerts     []string  `json:"alerts"`
+	PriorSeen  int       `json:"prior_seen"`
+	Narrative  string    `json:"narrative"`
+	Evidence   string    `json:"evidence"`
+	Delivered  bool      `json:"delivered"`
+	DeliverErr string    `json:"deliver_error,omitempty"`
+}
+
+func (r *recent) add(d DigestRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items = append(r.items, d)
+	if len(r.items) > r.max {
+		r.items = r.items[len(r.items)-r.max:]
+	}
+}
+
+// snapshot returns the records newest first, since the reason to open this
+// endpoint is nearly always the digest that just arrived.
+func (r *recent) snapshot() []DigestRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]DigestRecord, 0, len(r.items))
+	for i := len(r.items) - 1; i >= 0; i-- {
+		out = append(out, r.items[i])
+	}
+	return out
 }
 
 // buffer accumulates alerts so that a cascade is reported as one incident
@@ -93,11 +139,20 @@ func main() {
 	}
 
 	buf := &buffer{}
+	seen := &recent{max: 20}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/recent", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(seen.snapshot()); err != nil {
+			logf("recent: encode: %v", err)
+		}
 	})
 	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -124,7 +179,7 @@ func main() {
 		w.WriteHeader(http.StatusAccepted)
 	})
 
-	go runFlushLoop(cfg, buf, k, hist)
+	go runFlushLoop(cfg, buf, k, hist, seen)
 	go runCompactLoop(hist)
 
 	srv := &http.Server{
@@ -135,7 +190,7 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func runFlushLoop(cfg Config, buf *buffer, k *kube, hist *History) {
+func runFlushLoop(cfg Config, buf *buffer, k *kube, hist *History, seen *recent) {
 	// Poll well inside the flush delay so the window is honoured rather than
 	// rounded up to the tick.
 	interval := cfg.FlushDelay / 4
@@ -152,7 +207,7 @@ func runFlushLoop(cfg Config, buf *buffer, k *kube, hist *History) {
 		if len(alerts) == 0 {
 			continue
 		}
-		process(cfg, alerts, k, hist)
+		process(cfg, alerts, k, hist, seen)
 	}
 }
 
@@ -166,7 +221,7 @@ func runCompactLoop(hist *History) {
 	}
 }
 
-func process(cfg Config, alerts []Alert, k *kube, hist *History) {
+func process(cfg Config, alerts []Alert, k *kube, hist *History, seen *recent) {
 	nodeOf := k.ResolveNodes(alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
 	log.Printf("processing %d alerts into %d group(s)", len(alerts), len(groups))
@@ -175,9 +230,22 @@ func process(cfg Config, alerts []Alert, k *kube, hist *History) {
 		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		r.Narrative = Narrate(cfg, r)
-		if err := Deliver(cfg, r); err != nil {
-			logf("deliver %s: %v", g.Key, err)
+
+		rec := DigestRecord{
+			At: time.Now(), Key: g.Key, Title: g.Title(), Severity: g.Severity(),
+			PriorSeen: r.PriorSeen, Narrative: r.Narrative, Evidence: renderEvidence(r),
 		}
+		for _, a := range g.Alerts {
+			rec.Alerts = append(rec.Alerts, a.name())
+		}
+		if err := Deliver(cfg, r); err != nil {
+			rec.DeliverErr = err.Error()
+			logf("deliver %s: %v", g.Key, err)
+		} else {
+			rec.Delivered = true
+		}
+		seen.add(rec)
+		log.Printf("digest %s [%s] %s | %s", g.Key, g.Severity(), g.Title(), oneLine(r.Narrative))
 	}
 }
 
@@ -201,6 +269,19 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	logf("bad duration for %s=%q, using %s", key, v, fallback)
 	return fallback
+}
+
+// oneLine flattens a narrative for the log, where it doubles as the record of
+// what was actually said when the pod is later restarted.
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 400 {
+		return s[:400] + "..."
+	}
+	if s == "" {
+		return "(no narrative)"
+	}
+	return s
 }
 
 func logf(format string, args ...any) {

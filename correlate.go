@@ -38,14 +38,19 @@ type Group struct {
 	Alerts     []Alert
 }
 
-// Signature is a known failure mode: when trigger matches an alert, every alert
-// in the window matching scope is pulled into the same group. These encode
-// root causes that label-matching alone cannot infer.
+// Signature is a known failure mode: when Trigger matches an alert, every other
+// alert that Scope accepts joins the same group. These encode root causes that
+// label matching alone cannot infer.
+//
+// Scope receives the alert that triggered the signature so it can bound itself
+// to that subject. A scope that ignores the trigger and accepts everything will
+// swallow a whole window of unrelated alerts, which is exactly what the first
+// version of the node signature did.
 type Signature struct {
 	Name    string
 	Reason  string
 	Trigger func(Alert) bool
-	Scope   func(Alert) bool
+	Scope   func(trigger, candidate Alert) bool
 }
 
 func labelContains(a Alert, key, substr string) bool {
@@ -69,33 +74,46 @@ func DefaultSignatures() []Signature {
 			textContains(a, "pvc") || textContains(a, "persistentvolume") ||
 			labelContains(a, "alertname", "ceph")
 	}
+	ignoreTrigger := func(f func(Alert) bool) func(Alert, Alert) bool {
+		return func(_, candidate Alert) bool { return f(candidate) }
+	}
 	return []Signature{
 		{
 			Name:    "nfs",
 			Reason:  "NFS export unreachable; dependent workloads fail to mount",
 			Trigger: func(a Alert) bool { return textContains(a, "nfs") },
-			Scope:   storage,
+			Scope:   ignoreTrigger(storage),
 		},
 		{
 			Name:    "ceph",
 			Reason:  "Ceph degraded; RWO/RWX consumers stall on IO",
 			Trigger: func(a Alert) bool { return labelContains(a, "alertname", "ceph") },
-			Scope:   storage,
+			Scope:   ignoreTrigger(storage),
 		},
 		{
-			Name:    "node",
-			Reason:  "Node unhealthy; its workloads are collateral",
-			Trigger: func(a Alert) bool { return textContains(a, "notready") || textContains(a, "node") },
-			Scope:   func(a Alert) bool { return true },
+			// Only a genuine node-health alert triggers this, and only alerts on
+			// the same node are collateral. Matching on the word "node" anywhere
+			// caught KubePodNotReady and CephNodeDiskspaceWarning, and an
+			// unbounded scope then absorbed every other alert in the window.
+			Name:   "node",
+			Reason: "Node unhealthy; workloads on it are collateral",
+			Trigger: func(a Alert) bool {
+				return a.Labels["node"] != "" &&
+					(textContains(a, "kubenode") || textContains(a, "node not ready") ||
+						textContains(a, "nodenotready") || textContains(a, "node unreachable"))
+			},
+			Scope: func(trigger, candidate Alert) bool {
+				return candidate.Labels["node"] == trigger.Labels["node"]
+			},
 		},
 		{
 			Name:    "dns",
 			Reason:  "DNS resolution failing; unrelated services report connection errors",
 			Trigger: func(a Alert) bool { return textContains(a, "dns") || textContains(a, "coredns") },
-			Scope: func(a Alert) bool {
+			Scope: ignoreTrigger(func(a Alert) bool {
 				return textContains(a, "dns") || textContains(a, "connection") ||
 					textContains(a, "timeout") || textContains(a, "unreachable")
-			},
+			}),
 		},
 	}
 }
@@ -128,30 +146,46 @@ func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack
 	var groups []Group
 
 	for _, sig := range sigs {
-		triggered := false
-		for i, a := range alerts {
-			if !claimed[i] && sig.Trigger(a) {
-				triggered = true
+		var trigger *Alert
+		for i := range alerts {
+			if !claimed[i] && sig.Trigger(alerts[i]) {
+				trigger = &alerts[i]
 				break
 			}
 		}
-		if !triggered {
+		if trigger == nil {
 			continue
 		}
 		var members []Alert
 		for i, a := range alerts {
-			if !claimed[i] && sig.Scope(a) {
+			if !claimed[i] && sig.Scope(*trigger, a) {
 				claimed[i] = true
 				members = append(members, a)
 			}
 		}
-		if len(members) > 0 {
+		// A signature that matched only its own trigger explains nothing, so
+		// leave the alert for a later rule rather than reporting a one-alert
+		// "root cause".
+		if len(members) > 1 {
 			groups = append(groups, newGroup("signature/"+sig.Name, sig.Reason, members, nodeOf))
+		} else {
+			for i := range alerts {
+				for _, m := range members {
+					if alerts[i].Fingerprint == m.Fingerprint {
+						claimed[i] = false
+					}
+				}
+			}
 		}
 	}
 
 	groups = append(groups, groupBy(alerts, claimed, slack, "node", nodeOf, func(a Alert) string {
 		return nodeOf[a.Fingerprint]
+	})...)
+	// The same alert firing across several namespaces is one story about a
+	// shared cause, not one story per namespace.
+	groups = append(groups, groupBy(alerts, claimed, slack, "alert", nodeOf, func(a Alert) string {
+		return a.name()
 	})...)
 	groups = append(groups, groupBy(alerts, claimed, slack, "namespace", nodeOf, func(a Alert) string {
 		return a.namespace()
