@@ -283,7 +283,6 @@ func Deliver(cfg Config, r Report) error {
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
-	writeDiscordSection(&desc, "Elsewhere in the cluster (may be unrelated)", r.Enrichment.Ambient)
 
 	embed := discordEmbed{
 		Title:       r.Group.Title(),

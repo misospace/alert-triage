@@ -85,3 +85,20 @@ func TestAmbientContextIsFencedOff(t *testing.T) {
 		t.Error("ambient item leaked into the findings section")
 	}
 }
+
+// A single stuck condition emits the same event against dozens of objects.
+// A digest once listed 43 VolumeFailedDelete lines and 157 Flux reconciles for
+// an alert about an upstream API quota.
+func TestRepeatedEventsCollapse(t *testing.T) {
+	var items []string
+	for i := 0; i < 43; i++ {
+		items = append(items, "VolumeFailedDelete x43 on PersistentVolume (e.g. pvc-2b8b): still attached to node eula")
+	}
+	got := capList(dedupe(items), 5)
+	if len(got) != 1 {
+		t.Fatalf("identical events must collapse to one line, got %d", len(got))
+	}
+	if !strings.Contains(got[0], "x43") {
+		t.Errorf("collapsed line should carry the count, got %q", got[0])
+	}
+}

@@ -279,7 +279,8 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.Events = capList(dedupe(e.Events), 8)
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
-	e.Ambient = capList(dedupe(e.Ambient), 6)
+	// Ambient only has to be enough for the model to rule things out.
+	e.Ambient = capList(dedupe(e.Ambient), 5)
 	return e
 }
 
@@ -324,20 +325,50 @@ func (k *kube) warningEvents(namespace string, since time.Time) []string {
 		logf("enrich: events (%s): %v", orAll(namespace), err)
 		return nil
 	}
-	var out []string
+	// One stuck condition emits the same event against dozens of objects. Listing
+	// each is noise, so collapse by reason and object kind and report the count.
+	type agg struct {
+		count   int
+		kind    string
+		sample  string
+		example string
+	}
+	seen := map[string]*agg{}
+	var order []string
 	for _, ev := range events.Items {
 		if ev.LastTimestamp.Before(since) {
 			continue
 		}
-		out = append(out, fmt.Sprintf("%s %s/%s: %s",
-			ev.Reason, ev.InvolvedObject.Kind, ev.InvolvedObject.Name, truncate(ev.Message, 160)))
+		key := ev.Reason + "/" + ev.InvolvedObject.Kind
+		if _, ok := seen[key]; !ok {
+			seen[key] = &agg{kind: ev.InvolvedObject.Kind, sample: truncate(ev.Message, 160), example: ev.InvolvedObject.Name}
+			order = append(order, key)
+		}
+		seen[key].count++
+	}
+
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		a := seen[key]
+		if a.count == 1 {
+			out = append(out, fmt.Sprintf("%s %s/%s: %s", strings.SplitN(key, "/", 2)[0], a.kind, a.example, a.sample))
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s x%d on %s (e.g. %s): %s",
+			strings.SplitN(key, "/", 2)[0], a.count, a.kind, a.example, a.sample))
 	}
 	return out
 }
 
-// fluxNotReady reports Flux resources that are failing or that reconciled
-// inside the window, which is how "did a deploy cause this?" gets answered.
+// fluxNotReady reports Flux resources that are failing, and - only when scoped
+// to a namespace - ones that reconciled inside the window.
+//
+// Cluster-wide reconciles are worthless: a routine sync of the whole repo
+// transitions every resource at once, so "did a deploy cause this?" turns into
+// a listing of 150 healthy Kustomizations. A reconcile is a signal only when it
+// happened in the namespace the alert is about.
 func (k *kube) fluxNotReady(namespace string, since time.Time) []string {
+	scoped := namespace != ""
 	apis := []string{
 		"/apis/helm.toolkit.fluxcd.io/v2/helmreleases",
 		"/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",
@@ -359,7 +390,7 @@ func (k *kube) fluxNotReady(namespace string, since time.Time) []string {
 				if c.Type != "Ready" {
 					continue
 				}
-				if c.Status == "True" && !c.LastTransitionTime.After(since) {
+				if c.Status == "True" && (!scoped || !c.LastTransitionTime.After(since)) {
 					continue
 				}
 				state := "reconciled recently"
