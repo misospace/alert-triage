@@ -68,78 +68,99 @@ func (k *kube) get(path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-type podList struct {
-	Items []struct {
-		Metadata struct {
-			Name      string `json:"name"`
-			Namespace string `json:"namespace"`
-		} `json:"metadata"`
-		Spec struct {
-			NodeName string `json:"nodeName"`
-		} `json:"spec"`
-		Status struct {
-			Phase             string `json:"phase"`
-			ContainerStatuses []struct {
-				Name         string `json:"name"`
-				RestartCount int    `json:"restartCount"`
-				Ready        bool   `json:"ready"`
-				State        map[string]struct {
-					Reason string `json:"reason"`
-				} `json:"state"`
-			} `json:"containerStatuses"`
-		} `json:"status"`
-	} `json:"items"`
+type metadata struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
 }
 
-type eventList struct {
-	Items []struct {
-		Type           string    `json:"type"`
-		Reason         string    `json:"reason"`
-		Message        string    `json:"message"`
-		LastTimestamp  time.Time `json:"lastTimestamp"`
-		InvolvedObject struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		} `json:"involvedObject"`
-	} `json:"items"`
+type nodeSpec struct {
+	Unschedulable bool `json:"unschedulable"`
 }
 
-type fluxList struct {
-	Items []struct {
-		Metadata struct {
-			Name      string `json:"name"`
-			Namespace string `json:"namespace"`
-		} `json:"metadata"`
-		Status struct {
-			LastAppliedRevision string `json:"lastAppliedRevision"`
-			Conditions          []struct {
-				Type               string    `json:"type"`
-				Status             string    `json:"status"`
-				Reason             string    `json:"reason"`
-				Message            string    `json:"message"`
-				LastTransitionTime time.Time `json:"lastTransitionTime"`
-			} `json:"conditions"`
-		} `json:"status"`
-	} `json:"items"`
+type condition struct {
+	Type    string `json:"type"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+type nodeStatus struct {
+	Conditions []condition `json:"conditions"`
+}
+
+type nodeItem struct {
+	Metadata metadata   `json:"metadata"`
+	Spec     nodeSpec   `json:"spec"`
+	Status   nodeStatus `json:"status"`
 }
 
 type nodeList struct {
-	Items []struct {
-		Metadata struct {
-			Name string `json:"name"`
-		} `json:"metadata"`
-		Spec struct {
-			Unschedulable bool `json:"unschedulable"`
-		} `json:"spec"`
-		Status struct {
-			Conditions []struct {
-				Type    string `json:"type"`
-				Status  string `json:"status"`
-				Reason  string `json:"reason"`
-				Message string `json:"message"`
-			} `json:"conditions"`
-		} `json:"status"`
-	} `json:"items"`
+	Items []nodeItem `json:"items"`
+}
+
+type containerState struct {
+	Reason string `json:"reason"`
+}
+
+type containerStatus struct {
+	Name         string            `json:"name"`
+	RestartCount int               `json:"restartCount"`
+	Ready        bool              `json:"ready"`
+	State        map[string]containerState `json:"state"`
+}
+
+type podItem struct {
+	Metadata metadata `json:"metadata"`
+	Spec     struct {
+		NodeName string `json:"nodeName"`
+	} `json:"spec"`
+	Status struct {
+		Phase             string            `json:"phase"`
+		ContainerStatuses []containerStatus `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+type podList struct {
+	Items []podItem `json:"items"`
+}
+
+type involvedObject struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+type eventItem struct {
+	Type           string         `json:"type"`
+	Reason         string         `json:"reason"`
+	Message        string         `json:"message"`
+	LastTimestamp  time.Time      `json:"lastTimestamp"`
+	InvolvedObject involvedObject `json:"involvedObject"`
+}
+
+type eventList struct {
+	Items []eventItem `json:"items"`
+}
+
+type fluxCondition struct {
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	Reason             string    `json:"reason"`
+	Message            string    `json:"message"`
+	LastTransitionTime time.Time `json:"lastTransitionTime"`
+}
+
+type fluxStatus struct {
+	LastAppliedRevision string          `json:"lastAppliedRevision"`
+	Conditions          []fluxCondition `json:"conditions"`
+}
+
+type fluxItem struct {
+	Metadata metadata   `json:"metadata"`
+	Status   fluxStatus `json:"status"`
+}
+
+type fluxList struct {
+	Items []fluxItem `json:"items"`
 }
 
 // Enrichment is the evidence gathered for one group.
@@ -281,8 +302,14 @@ func (k *kube) unhealthyNodes() []string {
 		logf("enrich: nodes: %v", err)
 		return nil
 	}
+	return findUnhealthyNodes(nodes.Items)
+}
+
+// findUnhealthyNodes inspects a list of node items and returns descriptions
+// of any that are not Ready, under pressure, or cordoned.
+func findUnhealthyNodes(items []nodeItem) []string {
 	var out []string
-	for _, n := range nodes.Items {
+	for _, n := range items {
 		var problems []string
 		for _, c := range n.Status.Conditions {
 			switch {
@@ -314,8 +341,13 @@ func (k *kube) warningEvents(namespace string, since time.Time) []string {
 		logf("enrich: events (%s): %v", orAll(namespace), err)
 		return nil
 	}
+	return findWarningEvents(events.Items, since)
+}
+
+// findWarningEvents filters a list of event items to recent non-Normal events.
+func findWarningEvents(items []eventItem, since time.Time) []string {
 	var out []string
-	for _, ev := range events.Items {
+	for _, ev := range items {
 		if ev.LastTimestamp.Before(since) {
 			continue
 		}
@@ -344,21 +376,29 @@ func (k *kube) fluxNotReady(namespace string, since time.Time) []string {
 		if err := k.get(api, &fl); err != nil {
 			continue
 		}
-		for _, item := range fl.Items {
-			for _, c := range item.Status.Conditions {
-				if c.Type != "Ready" {
-					continue
-				}
-				if c.Status == "True" && !c.LastTransitionTime.After(since) {
-					continue
-				}
-				state := "reconciled recently"
-				if c.Status != "True" {
-					state = "NOT READY: " + c.Reason
-				}
-				out = append(out, fmt.Sprintf("%s/%s %s rev=%s",
-					item.Metadata.Namespace, item.Metadata.Name, state, shortRev(item.Status.LastAppliedRevision)))
+		out = append(out, findFluxNotReady(fl.Items, since)...)
+	}
+	return out
+}
+
+// findFluxNotReady inspects a list of Flux items and returns descriptions of
+// resources that are not Ready or reconciled recently.
+func findFluxNotReady(items []fluxItem, since time.Time) []string {
+	var out []string
+	for _, item := range items {
+		for _, c := range item.Status.Conditions {
+			if c.Type != "Ready" {
+				continue
 			}
+			if c.Status == "True" && !c.LastTransitionTime.After(since) {
+				continue
+			}
+			state := "reconciled recently"
+			if c.Status != "True" {
+				state = "NOT READY: " + c.Reason
+			}
+			out = append(out, fmt.Sprintf("%s/%s %s rev=%s",
+				item.Metadata.Namespace, item.Metadata.Name, state, shortRev(item.Status.LastAppliedRevision)))
 		}
 	}
 	return out
