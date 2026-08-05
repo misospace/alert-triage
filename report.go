@@ -18,15 +18,24 @@ type Report struct {
 }
 
 const narratePrompt = `You are triaging Kubernetes alerts for a homelab cluster.
-Given a correlated group of alerts and evidence gathered from the cluster, write
-2-4 sentences for the operator: what is broken, the most likely root cause, and
+Write 2-4 sentences for the operator: what is broken, the most likely cause, and
 what to check first.
 
+The cluster has ALREADY been inspected on your behalf. Everything under EVIDENCE
+was read live from the Kubernetes API moments ago. Treat it as first-hand fact.
+
 Rules:
-- State the likely cause plainly. If the evidence does not support one, say the
-  evidence is inconclusive rather than inventing a cause.
-- Prefer the evidence over the alert names; alert names are often vague.
-- If a recent Flux change coincides with the alerts, say so explicitly.
+- Never comment on your own limitations. Do not say you did not check the
+  cluster, cannot access it, or lack information. The evidence below IS the
+  check. If it is thin, reason from the alert itself instead.
+- "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
+  Use them to rule causes out.
+- Some alerts are self-describing. Restate what it means operationally and stop;
+  do not pad.
+- Name a cause only where the evidence or the alert supports one. If several are
+  plausible, give the likeliest and say what would distinguish them.
+- If a Flux resource reconciled or went NotReady near the alert, say so - a
+  recent deploy is the first thing worth ruling out.
 - No preamble, no bullet points, no markdown headers. Plain prose only.`
 
 type chatReq struct {
@@ -128,23 +137,32 @@ func renderEvidence(r Report) string {
 		b.WriteString("\n")
 	}
 
-	writeSection(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods)
-	writeSection(&b, "Recent warning events", r.Enrichment.Events)
-	writeSection(&b, "Recent Flux changes", r.Enrichment.RecentChanges)
-	if r.Enrichment.empty() {
-		b.WriteString("\nNo supporting cluster evidence was found.\n")
-	}
+	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
+	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
+	writeFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.RecentChanges, "no reconciles or failures in the window, so a recent deploy is unlikely")
 	return b.String()
 }
 
-func writeSection(b *strings.Builder, title string, items []string) {
+// writeFinding renders a section, stating the negative explicitly when empty so
+// the model can rule causes out instead of treating silence as missing data.
+func writeFinding(b *strings.Builder, title string, items []string, whenEmpty string) {
 	if len(items) == 0 {
+		fmt.Fprintf(b, "\n%s: %s\n", title, whenEmpty)
 		return
 	}
 	fmt.Fprintf(b, "\n%s:\n", title)
 	for _, s := range items {
 		fmt.Fprintf(b, "- %s\n", s)
 	}
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 func firstAnnotation(a Alert) string {
@@ -200,6 +218,7 @@ func Deliver(cfg Config, r Report) error {
 		}
 		desc.WriteString("\n")
 	}
+	writeDiscordSection(&desc, "Unhealthy nodes", r.Enrichment.Nodes)
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)

@@ -26,7 +26,7 @@ type Payload struct {
 }
 
 func (a Alert) name() string      { return a.Labels["alertname"] }
-func (a Alert) namespace() string { return a.Labels["namespace"] }
+func (a Alert) namespace() string { return alertNamespace(a) }
 func (a Alert) severity() string  { return a.Labels["severity"] }
 
 // Group is a set of alerts believed to share a root cause.
