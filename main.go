@@ -25,6 +25,8 @@ type Config struct {
 	EvidenceWindow time.Duration
 	Retention      time.Duration
 	NarrateTimeout time.Duration
+	WebhookToken   string
+	MaxBuffered    int
 }
 
 func loadConfig() Config {
@@ -41,6 +43,8 @@ func loadConfig() Config {
 		EvidenceWindow: envDuration("EVIDENCE_WINDOW", 30*time.Minute),
 		Retention:      envDuration("RETENTION", 7*24*time.Hour),
 		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
+		WebhookToken:   os.Getenv("WEBHOOK_TOKEN"),
+		MaxBuffered:    envInt("MAX_BUFFERED", 10000),
 	}
 }
 
@@ -50,6 +54,7 @@ type buffer struct {
 	mu      sync.Mutex
 	alerts  []Alert
 	firstAt time.Time
+	cap     int
 }
 
 func (b *buffer) add(alerts []Alert) {
@@ -58,7 +63,15 @@ func (b *buffer) add(alerts []Alert) {
 	if len(b.alerts) == 0 {
 		b.firstAt = time.Now()
 	}
-	b.alerts = append(b.alerts, alerts...)
+	for _, a := range alerts {
+		if b.cap > 0 && len(b.alerts) >= b.cap {
+			// drop-oldest: shift the slice left by one to make room
+			b.alerts = append(b.alerts[:0], b.alerts[1:]...)
+		}
+		if b.cap == 0 || len(b.alerts) < b.cap {
+			b.alerts = append(b.alerts, a)
+		}
+	}
 }
 
 // take returns the buffered alerts if the window is due, clearing the buffer.
@@ -92,7 +105,7 @@ func main() {
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
 	}
 
-	buf := &buffer{}
+	buf := &buffer{cap: cfg.MaxBuffered}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -102,6 +115,10 @@ func main() {
 	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if cfg.WebhookToken != "" && r.Header.Get("X-Webhook-Token") != cfg.WebhookToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		defer r.Body.Close()
@@ -205,4 +222,16 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 
 func logf(format string, args ...any) {
 	log.Printf(format, args...)
+}
+
+func envInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	logf("bad int for %s=%q, using %d", key, v, fallback)
+	return fallback
 }

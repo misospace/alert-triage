@@ -51,6 +51,56 @@ unreachable, the digest still ships with whatever is available.
 | `EVIDENCE_WINDOW`     | `30m`                | How far back to look for events and changes    |
 | `RETENTION`           | `168h`               | History retention                              |
 | `NARRATE_TIMEOUT`     | `120s`               | Model call timeout                             |
+| `WEBHOOK_TOKEN`       | *(empty)*            | Shared secret for `/webhook`; when set, clients must send `X-Webhook-Token` header with this value or receive `401` |
+| `MAX_BUFFERED`        | `10000`              | Maximum alerts held in the flush buffer; oldest are dropped when exceeded |
+
+### Webhook Authentication
+
+When `WEBHOOK_TOKEN` is set, every POST to `/webhook` must include the header:
+
+```
+X-Webhook-Token: <your-secret>
+```
+
+Requests without the header or with a wrong value receive HTTP 401.
+
+In Alertmanager, configure the receiver like this:
+
+```yaml
+receivers:
+  - name: 'alert-triage'
+    webhook_configs:
+      - url: 'http://alert-triage:8080/webhook'
+        send_resolved: false
+        http_config:
+          headers:
+            X-Webhook-Token: '<your-secret>'
+```
+
+### NetworkPolicy (recommended)
+
+Limit `/webhook` access to Alertmanager pods only:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alert-triage-webhook-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: alert-triage
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: alertmanager
+      ports:
+        - protocol: TCP
+          port: 8080
+```
 
 ## Deploying
 
