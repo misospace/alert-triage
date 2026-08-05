@@ -122,6 +122,81 @@ func TestEveryAlertLandsInExactlyOneGroup(t *testing.T) {
 	}
 }
 
+func TestNodeSignatureDoesNotAbsorbUnrelatedAlerts(t *testing.T) {
+	// Regression: bare "node" substring must not trigger the node signature.
+	// An alert like NodeFilesystemSpaceFillingUp or a summary mentioning a
+	// hostname such as "node-03" should NOT sweep unrelated alerts into a
+	// signature/node group.
+	alerts := []Alert{
+		alert("NodeFilesystemSpaceFillingUp", "llm", "warning", 0, "disk usage high on node-03"),
+		alert("PodCrashLooping", "media", "warning", time.Minute, "OOM killed"),
+		alert("HTTPTimeout", "utility", "info", 30*time.Second, "connection timeout"),
+	}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	for _, g := range groups {
+		if g.Key == "signature/node" {
+			t.Fatalf("node signature must not trigger on bare 'node' substring; got group %s with alerts: %v",
+				g.Key, func() []string {
+					names := make([]string, len(g.Alerts))
+					for i, a := range g.Alerts {
+						names[i] = a.name()
+					}
+					return names
+				}())
+		}
+	}
+
+	// Verify unrelated alerts are not grouped together.
+	seen := map[string][]string{}
+	for _, g := range groups {
+		for _, a := range g.Alerts {
+			seen[g.Key] = append(seen[g.Key], a.name())
+		}
+	}
+	// NodeFilesystemSpaceFillingUp and PodCrashLooping must be in separate groups.
+	for key, names := range seen {
+		if len(names) > 1 {
+			hasNodeFS := false
+			hasPodCrash := false
+			for _, n := range names {
+				if n == "NodeFilesystemSpaceFillingUp" {
+					hasNodeFS = true
+				}
+				if n == "PodCrashLooping" {
+					hasPodCrash = true
+				}
+			}
+			if hasNodeFS && hasPodCrash {
+				t.Errorf("unrelated alerts merged into group %s: %v", key, names)
+			}
+		}
+	}
+}
+
+func TestNodeSignatureMatchesRealNodeFailure(t *testing.T) {
+	// Verify the node signature still fires on actual node-unhealth signals.
+	alerts := []Alert{
+		alert("KubeNodeNotReady", "kube-system", "critical", 0, "node not ready"),
+		alert("PodEvicted", "llm", "warning", time.Minute, "evicted due to pressure"),
+	}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	var nodeGroup *Group
+	for i, g := range groups {
+		if g.Key == "signature/node" {
+			nodeGroup = &groups[i]
+			break
+		}
+	}
+	if nodeGroup == nil {
+		t.Fatal("node signature should trigger on KubeNodeNotReady")
+	}
+	if len(nodeGroup.Alerts) < 1 {
+		t.Fatal("node group should contain at least the triggering alert")
+	}
+}
+
 func TestSignatureIsStableAcrossFirings(t *testing.T) {
 	mk := func(offset time.Duration) Group {
 		return Correlate([]Alert{

@@ -83,10 +83,24 @@ func DefaultSignatures() []Signature {
 			Scope:   storage,
 		},
 		{
-			Name:    "node",
-			Reason:  "Node unhealthy; its workloads are collateral",
-			Trigger: func(a Alert) bool { return textContains(a, "notready") || textContains(a, "node") },
-			Scope:   func(a Alert) bool { return true },
+			Name:   "node",
+			Reason: "Node unhealthy; its workloads are collateral",
+			Trigger: func(a Alert) bool {
+				return textContains(a, "notready") ||
+					textContains(a, "unreachable") ||
+					textContains(a, "reboot") ||
+					textContains(a, "pressure") ||
+					textContains(a, "cordoned") ||
+					textContains(a, "kubelet")
+			},
+			Scope: func(a Alert) bool {
+				return textContains(a, "notready") ||
+					textContains(a, "unreachable") ||
+					textContains(a, "reboot") ||
+					textContains(a, "pressure") ||
+					textContains(a, "cordoned") ||
+					textContains(a, "kubelet")
+			},
 		},
 		{
 			Name:    "dns",
