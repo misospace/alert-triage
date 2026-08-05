@@ -57,16 +57,20 @@ type recent struct {
 
 // DigestRecord is one delivered digest, as served by /recent.
 type DigestRecord struct {
-	At         time.Time `json:"at"`
-	Key        string    `json:"key"`
-	Title      string    `json:"title"`
-	Severity   string    `json:"severity"`
-	Alerts     []string  `json:"alerts"`
-	PriorSeen  int       `json:"prior_seen"`
-	Narrative  string    `json:"narrative"`
-	Evidence   string    `json:"evidence"`
-	Delivered  bool      `json:"delivered"`
-	DeliverErr string    `json:"deliver_error,omitempty"`
+	At           time.Time `json:"at"`
+	Key          string    `json:"key"`
+	Title        string    `json:"title"`
+	Severity     string    `json:"severity"`
+	Alerts       []string  `json:"alerts"`
+	PriorSeen    int       `json:"prior_seen"`
+	Narrative    string    `json:"narrative"`
+	Evidence     string    `json:"evidence"`
+	FixLocation  string    `json:"fix_location"`
+	WhatToChange string    `json:"what_to_change,omitempty"`
+	Confidence   string    `json:"confidence,omitempty"`
+	Actionable   bool      `json:"actionable"`
+	Delivered    bool      `json:"delivered"`
+	DeliverErr   string    `json:"deliver_error,omitempty"`
 }
 
 func (r *recent) add(d DigestRecord) {
@@ -229,11 +233,14 @@ func process(cfg Config, alerts []Alert, k *kube, hist *History, seen *recent) {
 	for _, g := range groups {
 		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
-		r.Narrative = Narrate(cfg, r)
+		r.Triage = Narrate(cfg, r)
+		r.Narrative = r.Triage.Narrative
 
 		rec := DigestRecord{
 			At: time.Now(), Key: g.Key, Title: g.Title(), Severity: g.Severity(),
 			PriorSeen: r.PriorSeen, Narrative: r.Narrative, Evidence: renderEvidence(r),
+			FixLocation: r.Triage.FixLocation, WhatToChange: r.Triage.WhatToChange,
+			Confidence: r.Triage.Confidence, Actionable: r.Triage.Actionable(),
 		}
 		for _, a := range g.Alerts {
 			rec.Alerts = append(rec.Alerts, a.name())
@@ -245,7 +252,8 @@ func process(cfg Config, alerts []Alert, k *kube, hist *History, seen *recent) {
 			rec.Delivered = true
 		}
 		seen.add(rec)
-		log.Printf("digest %s [%s] %s | %s", g.Key, g.Severity(), g.Title(), oneLine(r.Narrative))
+		log.Printf("digest %s [%s] fix=%s %s | %s", g.Key, g.Severity(),
+			orUnknown(r.Triage.FixLocation), g.Title(), oneLine(r.Narrative))
 	}
 }
 

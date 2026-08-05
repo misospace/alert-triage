@@ -29,7 +29,10 @@ credentials or state.
    HelmRelease/Kustomization transitions for the involved namespaces.
 5. **History** — every group is recorded to a JSONL file so the digest can say
    whether an incident is novel or routine.
-6. **Narrate** — one chat completion per group via LiteLLM.
+6. **Narrate** — one chat completion per group via LiteLLM, which also judges
+   where a fix would have to be made: `git`, `partial`, `cluster`, `external` or
+   `unknown`. Only `git` and `partial` are actionable by editing the repository,
+   which is the gate a future issue sink would use.
 7. **Deliver** — one Discord embed per group.
 
 Enrichment and narration are both optional: if the API server or the model is

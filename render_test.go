@@ -102,3 +102,37 @@ func TestRepeatedEventsCollapse(t *testing.T) {
 		t.Errorf("collapsed line should carry the count, got %q", got[0])
 	}
 }
+
+func TestParseTriageTolerance(t *testing.T) {
+	want := `{"narrative":"n","fix_location":"git","what_to_change":"w","confidence":"high"}`
+	for name, raw := range map[string]string{
+		"bare":       want,
+		"fenced":     "```json\n" + want + "\n```",
+		"prefixed":   "Here is my answer:\n" + want,
+		"suffixed":   want + "\n\nHope that helps.",
+		"whitespace": "\n\n  " + want + "  \n",
+	} {
+		got := parseTriage(raw)
+		if got.FixLocation != "git" || got.Narrative != "n" {
+			t.Errorf("%s: parsed as %+v", name, got)
+		}
+	}
+}
+
+func TestParseTriageRejectsUnknownLocation(t *testing.T) {
+	got := parseTriage(`{"narrative":"n","fix_location":"somewhere-else"}`)
+	if got.FixLocation != "unknown" {
+		t.Errorf("unrecognised location must fall back to unknown, got %q", got.FixLocation)
+	}
+}
+
+// A model that ignores the format must still yield a readable digest.
+func TestParseTriageKeepsProseOnFailure(t *testing.T) {
+	got := parseTriage("The job is stuck because the volume never mounted.")
+	if got.Narrative == "" || got.FixLocation != "unknown" {
+		t.Errorf("prose reply should survive as the narrative, got %+v", got)
+	}
+	if got.Actionable() {
+		t.Error("an unparsed reply must never be treated as actionable")
+	}
+}

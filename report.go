@@ -16,6 +16,46 @@ type Report struct {
 	Enrichment Enrichment
 	PriorSeen  int
 	Narrative  string
+	Triage     Triage
+}
+
+// Triage is the model's judgement about where a fix would have to be made. It
+// gates whether an incident is worth raising as work: only something the
+// repository can fix is actionable by editing the repository.
+type Triage struct {
+	Narrative    string `json:"narrative"`
+	FixLocation  string `json:"fix_location"`
+	WhatToChange string `json:"what_to_change"`
+	Confidence   string `json:"confidence"`
+}
+
+// Actionable reports whether a repository change would help at all.
+func (t Triage) Actionable() bool {
+	return t.FixLocation == "git" || t.FixLocation == "partial"
+}
+
+var fixLocations = map[string]bool{
+	"git": true, "partial": true, "cluster": true, "external": true, "unknown": true,
+}
+
+// parseTriage tolerates the shapes models actually emit: a bare object, one
+// wrapped in a fence, or one preceded by commentary. Anything unparseable is
+// kept as the narrative so a malformed reply still ships a readable digest.
+func parseTriage(raw string) Triage {
+	raw = strings.TrimSpace(raw)
+	start, end := strings.Index(raw, "{"), strings.LastIndex(raw, "}")
+	if start >= 0 && end > start {
+		var t Triage
+		if err := json.Unmarshal([]byte(raw[start:end+1]), &t); err == nil && t.Narrative != "" {
+			t.FixLocation = strings.ToLower(strings.TrimSpace(t.FixLocation))
+			if !fixLocations[t.FixLocation] {
+				t.FixLocation = "unknown"
+			}
+			return t
+		}
+	}
+	logf("triage: reply was not JSON, keeping it as the narrative")
+	return Triage{Narrative: raw, FixLocation: "unknown", Confidence: "low"}
 }
 
 const narratePrompt = `You are triaging Kubernetes alerts for a homelab cluster.
@@ -56,7 +96,27 @@ Rules:
   that it does. Otherwise leave it out entirely.
 - If a Flux resource reconciled or went NotReady near the alert, say so - a
   recent deploy is the first thing worth ruling out.
-- No preamble, no bullet points, no markdown headers. Plain prose only.`
+
+Also decide where a fix would have to be made. The cluster is managed by GitOps:
+a commit to the repository is reconciled onto it automatically.
+
+  git      - fixable by editing the repository alone: image tags, chart values,
+             resource limits, replicas, affinity, scheduling, config.
+  partial  - a repository change helps but does not finish the job; some manual
+             action against the cluster or hardware is still required.
+  cluster  - needs an action against the cluster or hardware and no repository
+             change would fix it: detaching a stuck volume, clearing a wedged
+             resource, restarting or rebooting something.
+  external - the fault is with an upstream provider, quota, subscription, API
+             key or third-party service. Nothing in this cluster fixes it.
+  unknown  - the evidence does not say.
+
+Reply with ONLY a JSON object, no fence and no commentary:
+{"narrative": "<2-4 sentences, plain prose, no markdown>",
+ "fix_location": "git|partial|cluster|external|unknown",
+ "what_to_change": "<if git or partial: which file or resource and what to change,
+                     in words. Never invent a path you were not shown. Otherwise "">",
+ "confidence": "high|low"}`
 
 type chatReq struct {
 	Model    string    `json:"model"`
@@ -78,11 +138,12 @@ type chatResp struct {
 	} `json:"choices"`
 }
 
-// Narrate asks the model for a plain-language story. A failure here is not
-// fatal: the digest still ships with its evidence, just without the summary.
-func Narrate(cfg Config, r Report) string {
+// Narrate asks the model for a story and a judgement about where a fix belongs.
+// A failure here is not fatal: the digest still ships with its evidence, just
+// without the summary.
+func Narrate(cfg Config, r Report) Triage {
 	if cfg.LiteLLMURL == "" {
-		return ""
+		return Triage{}
 	}
 	body, err := json.Marshal(chatReq{
 		Model: cfg.Model,
@@ -93,13 +154,13 @@ func Narrate(cfg Config, r Report) string {
 	})
 	if err != nil {
 		logf("narrate: marshal: %v", err)
-		return ""
+		return Triage{}
 	}
 
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		logf("narrate: request: %v", err)
-		return ""
+		return Triage{}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.LiteLLMKey != "" {
@@ -110,27 +171,27 @@ func Narrate(cfg Config, r Report) string {
 	resp, err := hc.Do(req)
 	if err != nil {
 		logf("narrate: %v", err)
-		return ""
+		return Triage{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		logf("narrate: %s", resp.Status)
-		return ""
+		return Triage{}
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		logf("narrate: decode: %v", err)
-		return ""
+		return Triage{}
 	}
 	if len(out.Choices) == 0 {
-		return ""
+		return Triage{}
 	}
 	// Some reasoning models put the answer in content and thinking in
 	// reasoning_content; others invert it when content comes back empty.
 	if c := strings.TrimSpace(out.Choices[0].Message.Content); c != "" {
-		return c
+		return parseTriage(c)
 	}
-	return strings.TrimSpace(out.Choices[0].Message.ReasoningContent)
+	return parseTriage(out.Choices[0].Message.ReasoningContent)
 }
 
 func renderEvidence(r Report) string {
@@ -283,6 +344,17 @@ func Deliver(cfg Config, r Report) error {
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
+
+	if loc := r.Triage.FixLocation; loc != "" && loc != "unknown" {
+		fmt.Fprintf(&desc, "\n**Fix belongs in:** %s", loc)
+		if r.Triage.Confidence == "low" {
+			desc.WriteString(" (low confidence)")
+		}
+		if r.Triage.WhatToChange != "" {
+			fmt.Fprintf(&desc, "\n%s", r.Triage.WhatToChange)
+		}
+		desc.WriteString("\n")
+	}
 
 	embed := discordEmbed{
 		Title:       r.Group.Title(),
