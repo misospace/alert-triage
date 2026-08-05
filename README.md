@@ -43,6 +43,9 @@ unreachable, the digest still ships with whatever is available.
 | Variable              | Default              | Purpose                                        |
 | --------------------- | -------------------- | ---------------------------------------------- |
 | `LISTEN_ADDR`         | `:8080`              | HTTP listen address                            |
+| `WEBHOOK_TOKEN`       | —                    | Shared secret required on `/webhook`. Unset accepts everything |
+| `MAX_ALERTS`          | `500`                | Cap on alerts buffered in one window           |
+| `MAX_GROUPS`          | `12`                 | Cap on groups narrated per flush               |
 | `LITELLM_URL`         | —                    | LiteLLM base URL, e.g. `http://litellm.llm:4000/v1` |
 | `LITELLM_API_KEY`     | —                    | Scoped LiteLLM key                             |
 | `MODEL`               | `dsv4f`              | Model alias used for the narrative             |
@@ -60,6 +63,33 @@ unreachable, the digest still ships with whatever is available.
 Images are published to `ghcr.io/misospace/alert-triage` on tag push. Point an
 Alertmanager webhook receiver at `/webhook` and give the pod a ServiceAccount
 with the RBAC below.
+
+### Securing the webhook
+
+Set `WEBHOOK_TOKEN` and have Alertmanager send it. `AlertmanagerConfig` cannot
+set arbitrary headers on a webhook receiver, so use `httpConfig.authorization`,
+which sends `Authorization: Bearer <token>`; `X-Webhook-Token` is accepted too
+and is easier to send by hand.
+
+```yaml
+- name: triage
+  webhookConfigs:
+    - url: http://alert-triage.observability.svc.cluster.local:8080/webhook
+      sendResolved: false
+      httpConfig:
+        authorization:
+          credentials:
+            name: alert-triage-secret
+            key: WEBHOOK_TOKEN
+```
+
+Leaving `WEBHOOK_TOKEN` unset accepts every request and logs a warning once, so
+that a new image cannot silently reject alerts before the receiver has the
+secret. Set the receiver up first, then the token.
+
+A token is not a perimeter on its own: anything that can reach the pod can spend
+model budget and post to the digest channel. Pair it with a NetworkPolicy that
+admits only Alertmanager to port 8080.
 
 ## RBAC
 

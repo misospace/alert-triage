@@ -1,7 +1,10 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,6 +167,79 @@ func TestBufferNotYetDue(t *testing.T) {
 	got := b.take(now.Add(500*time.Millisecond), 1*time.Second, 10*time.Second)
 	if len(got) != 0 {
 		t.Errorf("expected 0 alerts before flush delay, got %d", len(got))
+	}
+}
+
+// Every accepted group costs a model call and a message in the operator
+// channel, so an unauthenticated /webhook is both a spend and a spoofing vector.
+func TestWebhookTokenEnforcement(t *testing.T) {
+	body := `{"alerts":[{"status":"firing","fingerprint":"a","labels":{"alertname":"A"}}]}`
+	tests := []struct {
+		name    string
+		token   string
+		header  string
+		value   string
+		want    int
+		buffers bool
+	}{
+		{"no token configured accepts", "", "", "", http.StatusAccepted, true},
+		{"missing header rejected", "s3cret", "", "", http.StatusUnauthorized, false},
+		{"wrong bearer rejected", "s3cret", "Authorization", "Bearer wrong", http.StatusUnauthorized, false},
+		{"wrong header token rejected", "s3cret", "X-Webhook-Token", "wrong", http.StatusUnauthorized, false},
+		{"bearer accepted", "s3cret", "Authorization", "Bearer s3cret", http.StatusAccepted, true},
+		{"header token accepted", "s3cret", "X-Webhook-Token", "s3cret", http.StatusAccepted, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &buffer{}
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+			if tt.header != "" {
+				req.Header.Set(tt.header, tt.value)
+			}
+			w := httptest.NewRecorder()
+			webhookHandler(Config{WebhookToken: tt.token}, buf)(w, req)
+
+			if w.Code != tt.want {
+				t.Errorf("status = %d, want %d", w.Code, tt.want)
+			}
+			buffered := len(buf.take(time.Now(), 0, 0))
+			if tt.buffers && buffered != 1 {
+				t.Errorf("expected the alert to be buffered, got %d", buffered)
+			}
+			if !tt.buffers && buffered != 0 {
+				t.Errorf("rejected request must not buffer anything, got %d", buffered)
+			}
+		})
+	}
+}
+
+// A flood must not grow memory without limit. The newest are refused rather
+// than evicting the alerts that opened the window, which are the ones that
+// explain a cascade.
+func TestBufferCapRefusesNewest(t *testing.T) {
+	b := &buffer{max: 3}
+	alerts := []Alert{
+		{Fingerprint: "first"}, {Fingerprint: "second"}, {Fingerprint: "third"},
+		{Fingerprint: "fourth"}, {Fingerprint: "fifth"},
+	}
+	if rejected := b.add(alerts); rejected != 2 {
+		t.Errorf("rejected = %d, want 2", rejected)
+	}
+	b.firstAt = time.Now().Add(-time.Second)
+	got := b.take(time.Now(), 0, 10*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("buffered %d alerts, want the cap of 3", len(got))
+	}
+	if got[0].Fingerprint != "first" {
+		t.Errorf("kept %q first, want the alert that opened the window", got[0].Fingerprint)
+	}
+}
+
+func TestBufferNoCapWhenUnset(t *testing.T) {
+	b := &buffer{}
+	if rejected := b.add([]Alert{{Fingerprint: "a"}, {Fingerprint: "b"}}); rejected != 0 {
+		t.Errorf("rejected = %d, want 0 when no cap is configured", rejected)
 	}
 }
 
