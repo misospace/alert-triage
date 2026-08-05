@@ -1,0 +1,106 @@
+# AGENTS.md
+
+Operating notes for anyone — human or agent — changing this service.
+
+## What it is
+
+A webhook receiver that turns a burst of Alertmanager alerts into a small number
+of explained incidents. Alertmanager already groups identical alerts by name;
+this exists to recognise that several *different* alerts are one event, attach
+evidence from the cluster, and say what happened in a few sentences.
+
+It runs unattended. Correctness matters more than cleverness, and a wrong
+confident sentence is worse than a vague one.
+
+## Commands
+
+```sh
+go build ./...          # must build
+gofmt -l .              # must print nothing
+go vet ./...            # must pass
+go test ./...           # must pass
+go test -race ./...     # what CI runs
+```
+
+CI runs fmt, vet and `go test -race`, plus a Docker build. A tag `v*` publishes
+a multi-arch image to `ghcr.io/misospace/alert-triage`.
+
+## Layout
+
+| File | Responsibility |
+| --- | --- |
+| `correlate.go` | Pure grouping. No I/O. The riskiest logic, so it is the most testable. |
+| `enrich.go` | Read-only Kubernetes client and evidence gathering. |
+| `history.go` | JSONL record of every group reported, for "seen N times". |
+| `report.go` | Prompt, model call, evidence rendering, Discord delivery. |
+| `main.go` | Config, HTTP server, windowing buffer, pipeline wiring. |
+
+Pipeline: ingest → window → correlate → enrich → history → narrate → deliver.
+Enrichment and narration are both optional; if the API server or the model is
+unreachable the digest still ships with whatever is available. Keep it that way.
+
+## Invariants
+
+**Stdlib only.** No `client-go`, no SDKs. The Kubernetes client is plain HTTP
+against the apiserver using the in-cluster ServiceAccount token. Four GETs do
+not justify the dependency tree. If you need a new resource, add a struct and a
+path, not a library.
+
+**`Signature.Scope` must bound itself to its trigger.** A scope that ignores the
+triggering alert and accepts everything swallows an entire window. This was a
+real bug: the `node` signature matched the word "node" anywhere — catching
+`KubePodNotReady` and `CephNodeDiskspaceWarning` — and its scope returned true,
+fusing 20 unrelated alerts into 2 groups. Triggers must be specific and scopes
+must key on something concrete, usually a label. `TestNoSignatureSwallowsUnrelatedAlerts`
+guards this.
+
+**A signature matching only its own trigger forms no group.** A one-alert "root
+cause" explains nothing; leave the alert for a later rule.
+
+**Never delete evidence to reduce noise.** Discord has no way to fold content, so
+volume was once managed by dropping data. Collapse, aggregate or count instead:
+repeated events aggregate with a count, and cluster-wide Flux reconciles are
+dropped because a routine sync transitions everything at once — that is noise,
+not signal, which is different from useful data being inconvenient.
+
+**Ambient context is fenced off.** Cluster-wide findings gathered when an alert
+names no namespace go in `Enrichment.Ambient`, render under `BACKGROUND`, and
+never reach Discord. They exist so the model can rule things out. Without the
+fence it offers coincidences as causes.
+
+**Absence is a finding.** Empty sections render as explicit negatives ("all nodes
+Ready"), never as silence. Silence reads to a model as missing data and produces
+hedging about not having checked the cluster.
+
+**Alert labels go to the model.** Alert names use the vocabulary of whatever
+emitted them. Without labels the model reads "deployment" as a Kubernetes
+Deployment when it meant an upstream routing target.
+
+## Testing against real data
+
+Unit tests cover correlation and rendering. For anything touching evidence or the
+prompt, replay real alerts — synthetic fixtures lack the variety that exposes
+grouping bugs.
+
+```sh
+# Capture what is actually firing
+kubectl exec -n observability alertmanager-... -c alertmanager -- \
+  wget -qO- 'http://localhost:9093/api/v2/alerts?active=true' > alerts.json
+
+# Run locally with a sink instead of Discord, short window
+DISCORD_WEBHOOK_URL=http://127.0.0.1:9911/ FLUSH_DELAY=2s LISTEN_ADDR=:9912 ./alert-triage
+curl -XPOST localhost:9912/webhook -d @payload.json
+```
+
+`GET /recent` returns the last 20 digests with the evidence the model was given
+and what it wrote. That is the fastest way to judge a prompt change, and it works
+without access to wherever digests are delivered.
+
+## Conventions
+
+- This repository is public. Use neutral placeholders in tests and docs — no real
+  hostnames, internal domains or private service names.
+- Comments explain constraints and the reason a thing is not the obvious thing.
+  They do not narrate what the next line does.
+- Deployment bumps live in a separate GitOps repository and are raised by
+  Renovate. Do not edit deployment manifests from here.
