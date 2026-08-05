@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,9 @@ var version = "dev"
 
 type Config struct {
 	ListenAddr     string
+	WebhookToken   string
+	MaxAlerts      int
+	MaxGroups      int
 	LiteLLMURL     string
 	LiteLLMKey     string
 	Model          string
@@ -31,6 +36,9 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		ListenAddr:     envDefault("LISTEN_ADDR", ":8080"),
+		WebhookToken:   os.Getenv("WEBHOOK_TOKEN"),
+		MaxAlerts:      envInt("MAX_ALERTS", 500),
+		MaxGroups:      envInt("MAX_GROUPS", 12),
 		LiteLLMURL:     envDefault("LITELLM_URL", ""),
 		LiteLLMKey:     os.Getenv("LITELLM_API_KEY"),
 		Model:          envDefault("MODEL", "dsv4f"),
@@ -98,6 +106,7 @@ func (r *recent) snapshot() []DigestRecord {
 // rather than a burst of unrelated-looking messages.
 type buffer struct {
 	mu      sync.Mutex
+	max     int
 	alerts  []Alert
 	seen    map[string]bool
 	firstAt time.Time
@@ -109,7 +118,11 @@ type buffer struct {
 // each copy duplicates its bullet in the digest and inflates every count the
 // operator reads, including "processing N alerts into M groups". The first
 // copy is kept, so StartsAt stays the one correlation windowing expects.
-func (b *buffer) add(alerts []Alert) {
+// It returns how many alerts were refused because the window is full. Refusing
+// the newest is deliberate: the alerts that opened the window are the ones that
+// explain a cascade, so evicting them to make room for the tail would discard
+// the trigger and keep the collateral.
+func (b *buffer) add(alerts []Alert) (rejected int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.alerts) == 0 {
@@ -123,9 +136,14 @@ func (b *buffer) add(alerts []Alert) {
 		if b.seen[id] {
 			continue
 		}
+		if b.max > 0 && len(b.alerts) >= b.max {
+			rejected++
+			continue
+		}
 		b.seen[id] = true
 		b.alerts = append(b.alerts, a)
 	}
+	return rejected
 }
 
 // take returns the buffered alerts if the window is due, clearing the buffer.
@@ -159,7 +177,7 @@ func main() {
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
 	}
 
-	buf := &buffer{}
+	buf := &buffer{max: cfg.MaxAlerts}
 	seen := &recent{max: 20}
 
 	mux := http.NewServeMux()
@@ -175,9 +193,28 @@ func main() {
 			logf("recent: encode: %v", err)
 		}
 	})
-	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/webhook", webhookHandler(cfg, buf))
+
+	go runFlushLoop(cfg, buf, k, hist, seen)
+	go runCompactLoop(hist)
+
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+func webhookHandler(cfg Config, buf *buffer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !authorized(cfg.WebhookToken, r) {
+			logf("webhook: rejected request without a valid token")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		defer r.Body.Close()
@@ -194,22 +231,43 @@ func main() {
 			}
 		}
 		if len(firing) > 0 {
-			buf.add(firing)
+			if rejected := buf.add(firing); rejected > 0 {
+				logf("webhook: window full at %d alerts, refused %d", cfg.MaxAlerts, rejected)
+			}
 		}
 		// Ack immediately; Alertmanager should never block on triage work.
 		w.WriteHeader(http.StatusAccepted)
-	})
-
-	go runFlushLoop(cfg, buf, k, hist, seen)
-	go runCompactLoop(hist)
-
-	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
 }
+
+// authorized checks the shared secret guarding /webhook. Every accepted group
+// costs a model call and a message in the operator channel, so an open endpoint
+// is both a spend and a spoofing vector.
+//
+// The token arrives as a bearer token because AlertmanagerConfig cannot set
+// arbitrary headers on a webhook receiver — httpConfig offers authorization,
+// basicAuth and bearerTokenSecret and nothing else. X-Webhook-Token is accepted
+// as well, since it is far easier to send by hand when replaying alerts.
+//
+// An unset token accepts everything and says so once. Enforcing unconditionally
+// would mean a new image silently rejects every alert until the receiver has
+// been given the secret, and silent triage failure is indistinguishable from a
+// quiet week.
+func authorized(token string, r *http.Request) bool {
+	if token == "" {
+		warnUnauthenticated.Do(func() {
+			log.Print("WEBHOOK_TOKEN is unset: /webhook accepts unauthenticated requests")
+		})
+		return true
+	}
+	if h := r.Header.Get("X-Webhook-Token"); h != "" {
+		return subtle.ConstantTimeCompare([]byte(h), []byte(token)) == 1
+	}
+	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(bearer), []byte(token)) == 1
+}
+
+var warnUnauthenticated sync.Once
 
 func runFlushLoop(cfg Config, buf *buffer, k *kube, hist *History, seen *recent) {
 	// Poll well inside the flush delay so the window is honoured rather than
@@ -247,10 +305,24 @@ func process(cfg Config, alerts []Alert, k *kube, hist *History, seen *recent) {
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
 	log.Printf("processing %d alerts into %d group(s)", len(alerts), len(groups))
 
-	for _, g := range groups {
+	// One model call per group means a burst of unique alerts sets the spend. Past
+	// the cap the digest still ships with its evidence; only the narrative is
+	// skipped, most urgent groups first, so what is lost is the explanation of the
+	// least urgent thing rather than the report of it.
+	sort.SliceStable(groups, func(i, j int) bool {
+		return severityRank(groups[i].Severity()) > severityRank(groups[j].Severity())
+	})
+	if cfg.MaxGroups > 0 && len(groups) > cfg.MaxGroups {
+		log.Printf("narrating the %d most urgent of %d groups; the rest ship without one (MAX_GROUPS=%d)",
+			cfg.MaxGroups, len(groups), cfg.MaxGroups)
+	}
+
+	for i, g := range groups {
 		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
-		r.Triage = Narrate(cfg, r)
+		if cfg.MaxGroups <= 0 || i < cfg.MaxGroups {
+			r.Triage = Narrate(cfg, r)
+		}
 		r.Narrative = r.Triage.Narrative
 
 		rec := DigestRecord{
@@ -278,6 +350,18 @@ func envDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	logf("bad integer for %s=%q, using %d", key, v, fallback)
 	return fallback
 }
 

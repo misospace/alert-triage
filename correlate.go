@@ -299,12 +299,23 @@ func (g Group) Signature() string {
 	return hex.EncodeToString(sum[:8])
 }
 
+func severityRank(s string) int {
+	switch s {
+	case "critical":
+		return 3
+	case "warning":
+		return 2
+	case "info":
+		return 1
+	}
+	return 0
+}
+
 // Severity returns the most urgent severity present in the group.
 func (g Group) Severity() string {
-	rank := map[string]int{"critical": 3, "warning": 2, "info": 1}
 	best, bestRank := "info", 0
 	for _, a := range g.Alerts {
-		if r := rank[a.severity()]; r > bestRank {
+		if r := severityRank(a.severity()); r > bestRank {
 			best, bestRank = a.severity(), r
 		}
 	}

@@ -76,6 +76,22 @@ hedging about not having checked the cluster.
 emitted them. Without labels the model reads "deployment" as a Kubernetes
 Deployment when it meant an upstream routing target.
 
+**Alert text is quoted, not trusted.** Annotations, labels, event messages and
+ambient findings are written by whoever emitted them, so they are fenced between
+`untrustedBegin` and `untrustedEnd` and passed through `untrusted()`, which
+flattens line structure and breaks up dash runs. The system prompt names that
+fence as a data boundary. Anything derived from an alert or from an object's own
+message belongs inside it; readings this service makes itself — node conditions,
+pod phases, Flux states, and the explicit negatives — stay outside, because
+fencing our own findings would tell the model to distrust them.
+
+**Webhook auth fails open when unconfigured.** An unset `WEBHOOK_TOKEN` accepts
+every request and warns once. Requiring it unconditionally would mean a new
+image silently 401s every alert until the receiver carries the secret, and
+silent triage failure is indistinguishable from a quiet week. `AlertmanagerConfig`
+cannot set arbitrary headers, so the token arrives via `httpConfig.authorization`
+as a bearer token.
+
 ## Testing against real data
 
 Unit tests cover correlation and rendering. For anything touching evidence or the
