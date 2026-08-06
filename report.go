@@ -232,6 +232,15 @@ func renderEvidence(r Report) string {
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
 	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
+	if len(r.Enrichment.PodLogs) > 0 {
+		b.WriteString("\nPod logs (previous container tail):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for podKey, log := range r.Enrichment.PodLogs {
+			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
+			b.WriteString(untrusted(log) + "\n")
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
@@ -387,6 +396,12 @@ func Deliver(cfg Config, r Report) error {
 	}
 	writeDiscordSection(&desc, "Unhealthy nodes", r.Enrichment.Nodes)
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
+	if len(r.Enrichment.PodLogs) > 0 {
+		desc.WriteString("**Pod logs (previous container tail)**\n")
+		for podKey, log := range r.Enrichment.PodLogs {
+			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, strings.TrimSpace(log))
+		}
+	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
 
