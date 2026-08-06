@@ -20,9 +20,10 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 // large dependency tree for what amounts to four GETs, so this talks to the
 // apiserver directly with the in-cluster ServiceAccount credentials.
 type kube struct {
-	base  string
-	token string
-	hc    *http.Client
+	base    string
+	token   string
+	hc      *http.Client
+	cluster string // cluster label this client belongs to (empty = local/default)
 }
 
 func newKube() (*kube, error) {
@@ -217,15 +218,31 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 // Enrich gathers cluster state and recent GitOps changes for a group. Failures
 // degrade the digest rather than block it: a partial story beats none.
 //
-// Cluster-level signals are always collected, because most alerts carry no
-// namespace label at all (node, exporter and recording-rule alerts especially)
-// and would otherwise yield an empty evidence block.
+// When the group's cluster label does not match this client's cluster, the
+// enrichment is skipped and Scope reports "cluster state unavailable" to avoid
+// producing wrong evidence from a foreign API server.
 func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
 		return e
 	}
+
+	// Check cluster match: if the group is from a different cluster than this
+	// client can reach, do not enrich against the wrong API server.
+	groupCluster := g.Cluster
+	if groupCluster == "" {
+		groupCluster = "default"
+	}
+	clientCluster := k.cluster
+	if clientCluster == "" {
+		clientCluster = "default"
+	}
+	if groupCluster != clientCluster {
+		e.Scope = fmt.Sprintf("cluster state unavailable (group is from cluster %q, this client serves %q)", groupCluster, clientCluster)
+		return e
+	}
+
 	since := time.Now().Add(-window)
 
 	// Node health is reported as a direct finding regardless of scope: a node in
