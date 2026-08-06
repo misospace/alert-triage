@@ -172,8 +172,8 @@ func TestSeverityTakesMostUrgent(t *testing.T) {
 
 func TestTitleSummarisesMultiple(t *testing.T) {
 	g := Group{Alerts: []Alert{alert("A", "x", "warning", 0), alert("B", "x", "warning", 0)}}
-	if got := g.Title(); got != "A +1 more" {
-		t.Errorf("want 'A +1 more', got %q", got)
+	if got := g.Title(); got != "[default] A + 1 more" {
+		t.Errorf("want '[default] A + 1 more', got %q", got)
 	}
 }
 
@@ -237,5 +237,80 @@ func TestSameAlertAcrossNamespacesGroups(t *testing.T) {
 	}
 	if groups[0].Key != "alert/KubeHpaMaxedOut" {
 		t.Errorf("want alert/KubeHpaMaxedOut, got %s", groups[0].Key)
+	}
+}
+
+// Regression: alerts from different clusters must never fuse into one group.
+// Namespace names collide across clusters (kube-system, observability, etc.)
+// so the cluster label must be part of grouping identity.
+func TestDifferentClustersStaySeparate(t *testing.T) {
+	mk := func(name, ns, cluster string) Alert {
+		return Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": name,
+				"namespace": ns,
+				"cluster":   cluster,
+				"severity":  "warning",
+			},
+			Annotations: map[string]string{},
+			StartsAt:    base,
+			Fingerprint: cluster + "/" + name,
+		}
+	}
+
+	alerts := []Alert{
+		// Cluster "primary" — two alerts that would group by namespace
+		mk("KubePodCrashLooping", "kube-system", "primary"),
+		mk("KubeDeploymentReplicasMismatch", "kube-system", "primary"),
+		// Cluster "utility" — same namespace name, different cluster
+		mk("KubePodCrashLooping", "kube-system", "utility"),
+		mk("KubeDeploymentReplicasMismatch", "kube-system", "utility"),
+	}
+
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	// Check that no group contains alerts from both clusters.
+	for _, g := range groups {
+		clusters := map[string]bool{}
+		for _, a := range g.Alerts {
+			clusters[a.Labels["cluster"]] = true
+		}
+		if len(clusters) > 1 {
+			t.Errorf("group %s fused alerts from multiple clusters: %v", g.Key, clusters)
+		}
+	}
+
+	// Each cluster should have its own group(s).
+	primaryGroups := 0
+	utilityGroups := 0
+	for _, g := range groups {
+		if g.Cluster == "primary" {
+			primaryGroups++
+		} else if g.Cluster == "utility" {
+			utilityGroups++
+		}
+	}
+	if primaryGroups < 1 {
+		t.Error("expected at least one group for cluster 'primary'")
+	}
+	if utilityGroups < 1 {
+		t.Error("expected at least one group for cluster 'utility'")
+	}
+}
+
+// Group.Signature must include the cluster so history dedup does not merge
+// identical incidents from different clusters.
+func TestSignatureIncludesCluster(t *testing.T) {
+	a := alert("KubePodCrashLooping", "kube-system", "warning", 0)
+	a.Labels["cluster"] = "primary"
+	b := alert("KubePodCrashLooping", "kube-system", "warning", 0)
+	b.Labels["cluster"] = "utility"
+
+	gA := Group{Cluster: "primary", Key: "single/KubePodCrashLooping", Alerts: []Alert{a}}
+	gB := Group{Cluster: "utility", Key: "single/KubePodCrashLooping", Alerts: []Alert{b}}
+
+	if sigA, sigB := gA.Signature(), gB.Signature(); sigA == sigB {
+		t.Errorf("signatures for different clusters must differ; got %s for both", sigA)
 	}
 }

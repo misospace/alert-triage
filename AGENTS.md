@@ -41,6 +41,19 @@ unreachable the digest still ships with whatever is available. Keep it that way.
 
 ## Invariants
 
+**Multi-cluster support.** The service can triage alerts from multiple clusters
+in a single instance. Alerts are partitioned by their `cluster` label before
+correlation so that incidents from different clusters never fuse together
+(namespace names collide across clusters). Each group is enriched against its
+own cluster's API server; if no client is available for the group's cluster,
+enrichment reports "cluster state unavailable" rather than producing wrong
+evidence from a foreign API server. The digest names the cluster it came from
+so operators can distinguish incidents when multiple clusters share one Discord
+channel. Originally the service was deliberately cluster-local: a second
+instance needed no shared credentials or state. That invariant was replaced
+because running one instance per cluster doubles what has to be watched and
+there are no metrics yet (#17), so a dead instance looks like a quiet cluster.
+
 **Stdlib only.** No `client-go`, no SDKs. The Kubernetes client is plain HTTP
 against the apiserver using the in-cluster ServiceAccount token. Four GETs do
 not justify the dependency tree. If you need a new resource, add a struct and a

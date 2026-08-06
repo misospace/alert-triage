@@ -202,6 +202,11 @@ func Narrate(cfg Config, r Report) Triage {
 
 func renderEvidence(r Report) string {
 	var b strings.Builder
+	cluster := r.Group.Cluster
+	if cluster == "" {
+		cluster = "default"
+	}
+	fmt.Fprintf(&b, "Cluster: %s\n", cluster)
 	fmt.Fprintf(&b, "Grouping: %s (%s)\n", r.Group.Key, r.Group.Reason)
 	if r.Group.Node != "" {
 		fmt.Fprintf(&b, "Node: %s\n", r.Group.Node)
@@ -411,6 +416,9 @@ func Deliver(cfg Config, r Report) error {
 		seen = fmt.Sprintf("seen %d time(s) recently", r.PriorSeen)
 	}
 	embed.Footer.Text = fmt.Sprintf("%s · %s · %s", r.Group.Key, r.Group.Severity(), seen)
+	if cluster := r.Group.Cluster; cluster != "" && cluster != "default" {
+		embed.Footer.Text = cluster + " · " + embed.Footer.Text
+	}
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
 	if err != nil {

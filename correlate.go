@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ type Payload struct {
 func (a Alert) name() string      { return a.Labels["alertname"] }
 func (a Alert) namespace() string { return alertNamespace(a) }
 func (a Alert) severity() string  { return a.Labels["severity"] }
+func (a Alert) cluster() string   { return a.Labels["cluster"] }
 
 // identity distinguishes one alert from another. Alertmanager sends a
 // fingerprint, but replayed and hand-built payloads routinely omit it, and an
@@ -56,6 +58,7 @@ func (a Alert) identity() string {
 // Group is a set of alerts believed to share a root cause.
 type Group struct {
 	Key        string
+	Cluster    string
 	Reason     string
 	Node       string
 	Namespaces []string
@@ -158,14 +161,33 @@ func overlaps(a, b Alert, slack time.Duration) bool {
 // Correlate groups alerts that plausibly share a root cause. It is pure: node
 // attribution must already be resolved into nodeOf, keyed by fingerprint.
 //
-// Precedence is signature, then node, then namespace. A signature beats a node
-// match because shared-storage and DNS faults cross node boundaries, and
-// splitting them by node would report one incident as several.
+// Alerts are first partitioned by their "cluster" label so that incidents from
+// different clusters never fuse together (namespace names collide across
+// clusters). Within each cluster partition, precedence is signature, then node,
+// then namespace. A signature beats a node match because shared-storage and
+// DNS faults cross node boundaries, and splitting them by node would report one
+// incident as several.
 func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration) []Group {
 	if len(alerts) == 0 {
 		return nil
 	}
 
+	// Partition alerts by cluster label so correlation never crosses clusters.
+	byCluster := map[string][]Alert{}
+	for _, a := range alerts {
+		byCluster[a.cluster()] = append(byCluster[a.cluster()], a)
+	}
+
+	var groups []Group
+	for _, clusterAlerts := range byCluster {
+		groups = append(groups, correlateCluster(clusterAlerts, nodeOf, sigs, slack)...)
+	}
+	return groups
+}
+
+// correlateCluster runs the correlation algorithm on alerts from a single
+// cluster partition.
+func correlateCluster(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration) []Group {
 	claimed := make([]bool, len(alerts))
 	var groups []Group
 
@@ -280,6 +302,9 @@ func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Gro
 		if g.Node == "" && nodeOf != nil {
 			g.Node = nodeOf[a.Fingerprint]
 		}
+		if g.Cluster == "" {
+			g.Cluster = a.cluster()
+		}
 	}
 	sort.Strings(g.Namespaces)
 	return g
@@ -288,14 +313,20 @@ func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Gro
 // Signature is the stable identity of a group across firings, used to look up
 // how often this same shape has been seen before. It deliberately excludes
 // timestamps and instance labels so a recurrence matches its predecessor.
+// The cluster label is included so that identical incidents on different
+// clusters are tracked separately.
 func (g Group) Signature() string {
+	cluster := g.Cluster
+	if cluster == "" {
+		cluster = "default"
+	}
 	names := make([]string, 0, len(g.Alerts))
 	for _, a := range g.Alerts {
 		names = append(names, a.name())
 	}
 	sort.Strings(names)
 	names = dedupe(names)
-	sum := sha256.Sum256([]byte(strings.Join(names, "|") + "@" + g.Node))
+	sum := sha256.Sum256([]byte(cluster + ":" + strings.Join(names, "|") + "@" + g.Node))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -324,6 +355,10 @@ func (g Group) Severity() string {
 
 // Title summarises the group for a message header.
 func (g Group) Title() string {
+	cluster := g.Cluster
+	if cluster == "" {
+		cluster = "default"
+	}
 	names := make([]string, 0, len(g.Alerts))
 	for _, a := range g.Alerts {
 		names = append(names, a.name())
@@ -331,9 +366,9 @@ func (g Group) Title() string {
 	names = dedupe(names)
 	sort.Strings(names)
 	if len(names) == 1 {
-		return names[0]
+		return fmt.Sprintf("[%s] %s", cluster, names[0])
 	}
-	return names[0] + " +" + itoa(len(names)-1) + " more"
+	return fmt.Sprintf("[%s] %s + %d more", cluster, names[0], len(names)-1)
 }
 
 func dedupe(in []string) []string {
