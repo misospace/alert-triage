@@ -5,9 +5,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -146,6 +148,7 @@ type nodeList struct {
 type Enrichment struct {
 	Nodes         []string
 	UnhealthyPods []string
+	PodLogs       map[string]string // pod key -> tail of previous container log
 	Events        []string
 	RecentChanges []string
 	// Ambient is cluster-wide context gathered when the alert names no subject
@@ -159,7 +162,7 @@ type Enrichment struct {
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
+		len(e.PodLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -277,6 +280,7 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
+	e.PodLogs = k.fetchPodLogs(e.UnhealthyPods)
 	e.Events = capList(dedupe(e.Events), 8)
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
 	// Ambient only has to be enough for the model to rule things out.
@@ -358,6 +362,67 @@ func (k *kube) warningEvents(namespace string, since time.Time) []string {
 			strings.SplitN(key, "/", 2)[0], a.count, a.kind, a.example, a.sample))
 	}
 	return out
+}
+
+// podLogTail is the maximum number of lines to fetch per unhealthy pod.
+const podLogTail = 20
+
+// secretPatterns are common patterns that likely contain secrets in logs.
+var secretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+`),
+	regexp.MustCompile(`(?i)(password|passwd|pwd)\s*[=:]\s*\S+`),
+	regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*\S+`),
+	regexp.MustCompile(`(?i)(secret|credential)\s*[=:]\s*\S+`),
+	regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`),
+}
+
+// stripSecrets replaces obvious secrets in log lines with [REDACTED].
+func stripSecrets(s string) string {
+	for _, re := range secretPatterns {
+		s = re.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
+}
+
+// fetchPodLogs retrieves the tail of the previous container log for each
+// unhealthy pod. Returns a map keyed by "namespace/name".
+func (k *kube) fetchPodLogs(pods []string) map[string]string {
+	if len(pods) == 0 || k.hc == nil {
+		return nil
+	}
+
+	logs := make(map[string]string)
+	for _, podKey := range pods {
+		parts := strings.SplitN(podKey, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ns, name := parts[0], parts[1]
+
+		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?previous=true&tailLines=%d", ns, name, podLogTail)
+		req, err := http.NewRequest("GET", k.base+path, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+k.token)
+		resp, err := k.hc.Do(req)
+		if err != nil {
+			logf("enrich: pod logs (%s): %v", podKey, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		logs[podKey] = stripSecrets(strings.TrimSpace(string(data)))
+	}
+
+	return logs
 }
 
 // fluxNotReady reports Flux resources that are failing, and - only when scoped
