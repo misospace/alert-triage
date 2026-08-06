@@ -147,7 +147,7 @@ type chatResp struct {
 // Narrate asks the model for a story and a judgement about where a fix belongs.
 // A failure here is not fatal: the digest still ships with its evidence, just
 // without the summary.
-func Narrate(cfg Config, r Report) Triage {
+func Narrate(cfg *Config, r Report) Triage {
 	if cfg.LiteLLMURL == "" {
 		return Triage{}
 	}
@@ -381,7 +381,7 @@ func severityColor(s string) int {
 }
 
 // Deliver posts one incident to the digest webhook.
-func Deliver(cfg Config, r Report) error {
+func Deliver(cfg *Config, r Report) error {
 	if cfg.DiscordURL == "" {
 		return fmt.Errorf("no discord webhook configured")
 	}

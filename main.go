@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,19 @@ type Config struct {
 	EvidenceWindow time.Duration
 	Retention      time.Duration
 	NarrateTimeout time.Duration
+
+	// TriageLabel, when set, makes the webhook drop any alert whose
+	// labels[TriageLabel] is not "true". It defaults to empty so a fresh
+	// deployment triages everything (fail-open, matching WEBHOOK_TOKEN):
+	// nothing in either cluster labels its rules today, and dropping them
+	// silently would look identical to a quiet week. Flip this on after
+	// the PrometheusRules in home-ops carry the label.
+	TriageLabel string
+
+	// DroppedByLabel counts alerts the webhook dropped because they
+	// lacked the TriageLabel. Surfaced in the delivery log so a
+	// label-rule typo is visible without waiting on Prometheus metrics.
+	DroppedByLabel atomic.Int64
 }
 
 func loadConfig() Config {
@@ -50,6 +64,7 @@ func loadConfig() Config {
 		EvidenceWindow: envDuration("EVIDENCE_WINDOW", 30*time.Minute),
 		Retention:      envDuration("RETENTION", 7*24*time.Hour),
 		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
+		TriageLabel:    os.Getenv("TRIAGE_LABEL"),
 	}
 }
 
@@ -193,9 +208,9 @@ func main() {
 			logf("recent: encode: %v", err)
 		}
 	})
-	mux.HandleFunc("/webhook", webhookHandler(cfg, buf))
+	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
 
-	go runFlushLoop(cfg, buf, k, hist, seen)
+	go runFlushLoop(&cfg, buf, k, hist, seen)
 	go runCompactLoop(hist)
 
 	srv := &http.Server{
@@ -206,7 +221,7 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func webhookHandler(cfg Config, buf *buffer) http.HandlerFunc {
+func webhookHandler(cfg *Config, buf *buffer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -228,6 +243,27 @@ func webhookHandler(cfg Config, buf *buffer) http.HandlerFunc {
 		for _, a := range p.Alerts {
 			if a.Status != "resolved" {
 				firing = append(firing, a)
+			}
+		}
+		// Opt-in triage: when TriageLabel is set, only alerts whose label is
+		// exactly "true" are buffered. An empty TriageLabel fails open so a
+		// fresh image keeps triaging everything; gates are flipped on after
+		// the rules in home-ops carry the label.
+		var dropped int
+		if cfg.TriageLabel != "" {
+			optIn := firing[:0]
+			for _, a := range firing {
+				if a.Labels[cfg.TriageLabel] == "true" {
+					optIn = append(optIn, a)
+				} else {
+					dropped++
+				}
+			}
+			firing = optIn
+			if dropped > 0 {
+				cfg.DroppedByLabel.Add(int64(dropped))
+				logf("webhook: dropped %d alert(s) without %s=true (cumulative %d)",
+					dropped, cfg.TriageLabel, cfg.DroppedByLabel.Load())
 			}
 		}
 		if len(firing) > 0 {
@@ -269,7 +305,7 @@ func authorized(token string, r *http.Request) bool {
 
 var warnUnauthenticated sync.Once
 
-func runFlushLoop(cfg Config, buf *buffer, k *kube, hist *History, seen *recent) {
+func runFlushLoop(cfg *Config, buf *buffer, k *kube, hist *History, seen *recent) {
 	// Poll well inside the flush delay so the window is honoured rather than
 	// rounded up to the tick.
 	interval := cfg.FlushDelay / 4
@@ -300,7 +336,7 @@ func runCompactLoop(hist *History) {
 	}
 }
 
-func process(cfg Config, alerts []Alert, k *kube, hist *History, seen *recent) {
+func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent) {
 	nodeOf := k.ResolveNodes(alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
 	log.Printf("processing %d alerts into %d group(s)", len(alerts), len(groups))

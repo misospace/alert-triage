@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -198,7 +200,7 @@ func TestWebhookTokenEnforcement(t *testing.T) {
 				req.Header.Set(tt.header, tt.value)
 			}
 			w := httptest.NewRecorder()
-			webhookHandler(Config{WebhookToken: tt.token}, buf)(w, req)
+			webhookHandler(&Config{WebhookToken: tt.token}, buf)(w, req)
 
 			if w.Code != tt.want {
 				t.Errorf("status = %d, want %d", w.Code, tt.want)
@@ -211,6 +213,149 @@ func TestWebhookTokenEnforcement(t *testing.T) {
 				t.Errorf("rejected request must not buffer anything, got %d", buffered)
 			}
 		})
+	}
+}
+
+// Triage is opt-in by label so a flood of uninteresting upstream alerts does
+// not cost a model call. The filter is gated behind TriageLabel so a fresh
+// deployment with no labelled rules keeps triaging everything — flipping it
+// on with nothing labelled would otherwise drop 100% of alerts silently.
+func TestWebhookTriageLabelOptIn(t *testing.T) {
+	mkPayload := func(alerts ...Alert) string {
+		body, _ := json.Marshal(Payload{Alerts: alerts})
+		return string(body)
+	}
+	mkReq := func(t *testing.T, body, label string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+		req.Header.Set("X-Webhook-Token", "secret")
+		return req
+	}
+
+	cases := []struct {
+		name     string
+		label    string
+		alerts   []Alert
+		wantBuf  int
+		wantDrop int64
+	}{
+		{
+			name:    "empty label disables the filter",
+			label:   "",
+			alerts:  []Alert{{Fingerprint: "a"}, {Fingerprint: "b"}},
+			wantBuf: 2,
+		},
+		{
+			name:     "label absent on alert is dropped",
+			label:    "triage",
+			alerts:   []Alert{{Fingerprint: "a", Labels: map[string]string{"severity": "critical"}}},
+			wantDrop: 1,
+		},
+		{
+			name:     "label value false is dropped",
+			label:    "triage",
+			alerts:   []Alert{{Fingerprint: "a", Labels: map[string]string{"triage": "false"}}},
+			wantDrop: 1,
+		},
+		{
+			name:    "label value true is buffered",
+			label:   "triage",
+			alerts:  []Alert{{Fingerprint: "a", Labels: map[string]string{"triage": "true"}}},
+			wantBuf: 1,
+		},
+		{
+			name:  "custom label name is honoured",
+			label: "ship-to-triage",
+			alerts: []Alert{
+				{Fingerprint: "a", Labels: map[string]string{"ship-to-triage": "true"}},
+			},
+			wantBuf: 1,
+		},
+		{
+			name:  "mixed batch counts drops and buffers true only",
+			label: "triage",
+			alerts: []Alert{
+				{Fingerprint: "yes", Labels: map[string]string{"triage": "true"}},
+				{Fingerprint: "no"},
+				{Fingerprint: "off", Labels: map[string]string{"triage": "false"}},
+				{Fingerprint: "yes2", Labels: map[string]string{"triage": "True"}}, // case sensitive on purpose
+			},
+			wantBuf:  1,
+			wantDrop: 3,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg Config
+			cfg.WebhookToken = "secret"
+			cfg.TriageLabel = tt.label
+			buf := &buffer{}
+			w := httptest.NewRecorder()
+			webhookHandler(&cfg, buf)(w, mkReq(t, mkPayload(tt.alerts...), tt.label))
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
+			}
+			if got := len(buf.take(time.Now(), 0, 0)); got != tt.wantBuf {
+				t.Errorf("buffered = %d, want %d", got, tt.wantBuf)
+			}
+			if got := cfg.DroppedByLabel.Load(); got != tt.wantDrop {
+				t.Errorf("DroppedByLabel = %d, want %d", got, tt.wantDrop)
+			}
+		})
+	}
+}
+
+// Resolved alerts never carry the opt-in label, so once the filter is on the
+// webhook must continue to drop them silently rather than double-count them
+// against the DroppedByLabel total.
+func TestWebhookResolvedSkipsLabelCounter(t *testing.T) {
+	var cfg Config
+	cfg.WebhookToken = "secret"
+	cfg.TriageLabel = "triage"
+	body, _ := json.Marshal(Payload{Alerts: []Alert{
+		{Status: "resolved", Fingerprint: "old"},
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Webhook-Token", "secret")
+	buf := &buffer{}
+	webhookHandler(&cfg, buf)(httptest.NewRecorder(), req)
+	if got := cfg.DroppedByLabel.Load(); got != 0 {
+		t.Errorf("DroppedByLabel = %d for resolved-only batch, want 0", got)
+	}
+}
+
+// Concurrent deliveries must each contribute to the cumulative counter
+// without losing updates. atomic.Int64 is what keeps this safe.
+func TestWebhookDroppedCounterConcurrent(t *testing.T) {
+	var cfg Config
+	cfg.WebhookToken = "secret"
+	cfg.TriageLabel = "triage"
+	handler := webhookHandler(&cfg, &buffer{})
+
+	const deliveries = 32
+	const perDelivery = 4
+	body, _ := json.Marshal(Payload{Alerts: []Alert{
+		{Fingerprint: "dropped", Labels: map[string]string{"triage": "false"}},
+		{Fingerprint: "dropped2"},
+		{Fingerprint: "kept", Labels: map[string]string{"triage": "true"}},
+		{Status: "resolved"},
+	}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < deliveries; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+			req.Header.Set("X-Webhook-Token", "secret")
+			handler(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
+
+	// Two of the four alerts lack triage=true; resolved already dropped.
+	if want := int64(deliveries * 2); cfg.DroppedByLabel.Load() != want {
+		t.Errorf("DroppedByLabel = %d, want %d", cfg.DroppedByLabel.Load(), want)
 	}
 }
 
@@ -244,7 +389,7 @@ func TestBufferNoCapWhenUnset(t *testing.T) {
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	for _, e := range []string{"DISCORD_WEBHOOK_URL", "RETENTION", "FLUSH_DELAY", "MAX_WINDOW"} {
+	for _, e := range []string{"DISCORD_WEBHOOK_URL", "RETENTION", "FLUSH_DELAY", "MAX_WINDOW", "TRIAGE_LABEL"} {
 		os.Unsetenv(e)
 	}
 	cfg := loadConfig()
@@ -257,14 +402,22 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxWindow != 10*time.Minute {
 		t.Errorf("default max window = %v, want 10m", cfg.MaxWindow)
 	}
+	// TRIAGE_LABEL must default to empty so a fresh image triages every
+	// alert; flipping the gate on with no labelled rules would drop them
+	// all silently.
+	if cfg.TriageLabel != "" {
+		t.Errorf("default TriageLabel = %q, want \"\"", cfg.TriageLabel)
+	}
 }
 
 func TestLoadConfigCustom(t *testing.T) {
 	os.Setenv("DISCORD_WEBHOOK_URL", "https://example.com/hook")
 	os.Setenv("RETENTION", "48h")
+	os.Setenv("TRIAGE_LABEL", "triage")
 	defer func() {
 		os.Unsetenv("DISCORD_WEBHOOK_URL")
 		os.Unsetenv("RETENTION")
+		os.Unsetenv("TRIAGE_LABEL")
 	}()
 
 	cfg := loadConfig()
@@ -273,5 +426,8 @@ func TestLoadConfigCustom(t *testing.T) {
 	}
 	if cfg.Retention != 48*time.Hour {
 		t.Errorf("retention = %v, want 48h", cfg.Retention)
+	}
+	if cfg.TriageLabel != "triage" {
+		t.Errorf("TriageLabel = %q, want triage", cfg.TriageLabel)
 	}
 }

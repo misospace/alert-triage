@@ -57,6 +57,58 @@ unreachable, the digest still ships with whatever is available.
 | `EVIDENCE_WINDOW`     | `30m`                | How far back to look for events and changes    |
 | `RETENTION`           | `168h`               | History retention                              |
 | `NARRATE_TIMEOUT`     | `120s`               | Model call timeout                             |
+| `TRIAGE_LABEL`        | —                    | When set, only alerts whose `<label>="true"` is buffered. Empty triages everything. |
+
+## Opt-in triage
+
+Triage costs a model call and a Discord message. Alerts that nobody reading
+this cluster can act on — upstream API quotas, third-party vendor outages,
+informational notices — still cost those today. The principle is that the
+alerting rules know whether a fire is worth investigating, so opt-in is by
+label: only PrometheusRules carrying `<TRIAGE_LABEL>="true"` get triaged.
+
+The contract is enforced in two places:
+
+- **Alertmanager route** (lives in `joryirving/home-ops`, not here): match on
+  the label and route those alerts to the `/webhook` receiver. This is the
+  primary contract — the filter below is a backstop for misroutes.
+- **Webhook** (this service): when `TRIAGE_LABEL` is set, the handler drops
+  any alert whose label is not exactly `"true"` and logs a single line per
+  delivery with the cumulative drop count, so a label-rule typo is visible
+  without checking metrics.
+
+`TRIAGE_LABEL` defaults to empty (fail-open, matching `WEBHOOK_TOKEN`), so a
+fresh image triages every alert. Leave it unset until the rules in `home-ops`
+are labelled; flipping it on beforehand silently drops everything.
+
+Rollout ordering:
+
+1. Ship this code with `TRIAGE_LABEL` unset so behaviour is unchanged.
+2. Label the PrometheusRules you want triaged in `home-ops`.
+3. Add an Alertmanager route matcher for `<label> = "true"`.
+4. Set `TRIAGE_LABEL` on the deployment. The webhook filter then backstops
+   anything the route missed.
+
+Example rule with the opt-in label:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: home-cluster
+spec:
+  groups:
+    - name: critical
+      rules:
+        - alert: NodeDown
+          labels:
+            triage: "true"
+            severity: critical
+```
+
+The value is matched literally: `triage="True"`, `triage="yes"`, or an absent
+label are all dropped. This is deliberate — a typo on the rule side is what
+the backstop is for, and the cumulative drop log line is how you notice it.
 
 ## Deploying
 

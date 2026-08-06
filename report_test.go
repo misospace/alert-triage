@@ -38,7 +38,7 @@ func TestDeliverDiscord(t *testing.T) {
 
 	cfg := Config{DiscordURL: srv.URL}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1", Labels: map[string]string{"alertname": "HighCPU"}}}}}
-	if err := Deliver(cfg, rpt); err != nil {
+	if err := Deliver(&cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(receivedBody, "sig-1") {
@@ -60,7 +60,7 @@ func TestDeliverClamp(t *testing.T) {
 	cfg := Config{DiscordURL: srv.URL}
 	longNarrative := strings.Repeat("x", 5000)
 	rpt := Report{Group: Group{Key: "sig-clamp", Alerts: []Alert{{Fingerprint: "fp-1"}}}, Narrative: longNarrative}
-	if err := Deliver(cfg, rpt); err != nil {
+	if err := Deliver(&cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -87,7 +87,7 @@ func TestDeliverWithEnrichment(t *testing.T) {
 		Group:      Group{Key: "sig-enrich", Alerts: []Alert{{Fingerprint: "fp-1"}}},
 		Enrichment: Enrichment{Nodes: []string{"node1 not ready"}},
 	}
-	if err := Deliver(cfg, rpt); err != nil {
+	if err := Deliver(&cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(receivedBody, "node1 not ready") {
@@ -98,7 +98,7 @@ func TestDeliverWithEnrichment(t *testing.T) {
 func TestDeliverNoURL(t *testing.T) {
 	cfg := Config{}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
-	if err := Deliver(cfg, rpt); err == nil {
+	if err := Deliver(&cfg, rpt); err == nil {
 		t.Error("expected error when no Discord URL configured")
 	}
 }
@@ -111,7 +111,7 @@ func TestDeliverServerFailure(t *testing.T) {
 
 	cfg := Config{DiscordURL: srv.URL}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
-	if err := Deliver(cfg, rpt); err == nil {
+	if err := Deliver(&cfg, rpt); err == nil {
 		t.Error("expected error on server failure")
 	}
 }
