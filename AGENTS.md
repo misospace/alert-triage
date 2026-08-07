@@ -105,6 +105,19 @@ silent triage failure is indistinguishable from a quiet week. `AlertmanagerConfi
 cannot set arbitrary headers, so the token arrives via `httpConfig.authorization`
 as a bearer token.
 
+**Triage is opt-in by label and defaults to failing open.** The webhook drops
+any alert whose `<TRIAGE_LABEL>` label is not exactly `"true"` *only when*
+`TRIAGE_LABEL` is set; an empty value is a no-op and the service triages
+everything, matching the `WEBHOOK_TOKEN` convention. Reasoning: no cluster
+labels its PrometheusRules today, so deploying with the filter on would drop
+every alert — silent failure indistinguishable from a quiet week. The
+rollout ordering is to ship the code, label the rules in the GitOps repo, and
+only then set `TRIAGE_LABEL`. The web counter `Config.DroppedByLabel` is
+logged on every batch that drops anything, so a label-rule typo is visible
+in `journalctl` before metrics land (#17). The primary contract lives in the
+Alertmanager route; the service-side filter is a backstop for misrouted
+alerts and the deployment must hold both.
+
 ## Testing against real data
 
 Unit tests cover correlation and rendering. For anything touching evidence or the
