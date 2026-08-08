@@ -17,6 +17,7 @@ type Report struct {
 	PriorSeen  int
 	Narrative  string
 	Triage     Triage
+	Metrics    []MetricSummary // nil when no backend configured; empty when queries returned nothing
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -250,6 +251,27 @@ func renderEvidence(r Report) string {
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.RecentChanges, "no reconciles or failures in the window, so a recent deploy is unlikely")
+
+	// Metrics: nil means no backend configured; empty slice means queries returned nothing.
+	if r.Metrics != nil {
+		b.WriteString("\nMETRICS (queried from Prometheus-compatible backend)\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, m := range r.Metrics {
+			if !m.HasData {
+				fmt.Fprintf(&b, "- %s: no data returned\n", untrusted(m.Name))
+			} else {
+				fmt.Fprintf(&b, "- %s: min=%s max=%s last=%s (%s)\n",
+					untrusted(m.Name),
+					formatMetricValue(m.Name, m.Min),
+					formatMetricValue(m.Name, m.Max),
+					formatMetricValue(m.Name, m.Last),
+					m.Direction)
+			}
+		}
+		b.WriteString(untrustedEnd + "\n")
+	} else {
+		b.WriteString("\nMETRICS: no metrics backend configured (set METRICS_URL)\n")
+	}
 
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")

@@ -45,6 +45,17 @@ type Config struct {
 	// lacked the TriageLabel. Surfaced in the delivery log so a
 	// label-rule typo is visible without waiting on Prometheus metrics.
 	DroppedByLabel atomic.Int64
+
+	// MetricsURL, when set, points to a Prometheus-compatible backend
+	// (Prometheus, VictoriaMetrics, Thanos, Mimir, promxy). The alert's
+	// firing rule expression is recovered from /api/v1/rules and queried
+	// across the group's window. A fixed set of contextual metrics
+	// (restarts, memory, CPU throttling) are also fetched for pods in scope.
+	MetricsURL string
+
+	// Prometheus is the client used to query the metrics backend.
+	// Nil when MetricsURL is empty (no backend configured).
+	Prometheus *Prometheus
 }
 
 func loadConfig() Config {
@@ -65,6 +76,7 @@ func loadConfig() Config {
 		Retention:      envDuration("RETENTION", 7*24*time.Hour),
 		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
 		TriageLabel:    os.Getenv("TRIAGE_LABEL"),
+		MetricsURL:     os.Getenv("METRICS_URL"),
 	}
 }
 
@@ -190,6 +202,13 @@ func main() {
 		// Enrichment is optional; without it the digest still correlates and
 		// narrates, so this must not be fatal for local runs or a broken SA.
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
+	}
+
+	cfg.Prometheus = newPrometheus(cfg.MetricsURL)
+	if cfg.Prometheus != nil {
+		log.Printf("metrics backend configured: %s", cfg.MetricsURL)
+	} else {
+		log.Printf("no metrics backend (set METRICS_URL)")
 	}
 
 	buf := &buffer{max: cfg.MaxAlerts}
@@ -360,6 +379,9 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent) 
 			r.Triage = Narrate(cfg, r)
 		}
 		r.Narrative = r.Triage.Narrative
+
+		// Fetch metrics: nil when no backend configured; empty when queries return nothing.
+		r.Metrics = cfg.Prometheus.FetchGroupMetrics(g, cfg.EvidenceWindow)
 
 		rec := DigestRecord{
 			At: time.Now(), Key: g.Key, Title: g.Title(), Severity: g.Severity(),
