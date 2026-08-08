@@ -246,6 +246,15 @@ func renderEvidence(r Report) string {
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
+	// Backend logs are workload-authored and belong in the untrusted fence.
+	if r.Enrichment.BackendLogs != "" {
+		b.WriteString("\nLog backend (workload logs from external backend):\n")
+		b.WriteString(untrustedBegin + "\n")
+		b.WriteString(untrusted(r.Enrichment.BackendLogs) + "\n")
+		b.WriteString(untrustedEnd + "\n")
+	} else if r.Enrichment.BackendLogStatus != "" {
+		fmt.Fprintf(&b, "\nLog backend: %s\n", r.Enrichment.BackendLogStatus)
+	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
@@ -406,6 +415,12 @@ func Deliver(cfg *Config, r Report) error {
 		for podKey, log := range r.Enrichment.PodLogs {
 			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, strings.TrimSpace(log))
 		}
+	}
+	if r.Enrichment.BackendLogs != "" {
+		desc.WriteString("**Log backend**\n")
+		desc.WriteString("```\n" + strings.TrimSpace(r.Enrichment.BackendLogs) + "\n```\n")
+	} else if r.Enrichment.BackendLogStatus != "" {
+		fmt.Fprintf(&desc, "**Log backend:** %s\n", r.Enrichment.BackendLogStatus)
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)

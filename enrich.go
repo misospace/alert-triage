@@ -156,6 +156,12 @@ type Enrichment struct {
 	// to scope to. It is NOT known to concern the alert, and is kept apart so a
 	// coincidence is not read as a cause.
 	Ambient []string
+	// BackendLogs are log lines fetched from an external log backend (VictoriaLogs
+	// or Loki). These are workload-authored and belong in the untrusted fence.
+	BackendLogs string
+	// BackendLogStatus records whether the log backend was configured and what it
+	// returned, so the narrative can distinguish "no backend" from "nothing found".
+	BackendLogStatus string
 	// Scope records what was actually inspected, so the narrative can
 	// distinguish "nothing is wrong" from "nothing was looked at".
 	Scope string
@@ -163,7 +169,8 @@ type Enrichment struct {
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
+		len(e.PodLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 &&
+		len(e.Ambient) == 0 && e.BackendLogs == ""
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -221,7 +228,7 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
-func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
+func (k *kube) Enrich(g Group, window time.Duration, lb *LogBackend) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
@@ -302,6 +309,10 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
+
+	// Query log backend if configured.
+	e.BackendLogs, e.BackendLogStatus = fetchBackendLogs(lb, g, window)
+
 	return e
 }
 
@@ -523,4 +534,73 @@ func shortRev(rev string) string {
 		return rev[:i+9]
 	}
 	return truncate(rev, 24)
+}
+
+// fetchBackendLogs queries the log backend for lines matching the group's
+// namespaces and pod labels, over the alert window. Returns collapsed log text
+// and a status string distinguishing "no backend" from "nothing found".
+func fetchBackendLogs(lb *LogBackend, g Group, window time.Duration) (logs, status string) {
+	if lb == nil {
+		return "", "no log backend configured"
+	}
+
+	start := time.Now().Add(-window)
+	end := time.Now()
+
+	// Collect pod names from alert labels.
+	var pods []string
+	for _, a := range g.Alerts {
+		if p := a.Labels["pod"]; p != "" {
+			pods = append(pods, p)
+		}
+	}
+	pods = dedupe(pods)
+
+	lines, err := lb.Query(g.Namespaces, pods, start, end)
+	if err != nil {
+		return "", fmt.Sprintf("log backend error: %v", err)
+	}
+	if len(lines) == 0 {
+		return "", "log backend returned no lines for this window"
+	}
+
+	// Apply stripSecrets to each line (workload-authored, untrusted).
+	for i, l := range lines {
+		lines[i] = stripSecrets(l)
+	}
+
+	return collapseLogLines(lines), fmt.Sprintf("fetched %d log lines from backend", len(lines))
+}
+
+// collapseLogLines caps total output and collapses repeated consecutive lines
+// into a count, so the evidence budget is respected without silently dropping.
+func collapseLogLines(lines []string) string {
+	const maxLines = 40
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+
+	var collapsed []string
+	var prev string
+	count := 0
+	for _, l := range lines {
+		if l == prev && count > 0 {
+			count++
+			continue
+		}
+		if count > 1 {
+			collapsed = append(collapsed, fmt.Sprintf("[%d × %s]", count, prev))
+		} else if count == 1 {
+			collapsed = append(collapsed, prev)
+		}
+		prev = l
+		count = 1
+	}
+	if count > 1 {
+		collapsed = append(collapsed, fmt.Sprintf("[%d × %s]", count, prev))
+	} else if count == 1 {
+		collapsed = append(collapsed, prev)
+	}
+
+	return strings.Join(collapsed, "\n")
 }

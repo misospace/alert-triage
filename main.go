@@ -192,6 +192,13 @@ func main() {
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
 	}
 
+	// Log backend (optional)
+	lb := newLogBackend(
+		os.Getenv("LOGS_URL"),
+		os.Getenv("LOGS_FLAVOR"),
+		envInt("LOGS_LIMIT", 200),
+	)
+
 	buf := &buffer{max: cfg.MaxAlerts}
 	seen := &recent{max: 20}
 
@@ -210,7 +217,7 @@ func main() {
 	})
 	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
 
-	go runFlushLoop(&cfg, buf, k, hist, seen)
+	go runFlushLoop(&cfg, buf, k, lb, hist, seen)
 	go runCompactLoop(hist)
 
 	srv := &http.Server{
@@ -305,7 +312,7 @@ func authorized(token string, r *http.Request) bool {
 
 var warnUnauthenticated sync.Once
 
-func runFlushLoop(cfg *Config, buf *buffer, k *kube, hist *History, seen *recent) {
+func runFlushLoop(cfg *Config, buf *buffer, k *kube, lb *LogBackend, hist *History, seen *recent) {
 	// Poll well inside the flush delay so the window is honoured rather than
 	// rounded up to the tick.
 	interval := cfg.FlushDelay / 4
@@ -322,7 +329,7 @@ func runFlushLoop(cfg *Config, buf *buffer, k *kube, hist *History, seen *recent
 		if len(alerts) == 0 {
 			continue
 		}
-		process(cfg, alerts, k, hist, seen)
+		process(cfg, alerts, k, lb, hist, seen)
 	}
 }
 
@@ -336,7 +343,7 @@ func runCompactLoop(hist *History) {
 	}
 }
 
-func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent) {
+func process(cfg *Config, alerts []Alert, k *kube, lb *LogBackend, hist *History, seen *recent) {
 	nodeOf := k.ResolveNodes(alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
 	log.Printf("processing %d alerts into %d group(s)", len(alerts), len(groups))
@@ -354,7 +361,7 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent) 
 	}
 
 	for i, g := range groups {
-		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
+		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, lb)}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		if cfg.MaxGroups <= 0 || i < cfg.MaxGroups {
 			r.Triage = Narrate(cfg, r)
