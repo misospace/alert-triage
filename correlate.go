@@ -164,9 +164,12 @@ func overlaps(a, b Alert, slack time.Duration) bool {
 // Alerts are first partitioned by their "cluster" label so that incidents from
 // different clusters never fuse together (namespace names collide across
 // clusters). Within each cluster partition, precedence is signature, then node,
-// then namespace. A signature beats a node match because shared-storage and
-// DNS faults cross node boundaries, and splitting them by node would report one
-// incident as several.
+// then alert name, then namespace, then shared labels (job, service). A
+// signature beats a node match because shared-storage and DNS faults cross node
+// boundaries, and splitting them by node would report one incident as several.
+// Label-based grouping catches alerts from the same subsystem that share no
+// namespace or name — different alert names firing together from the same job
+// or service are one story about one subsystem.
 func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration) []Group {
 	if len(alerts) == 0 {
 		return nil
