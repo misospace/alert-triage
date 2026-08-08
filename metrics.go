@@ -11,13 +11,13 @@ import (
 // Metrics holds all Prometheus-style counters and gauges for the alert-triage service.
 // All fields are atomic so they can be read/written from multiple goroutines safely.
 type Metrics struct {
-	alertsReceived        atomic.Int64
-	groupsFormed          atomic.Int64
-	digestsDelivered      atomic.Int64
-	deliveryFailures      atomic.Int64
-	narrationFailures     atomic.Int64
-	modelCalls            atomic.Int64
-	lastSuccessfulFlush   atomic.Int64 // unix epoch seconds
+	alertsReceived      atomic.Int64
+	groupsFormed        atomic.Int64
+	digestsDelivered    atomic.Int64
+	deliveryFailures    atomic.Int64
+	narrationFailures   atomic.Int64
+	modelCalls          atomic.Int64
+	lastSuccessfulFlush atomic.Int64 // unix epoch seconds
 }
 
 // NewMetrics returns a zero-initialized Metrics instance.
