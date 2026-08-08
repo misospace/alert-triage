@@ -233,6 +233,14 @@ func correlateCluster(alerts []Alert, nodeOf map[string]string, sigs []Signature
 	groups = append(groups, groupBy(alerts, claimed, slack, "namespace", nodeOf, func(a Alert) string {
 		return a.namespace()
 	})...)
+	// Group alerts from the same subsystem that share no namespace or name.
+	// Different alert names firing together from the same job or service are
+	// one story about one subsystem.
+	for _, label := range []string{"job", "service"} {
+		groups = append(groups, groupBy(alerts, claimed, slack, "label/"+label, nodeOf, func(a Alert) string {
+			return a.Labels[label]
+		})...)
+	}
 
 	for i, a := range alerts {
 		if !claimed[i] {

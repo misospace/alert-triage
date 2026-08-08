@@ -314,3 +314,75 @@ func TestSignatureIncludesCluster(t *testing.T) {
 		t.Errorf("signatures for different clusters must differ; got %s for both", sigA)
 	}
 }
+
+// TestLabelBasedGrouping verifies that alerts from the same subsystem (shared
+// job or service label) but with different names, namespaces, and nodes are
+// grouped together — and that unrelated subsystems are NOT fused.
+func TestLabelBasedGrouping(t *testing.T) {
+	// Three LiteLLM alerts: different names, different namespaces, no shared node.
+	// They share the "job" label, so they should be one group.
+	liteAuth := alert("LiteLLMAuthOrQuotaFailures", "llm-auth", "critical", 0)
+	liteAuth.Labels["job"] = "litellm"
+	liteOutage := alert("LiteLLMDeploymentOutage", "llm-inference", "critical", time.Minute)
+	liteOutage.Labels["job"] = "litellm"
+	liteFailover := alert("LiteLLMModelFailover", "llm-routing", "warning", 2*time.Minute)
+	liteFailover.Labels["job"] = "litellm"
+
+	// Unrelated alerts that happen to fire in the same window.
+	// Different job label — must NOT fuse with LiteLLM group.
+	prometheus := alert("PrometheusTargetDown", "monitoring", "warning", time.Minute)
+	prometheus.Labels["job"] = "prometheus"
+
+	// No shared label at all — singleton.
+	orphan := alert("RandomAlert", "default", "info", 3*time.Minute)
+
+	alerts := []Alert{liteAuth, liteOutage, liteFailover, prometheus, orphan}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	// LiteLLM alerts should be in one group.
+	liteGroup := groupFor(t, groups, liteAuth.Fingerprint)
+	if len(liteGroup.Alerts) != 3 {
+		t.Errorf("LiteLLM group has %d alerts, want 3", len(liteGroup.Alerts))
+	}
+
+	// Prometheus alert must be in its own group (different job).
+	promGroup := groupFor(t, groups, prometheus.Fingerprint)
+	if len(promGroup.Alerts) != 1 {
+		t.Errorf("Prometheus group has %d alerts, want 1 (should not fuse with LiteLLM)", len(promGroup.Alerts))
+	}
+
+	// Orphan must be a singleton.
+	orphanGroup := groupFor(t, groups, orphan.Fingerprint)
+	if len(orphanGroup.Alerts) != 1 {
+		t.Errorf("Orphan group has %d alerts, want 1", len(orphanGroup.Alerts))
+	}
+
+	// Total: 3 groups (LiteLLM, Prometheus, Orphan).
+	if got := len(groups); got != 3 {
+		t.Errorf("got %d groups, want 3", got)
+	}
+}
+
+// TestServiceLabelGrouping verifies grouping on the "service" label when
+// "job" is not present.
+func TestServiceLabelGrouping(t *testing.T) {
+	a := alert("HighErrorRate", "frontend", "critical", 0)
+	a.Labels["service"] = "checkout"
+	b := alert("HighLatency", "frontend", "warning", time.Minute)
+	b.Labels["service"] = "checkout"
+	c := alert("PodCrashLooping", "backend", "warning", 2*time.Minute)
+	c.Labels["service"] = "inventory"
+
+	alerts := []Alert{a, b, c}
+	groups := Correlate(alerts, nil, DefaultSignatures(), 5*time.Minute)
+
+	checkoutGroup := groupFor(t, groups, a.Fingerprint)
+	if len(checkoutGroup.Alerts) != 2 {
+		t.Errorf("checkout service group has %d alerts, want 2", len(checkoutGroup.Alerts))
+	}
+
+	inventoryGroup := groupFor(t, groups, c.Fingerprint)
+	if len(inventoryGroup.Alerts) != 1 {
+		t.Errorf("inventory service group has %d alerts, want 1", len(inventoryGroup.Alerts))
+	}
+}
