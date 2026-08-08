@@ -200,7 +200,7 @@ func TestWebhookTokenEnforcement(t *testing.T) {
 				req.Header.Set(tt.header, tt.value)
 			}
 			w := httptest.NewRecorder()
-			webhookHandler(&Config{WebhookToken: tt.token}, buf)(w, req)
+			webhookHandler(&Config{WebhookToken: tt.token}, buf, NewMetrics())(w, req)
 
 			if w.Code != tt.want {
 				t.Errorf("status = %d, want %d", w.Code, tt.want)
@@ -291,7 +291,7 @@ func TestWebhookTriageLabelOptIn(t *testing.T) {
 			cfg.TriageLabel = tt.label
 			buf := &buffer{}
 			w := httptest.NewRecorder()
-			webhookHandler(&cfg, buf)(w, mkReq(t, mkPayload(tt.alerts...), tt.label))
+			webhookHandler(&cfg, buf, NewMetrics())(w, mkReq(t, mkPayload(tt.alerts...), tt.label))
 			if w.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
 			}
@@ -318,7 +318,7 @@ func TestWebhookResolvedSkipsLabelCounter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Webhook-Token", "secret")
 	buf := &buffer{}
-	webhookHandler(&cfg, buf)(httptest.NewRecorder(), req)
+	webhookHandler(&cfg, buf, NewMetrics())(httptest.NewRecorder(), req)
 	if got := cfg.DroppedByLabel.Load(); got != 0 {
 		t.Errorf("DroppedByLabel = %d for resolved-only batch, want 0", got)
 	}
@@ -330,7 +330,7 @@ func TestWebhookDroppedCounterConcurrent(t *testing.T) {
 	var cfg Config
 	cfg.WebhookToken = "secret"
 	cfg.TriageLabel = "triage"
-	handler := webhookHandler(&cfg, &buffer{})
+	handler := webhookHandler(&cfg, &buffer{}, NewMetrics())
 
 	const deliveries = 32
 	const perDelivery = 4

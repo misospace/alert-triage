@@ -1,0 +1,31 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: alert-triage-rules
+spec:
+  groups:
+    - name: alert-triage.rules
+      rules:
+        # Alert when delivery has been failing for more than 5 minutes.
+        - alert: AlertTriageDeliveryFailing
+          expr: increase(alert_triage_delivery_failures_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Alert triage delivery failures detected"
+            description: "alert-triage has recorded {{ $value }} delivery failure(s) in the last 5 minutes."
+
+        # Alert when alerts are being received but nothing has been flushed
+        # (last_successful_flush is stale) for more than 10 minutes.
+        - alert: AlertTriageFlushStale
+          expr: |
+            (alert_triage_alerts_received_total > 0)
+            and
+            (time() - alert_triage_last_successful_flush_timestamp > 600)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Alert triage flush appears stale"
+            description: "alert-triage has received alerts but the last successful flush was more than 10 minutes ago."
