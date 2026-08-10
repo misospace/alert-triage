@@ -41,6 +41,11 @@ type Config struct {
 	// the PrometheusRules in home-ops carry the label.
 	TriageLabel string
 
+	// Cluster names the cluster this instance serves, matching the `cluster`
+	// label the local Prometheus stamps on alerts. It only gates enrichment
+	// when the alert also carries a cluster label and the two disagree.
+	Cluster string
+
 	// DroppedByLabel counts alerts the webhook dropped because they
 	// lacked the TriageLabel. Surfaced in the delivery log so a
 	// label-rule typo is visible without waiting on Prometheus metrics.
@@ -65,6 +70,7 @@ func loadConfig() Config {
 		Retention:      envDuration("RETENTION", 7*24*time.Hour),
 		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
 		TriageLabel:    os.Getenv("TRIAGE_LABEL"),
+		Cluster:        os.Getenv("CLUSTER"),
 	}
 }
 
@@ -185,11 +191,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("history: %v", err)
 	}
-	k, err := newKube()
+	k, err := newKube(cfg.Cluster)
 	if err != nil {
 		// Enrichment is optional; without it the digest still correlates and
 		// narrates, so this must not be fatal for local runs or a broken SA.
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
+	}
+	if cfg.Cluster == "" {
+		log.Print("CLUSTER is unset: every group is enriched against this API server. " +
+			"Set it if this instance receives alerts from more than one cluster.")
 	}
 
 	buf := &buffer{max: cfg.MaxAlerts}

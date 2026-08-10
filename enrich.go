@@ -26,7 +26,12 @@ type kube struct {
 	cluster string // cluster label this client belongs to (empty = local/default)
 }
 
-func newKube() (*kube, error) {
+// newKube builds the read-only client. cluster names the cluster this instance
+// serves, matching the `cluster` label the local Prometheus stamps on alerts.
+// Leaving it empty means the instance enriches whatever it is given, which is
+// right for the single-cluster case and wrong the moment one instance receives
+// alerts from elsewhere — see the invariant in AGENTS.md.
+func newKube(cluster string) (*kube, error) {
 	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
 	if host == "" {
 		return nil, fmt.Errorf("not running in-cluster")
@@ -44,8 +49,9 @@ func newKube() (*kube, error) {
 		return nil, fmt.Errorf("bad service account CA")
 	}
 	return &kube{
-		base:  fmt.Sprintf("https://%s:%s", host, port),
-		token: strings.TrimSpace(string(token)),
+		cluster: cluster,
+		base:    fmt.Sprintf("https://%s:%s", host, port),
+		token:   strings.TrimSpace(string(token)),
 		hc: &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
@@ -228,18 +234,14 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 		return e
 	}
 
-	// Check cluster match: if the group is from a different cluster than this
-	// client can reach, do not enrich against the wrong API server.
-	groupCluster := g.Cluster
-	if groupCluster == "" {
-		groupCluster = "default"
-	}
-	clientCluster := k.cluster
-	if clientCluster == "" {
-		clientCluster = "default"
-	}
-	if groupCluster != clientCluster {
-		e.Scope = fmt.Sprintf("cluster state unavailable (group is from cluster %q, this client serves %q)", groupCluster, clientCluster)
+	// Skip only when both identities are known and disagree. The check is
+	// deliberately one-sided: an unset CLUSTER means this instance does not know
+	// which cluster it serves, and refusing on that basis empties every evidence
+	// block while the narrative still reads as though the cluster was inspected.
+	// That shipped in 0.1.8 and ran unnoticed for three days, because a
+	// confident story told over no evidence looks exactly like a good one.
+	if k.cluster != "" && g.Cluster != "" && k.cluster != g.Cluster {
+		e.Scope = fmt.Sprintf("cluster state unavailable (group is from cluster %q, this client serves %q)", g.Cluster, k.cluster)
 		return e
 	}
 

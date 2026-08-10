@@ -58,6 +58,7 @@ unreachable, the digest still ships with whatever is available.
 | `RETENTION`           | `168h`               | History retention                              |
 | `NARRATE_TIMEOUT`     | `120s`               | Model call timeout                             |
 | `TRIAGE_LABEL`        | —                    | When set, only alerts whose `<label>="true"` is buffered. Empty triages everything. |
+| `CLUSTER`             | —                    | Cluster this instance serves, matching the alerts' `cluster` label. Empty enriches every group. |
 
 ## Opt-in triage
 
