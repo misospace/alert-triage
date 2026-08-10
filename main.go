@@ -196,8 +196,7 @@ func main() {
 		// Enrichment is optional; without it the digest still correlates and
 		// narrates, so this must not be fatal for local runs or a broken SA.
 		logf("kubernetes unavailable, enrichment disabled: %v", err)
-	}
-	if cfg.Cluster == "" {
+	} else if cfg.Cluster == "" {
 		log.Print("CLUSTER is unset: every group is enriched against this API server. " +
 			"Set it if this instance receives alerts from more than one cluster.")
 	}
