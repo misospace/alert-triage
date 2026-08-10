@@ -47,7 +47,20 @@ correlation so that incidents from different clusters never fuse together
 (namespace names collide across clusters). Each group is enriched against its
 own cluster's API server; if no client is available for the group's cluster,
 enrichment reports "cluster state unavailable" rather than producing wrong
-evidence from a foreign API server. The digest names the cluster it came from
+evidence from a foreign API server.
+
+The cluster identity comes from `CLUSTER`, and **the mismatch check skips only
+when both sides are known and disagree**. An unset `CLUSTER` enriches
+everything, which is correct for one instance per cluster and is the same
+fail-open rule `WEBHOOK_TOKEN` and `TRIAGE_LABEL` follow. Failing closed here
+was a real bug: 0.1.8 compared the group's cluster against a client cluster
+that was never assigned, so every group looked foreign, enrichment was skipped
+on every instance, and 77 digests shipped narrating alert text alone while
+asserting the cluster was healthy. Nothing caught it because a confident story
+told over no evidence reads exactly like a good one. Anything that gates
+evidence on configuration must fail open and say so.
+
+The digest names the cluster it came from
 so operators can distinguish incidents when multiple clusters share one Discord
 channel. Originally the service was deliberately cluster-local: a second
 instance needed no shared credentials or state. That invariant was replaced

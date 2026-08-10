@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPodList(t *testing.T) {
@@ -175,6 +176,46 @@ func TestFetchPodLogs_capped(t *testing.T) {
 	}
 	if !strings.Contains(gotURL, "tailLines=20") {
 		t.Errorf("expected tailLines=20 in request, got: %s", gotURL)
+	}
+}
+
+// Regression: 0.1.8 compared the group's cluster against a client cluster that
+// was never assigned, so every group looked foreign and enrichment was skipped
+// on every instance. 77 digests shipped narrating alert text alone while
+// claiming the cluster was healthy. An unknown client cluster must enrich, not
+// refuse.
+func TestEnrichSkipsOnlyWhenBothClustersAreKnownAndDiffer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	tests := []struct {
+		name          string
+		clientCluster string
+		groupCluster  string
+		wantSkipped   bool
+	}{
+		{"client cluster unknown enriches", "", "main", false},
+		{"alert carries no cluster label enriches", "main", "", false},
+		{"neither known enriches", "", "", false},
+		{"same cluster enriches", "main", "main", false},
+		{"known and different is skipped", "main", "utility", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k := &kube{cluster: tt.clientCluster, base: srv.URL, token: "tok", hc: srv.Client()}
+			g := Group{Key: "single/A", Cluster: tt.groupCluster, Alerts: []Alert{
+				{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
+			}}
+			got := k.Enrich(g, time.Minute)
+
+			skipped := strings.Contains(got.Scope, "cluster state unavailable")
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v (scope: %q)", skipped, tt.wantSkipped, got.Scope)
+			}
+		})
 	}
 }
 
