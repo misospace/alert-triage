@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -270,6 +271,11 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 		if err := k.get("/api/v1/namespaces/"+esc+"/pods", &pods); err != nil {
 			logf("enrich: pods in %s: %v", ns, err)
 		}
+		type scoredPod struct {
+			desc  string
+			score int // higher = worse health
+		}
+		var unhealthy []scoredPod
 		for _, p := range pods.Items {
 			for _, cs := range p.Status.ContainerStatuses {
 				reason := ""
@@ -281,6 +287,9 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 				if p.Status.Phase == "Running" && cs.Ready && reason == "" {
 					continue
 				}
+				if p.Status.Phase == "Succeeded" {
+					continue
+				}
 				desc := fmt.Sprintf("%s/%s %s", ns, p.Metadata.Name, p.Status.Phase)
 				if reason != "" {
 					desc += " (" + reason + ")"
@@ -288,9 +297,13 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 				if cs.RestartCount > 0 {
 					desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
 				}
-				e.UnhealthyPods = append(e.UnhealthyPods, desc)
+				unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount)})
 				break
 			}
+		}
+		sort.SliceStable(unhealthy, func(i, j int) bool { return unhealthy[i].score > unhealthy[j].score })
+		for _, sp := range unhealthy {
+			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
 		}
 
 		e.Events = append(e.Events, k.warningEvents(esc, since)...)
@@ -525,4 +538,34 @@ func shortRev(rev string) string {
 		return rev[:i+9]
 	}
 	return truncate(rev, 24)
+}
+
+// podHealthScore ranks a pod's health so the worst pods surface before the
+// cap truncates. Higher score = worse health.
+func podHealthScore(phase, reason string, ready bool, restarts int) int {
+	score := 0
+	switch phase {
+	case "Failed":
+		score += 100
+	case "Pending":
+		score += 80
+	case "Unknown":
+		score += 70
+	case "Running":
+		if !ready {
+			score += 50
+		}
+	default:
+		// CrashLoopBackOff, OOMKilled, etc. are already captured by reason.
+	}
+	if reason != "" {
+		switch reason {
+		case "OOMKilled", "CrashLoopBackOff":
+			score += 200
+		default:
+			score += 50
+		}
+	}
+	score += restarts * 10
+	return score
 }
