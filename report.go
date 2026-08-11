@@ -17,6 +17,7 @@ type Report struct {
 	PriorSeen  int
 	Narrative  string
 	Triage     Triage
+	Metrics    []string // compact metric summaries from Prometheus backend
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -250,6 +251,17 @@ func renderEvidence(r Report) string {
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.RecentChanges, "no reconciles or failures in the window, so a recent deploy is unlikely")
+
+	// Metrics evidence from the Prometheus-compatible backend. Label values are
+	// workload-authored and belong inside the untrusted fence.
+	if len(r.Metrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend)\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.Metrics {
+			fmt.Fprintf(&b, "- %s\n", untrusted(line))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")

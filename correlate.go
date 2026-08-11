@@ -65,6 +65,21 @@ type Group struct {
 	Alerts     []Alert
 }
 
+// Label returns the value of a label that is common across all alerts in the
+// group. If any alert lacks the key or values disagree, it returns "".
+func (g Group) Label(key string) string {
+	if len(g.Alerts) == 0 {
+		return ""
+	}
+	v := g.Alerts[0].Labels[key]
+	for _, a := range g.Alerts[1:] {
+		if a.Labels[key] != v {
+			return ""
+		}
+	}
+	return v
+}
+
 // Signature is a known failure mode: when Trigger matches an alert, every other
 // alert that Scope accepts joins the same group. These encode root causes that
 // label matching alone cannot infer.
