@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -227,7 +230,43 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+
+	// Graceful shutdown: catch SIGTERM/SIGINT so buffered alerts are flushed
+	// rather than silently dropped on pod eviction or node drain.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-stop
+		log.Print("shutdown signal received; draining buffer before exit")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			logf("server shutdown: %v", err)
+		}
+		// Drain any alerts still sitting in the buffer. The flush loop is no
+		// longer running (the process is about to exit), so we call process
+		// directly for every remaining batch.
+		drained := 0
+		for {
+			buf.mu.Lock()
+			if len(buf.alerts) == 0 {
+				buf.mu.Unlock()
+				break
+			}
+			alerts := buf.alerts
+			buf.alerts = nil
+			buf.seen = nil
+			buf.mu.Unlock()
+			process(&cfg, alerts, k, hist, seen)
+			drained += len(alerts)
+		}
+		log.Printf("shutdown: flushed %d buffered alert(s)", drained)
+		os.Exit(0)
+	}()
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("server: %v", err)
+	}
 }
 
 func webhookHandler(cfg *Config, buf *buffer) http.HandlerFunc {
