@@ -273,7 +273,7 @@ func main() {
 			buf.alerts = nil
 			buf.seen = nil
 			buf.mu.Unlock()
-			process(&cfg, alerts, k, hist, seen)
+			process(&cfg, alerts, k, hist, seen, prom)
 			drained += len(alerts)
 		}
 		log.Printf("shutdown: flushed %d buffered alert(s)", drained)

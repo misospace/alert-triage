@@ -22,13 +22,13 @@ func TestPrometheusIsConfigured(t *testing.T) {
 
 func TestSummarizeSeries(t *testing.T) {
 	tests := []struct {
-		name      string
-		values    [][]interface{}
-		wantNil   bool
-		wantMin   float64
-		wantMax   float64
-		wantLast  float64
-		wantDir   string
+		name     string
+		values   [][]interface{}
+		wantNil  bool
+		wantMin  float64
+		wantMax  float64
+		wantLast float64
+		wantDir  string
 	}{
 		{
 			name:    "empty values",
@@ -436,7 +436,7 @@ func TestQueryRangeNoData(t *testing.T) {
 func TestEnrichMetricsWithNamespaceContext(t *testing.T) {
 	rulesResp := rulesResponse{
 		Status: "success",
-		Data: rulesData{Groups: []ruleGroup{}},
+		Data:   rulesData{Groups: []ruleGroup{}},
 	}
 
 	queryResp := queryRangeResponse{
@@ -732,10 +732,10 @@ func TestEnrichMetricsDeduplicatesAlertNames(t *testing.T) {
 func TestRenderEvidenceWithMetrics(t *testing.T) {
 	r := Report{
 		Group: Group{
-			Key:      "test-group",
-			Reason:   "OOMKilled",
-			Node:     "node-1",
-			Alerts:   []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}},
+			Key:        "test-group",
+			Reason:     "OOMKilled",
+			Node:       "node-1",
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}},
 			Namespaces: []string{"default"},
 		},
 		Metrics: []string{
@@ -758,10 +758,10 @@ func TestRenderEvidenceWithMetrics(t *testing.T) {
 func TestRenderEvidenceWithoutMetrics(t *testing.T) {
 	r := Report{
 		Group: Group{
-			Key:      "test-group",
-			Reason:   "OOMKilled",
-			Node:     "node-1",
-			Alerts:   []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}},
+			Key:        "test-group",
+			Reason:     "OOMKilled",
+			Node:       "node-1",
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}},
 			Namespaces: []string{"default"},
 		},
 	}
