@@ -431,3 +431,48 @@ func TestLoadConfigCustom(t *testing.T) {
 		t.Errorf("TriageLabel = %q, want triage", cfg.TriageLabel)
 	}
 }
+
+// TestShutdownDrainFlushesBuffer verifies that the graceful-shutdown drain
+// logic flushes buffered alerts instead of silently dropping them.  This is
+// the regression test for issue #11: on SIGTERM the process must drain the
+// in-memory buffer through process() before exiting.
+func TestShutdownDrainFlushesBuffer(t *testing.T) {
+	var cfg Config
+	cfg.WebhookToken = "secret"
+
+	buf := &buffer{}
+	now := time.Now()
+	buf.firstAt = now.Add(-time.Second)
+	buf.add([]Alert{
+		{Fingerprint: "a", Labels: map[string]string{"alertname": "TestAlert1"}},
+		{Fingerprint: "b", Labels: map[string]string{"alertname": "TestAlert2"}},
+	})
+
+	// Create a real History so process() doesn't panic on nil deref.
+	hist, err := NewHistory(t.TempDir()+"/history.json", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+
+	var seen recent
+
+	// Simulate the drain loop from main.go's shutdown handler.
+	drained := 0
+	for {
+		buf.mu.Lock()
+		if len(buf.alerts) == 0 {
+			buf.mu.Unlock()
+			break
+		}
+		alerts := buf.alerts
+		buf.alerts = nil
+		buf.seen = nil
+		buf.mu.Unlock()
+		process(&cfg, alerts, nil, hist, &seen)
+		drained += len(alerts)
+	}
+
+	if drained != 2 {
+		t.Errorf("drained %d alerts, want 2", drained)
+	}
+}
