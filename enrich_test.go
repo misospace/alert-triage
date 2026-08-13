@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -223,5 +224,56 @@ func TestEnrichment_empty(t *testing.T) {
 	got := Enrichment{}.empty()
 	if !got {
 		t.Errorf("expected empty, got %v", got)
+	}
+}
+
+func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.Contains(r.URL.Path, "/pods") || strings.Contains(r.URL.Path, "/log") {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"items":[
+			{"metadata":{"name":"job-finished","namespace":"ns1"},
+			 "status":{"phase":"Succeeded",
+			   "containerStatuses":[{"ready":false,"restartCount":0,
+			     "state":{"terminated":{"reason":"Completed"}}}]}},
+			{"metadata":{"name":"flaky-restart","namespace":"ns1"},
+			 "status":{"phase":"Running",
+			   "containerStatuses":[{"ready":false,"restartCount":1,
+			     "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}},
+			{"metadata":{"name":"pending-pod","namespace":"ns1"},
+			 "status":{"phase":"Pending",
+			   "containerStatuses":[{"ready":false,"restartCount":0,
+			     "state":{"waiting":{"reason":"ImagePullBackOff"}}}]}},
+			{"metadata":{"name":"job-finished-2","namespace":"ns1"},
+			 "status":{"phase":"Succeeded",
+			   "containerStatuses":[{"ready":false,"restartCount":0,
+			     "state":{"terminated":{"reason":"Completed"}}}]}}
+		]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(g, time.Minute)
+
+	for _, p := range en.UnhealthyPods {
+		if strings.Contains(p, "job-finished") {
+			t.Errorf("Succeeded pod should be skipped, got %q", p)
+		}
+	}
+	if len(en.UnhealthyPods) != 2 {
+		t.Fatalf("expected 2 unhealthy pods (CrashLoopBackOff + Pending), got %d: %v", len(en.UnhealthyPods), en.UnhealthyPods)
+	}
+	if !strings.Contains(en.UnhealthyPods[0], "flaky-restart") {
+		t.Errorf("expected worst pod (CrashLoopBackOff) first, got %v", en.UnhealthyPods)
+	}
+	if !strings.Contains(en.UnhealthyPods[1], "pending-pod") {
+		t.Errorf("expected Pending pod second, got %v", en.UnhealthyPods)
 	}
 }
