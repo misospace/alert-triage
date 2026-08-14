@@ -237,6 +237,7 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
+	mux.HandleFunc("/metrics", metricsHandler())
 
 	go runFlushLoop(&cfg, buf, k, hist, seen, prom)
 	go runCompactLoop(hist)
@@ -331,6 +332,10 @@ func webhookHandler(cfg *Config, buf *buffer) http.HandlerFunc {
 			}
 		}
 		if len(firing) > 0 {
+			// Count alerts that survived the label gate and made it into the
+			// buffer, not the raw payload: a deluge of already-resolved
+			// alerts must not look like a busy day on the dashboard.
+			metrics.observeAlerts(len(firing))
 			if rejected := buf.add(firing); rejected > 0 {
 				logf("webhook: window full at %d alerts, refused %d", cfg.MaxAlerts, rejected)
 			}
@@ -403,6 +408,9 @@ func runCompactLoop(hist *History) {
 func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
 	nodeOf := k.ResolveNodes(alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
+	// Count groups once per flush; if the count stays at zero while alerts
+	// arrive, the correlation rules are misbehaving, not the network.
+	metrics.observeGroups(len(groups))
 	log.Printf("processing %d alerts into %d group(s)", len(alerts), len(groups))
 
 	// One model call per group means a burst of unique alerts sets the spend. Past
@@ -424,8 +432,14 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 		}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		if cfg.MaxGroups <= 0 || i < cfg.MaxGroups {
+			metrics.observeModelCall()
 			r.Triage = Narrate(cfg, r)
 		}
+		// A non-actionable triage without a narrative means the model call
+		// failed: the digest still ships with evidence, but the explanation
+		// was lost. This counter is the only signal that a silent narration
+		// regression has happened.
+		metrics.observeNarration(r.Triage.Narrative == "" && r.Triage.Confidence == "")
 		r.Narrative = r.Triage.Narrative
 
 		rec := DigestRecord{
@@ -439,9 +453,11 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 		}
 		if err := Deliver(cfg, r); err != nil {
 			rec.DeliverErr = err.Error()
+			metrics.observeDelivery(false)
 			logf("deliver %s: %v", g.Key, err)
 		} else {
 			rec.Delivered = true
+			metrics.observeDelivery(true)
 		}
 		seen.add(rec)
 		log.Printf("digest %s [%s] fix=%s %s | %s", g.Key, g.Severity(),
