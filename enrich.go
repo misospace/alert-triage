@@ -99,6 +99,11 @@ type podList struct {
 				State        map[string]struct {
 					Reason string `json:"reason"`
 				} `json:"state"`
+				LastTerminationState struct {
+					Terminated struct {
+						FinishedAt time.Time `json:"finishedAt"`
+					} `json:"terminated"`
+				} `json:"lastState"`
 			} `json:"containerStatuses"`
 		} `json:"status"`
 	} `json:"items"`
@@ -167,6 +172,11 @@ type Enrichment struct {
 	BackendState  string
 	Events        []string
 	RecentChanges []string
+	// RecentRestarts flags pods whose containers restarted inside the alert
+	// window. A restart that left the current container healthy is still
+	// evidence the alert is about, so it is surfaced as its own finding rather
+	// than only mentioned inside UnhealthyPods.
+	RecentRestarts []string
 	// Ambient is cluster-wide context gathered when the alert names no subject
 	// to scope to. It is NOT known to concern the alert, and is kept apart so a
 	// coincidence is not read as a cause.
@@ -279,6 +289,16 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
 	}
 
+	// Collect the pods the alerts actually name, so we can still fetch their
+	// previous-container logs when the current container has already recovered
+	// (e.g. an OOMKilled container that has been replaced by a healthy one).
+	targetPods := map[string]bool{}
+	for _, a := range g.Alerts {
+		if a.Labels["pod"] != "" && a.namespace() != "" {
+			targetPods[a.namespace()+"/"+a.Labels["pod"]] = true
+		}
+	}
+
 	var seenPods []podRef
 	for _, ns := range g.Namespaces {
 		esc := url.PathEscape(ns)
@@ -288,8 +308,10 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 			logf("enrich: pods in %s: %v", ns, err)
 		}
 		type scoredPod struct {
-			desc  string
-			score int // higher = worse health
+			desc    string
+			score   int // higher = worse health
+			restart int // restart count, surfaced as a finding on its own
+			key     string
 		}
 		var unhealthy []scoredPod
 		for _, p := range pods.Items {
@@ -298,6 +320,7 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 				Namespace:   p.Metadata.Namespace,
 				Annotations: p.Metadata.Annotations,
 			})
+			key := p.Metadata.Namespace + "/" + p.Metadata.Name
 			for _, cs := range p.Status.ContainerStatuses {
 				reason := ""
 				for state, s := range cs.State {
@@ -305,24 +328,42 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 						reason = s.Reason
 					}
 				}
+				restartedRecently := cs.RestartCount > 0 && !cs.LastTerminationState.Terminated.FinishedAt.IsZero() &&
+					cs.LastTerminationState.Terminated.FinishedAt.After(since)
 				if p.Status.Phase == "Running" && cs.Ready && reason == "" {
-					continue
+					// A recovered pod that the alert named still matters: its
+					// previous container's log is the evidence we want.
+					if !targetPods[key] && !restartedRecently {
+						continue
+					}
 				}
 				if p.Status.Phase == "Succeeded" {
 					continue
 				}
-				desc := fmt.Sprintf("%s/%s %s", ns, p.Metadata.Name, p.Status.Phase)
+				desc := fmt.Sprintf("%s %s", key, p.Status.Phase)
 				if reason != "" {
 					desc += " (" + reason + ")"
 				}
 				if cs.RestartCount > 0 {
 					desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
 				}
-				unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount)})
+				unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key})
+				if restartedRecently {
+					e.RecentRestarts = append(e.RecentRestarts, fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339)))
+				}
 				break
 			}
 		}
-		sort.SliceStable(unhealthy, func(i, j int) bool { return unhealthy[i].score > unhealthy[j].score })
+		// Pull the pods the alert actually names to the front, so they survive
+		// truncation ahead of unrelated noise in the same namespace.
+		sort.SliceStable(unhealthy, func(i, j int) bool {
+			iTarget := targetPods[unhealthy[i].key]
+			jTarget := targetPods[unhealthy[j].key]
+			if iTarget != jTarget {
+				return iTarget
+			}
+			return unhealthy[i].score > unhealthy[j].score
+		})
 		for _, sp := range unhealthy {
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
 		}
@@ -333,6 +374,7 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
+	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
 	e.PodLogs = k.fetchPodLogs(e.UnhealthyPods)
 	if k.logs != nil {
 		var err error
