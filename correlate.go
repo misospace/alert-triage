@@ -176,28 +176,51 @@ func overlaps(a, b Alert, slack time.Duration) bool {
 // Correlate groups alerts that plausibly share a root cause. It is pure: node
 // attribution must already be resolved into nodeOf, keyed by fingerprint.
 //
-// Alerts are first partitioned by their "cluster" label so that incidents from
+// Alerts are first partitioned by their resolved cluster so that incidents from
 // different clusters never fuse together (namespace names collide across
 // clusters). Within each cluster partition, precedence is signature, then node,
 // then namespace. A signature beats a node match because shared-storage and
 // DNS faults cross node boundaries, and splitting them by node would report one
 // incident as several.
-func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration) []Group {
+func Correlate(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration, configuredCluster ...string) []Group {
 	if len(alerts) == 0 {
 		return nil
 	}
 
-	// Partition alerts by cluster label so correlation never crosses clusters.
+	clusterName := ""
+	if len(configuredCluster) != 0 {
+		clusterName = configuredCluster[0]
+	}
+
+	// Partition alerts by their resolved cluster so correlation never crosses
+	// clusters. An unlabelled alert inherits the instance's configured cluster.
 	byCluster := map[string][]Alert{}
 	for _, a := range alerts {
-		byCluster[a.cluster()] = append(byCluster[a.cluster()], a)
+		cluster := resolveCluster(a.cluster(), clusterName)
+		byCluster[cluster] = append(byCluster[cluster], a)
 	}
 
 	var groups []Group
-	for _, clusterAlerts := range byCluster {
-		groups = append(groups, correlateCluster(clusterAlerts, nodeOf, sigs, slack)...)
+	for cluster, clusterAlerts := range byCluster {
+		clusterGroups := correlateCluster(clusterAlerts, nodeOf, sigs, slack)
+		for i := range clusterGroups {
+			if clusterGroups[i].Cluster == "" && clusterName != "" {
+				clusterGroups[i].Cluster = cluster
+			}
+		}
+		groups = append(groups, clusterGroups...)
 	}
 	return groups
+}
+
+func resolveCluster(label, configured string) string {
+	if label != "" {
+		return label
+	}
+	if configured != "" {
+		return configured
+	}
+	return "default"
 }
 
 // correlateCluster runs the correlation algorithm on alerts from a single

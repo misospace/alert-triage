@@ -45,8 +45,8 @@ type Config struct {
 	TriageLabel string
 
 	// Cluster names the cluster this instance serves, matching the `cluster`
-	// label the local Prometheus stamps on alerts. It only gates enrichment
-	// when the alert also carries a cluster label and the two disagree.
+	// label the local Prometheus stamps on alerts. Alerts without that label
+	// inherit this value; it also gates enrichment when the two disagree.
 	Cluster string
 
 	// MetricsURL is the base URL of a Prometheus-compatible backend
@@ -416,7 +416,7 @@ func runCompactLoop(hist *History) {
 
 func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
 	nodeOf := k.ResolveNodes(alerts)
-	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack)
+	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack, cfg.Cluster)
 	// Count groups once per flush; if the count stays at zero while alerts
 	// arrive, the correlation rules are misbehaving, not the network.
 	metrics.observeGroups(len(groups))
