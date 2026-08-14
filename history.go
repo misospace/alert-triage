@@ -39,7 +39,12 @@ func (h *History) load() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		// Any other open failure (corruption, permission denied, stale
+		// mount) leaves the service still able to start: we begin with an
+		// empty history and the on-disk file is left untouched so an
+		// operator can inspect or move it aside.
+		logf("history: open failed, starting empty: %v", err)
+		return nil
 	}
 	defer f.Close()
 
@@ -60,7 +65,32 @@ func (h *History) load() error {
 			h.entries = append(h.entries, s)
 		}
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		// Same policy as a bad open: surface once, keep running.
+		logf("history: scan failed, keeping what was read: %v", err)
+	}
+	return nil
+}
+
+// PriorSeen reports how many times the given signature has been recorded
+// within the retention window. Unlike Record it does not mutate state or
+// append to the on-disk log, so callers can inspect history before deciding
+// whether to record.
+func (h *History) PriorSeen(sig, title string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	cutoff := time.Now().Add(-h.retain)
+	n := 0
+	for _, e := range h.entries {
+		if !e.At.After(cutoff) {
+			continue
+		}
+		if e.Signature == sig {
+			n++
+		}
+	}
+	return n
 }
 
 // Record stores a sighting and returns how many times this signature has been
