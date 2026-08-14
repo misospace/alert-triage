@@ -314,3 +314,55 @@ func TestSignatureIncludesCluster(t *testing.T) {
 		t.Errorf("signatures for different clusters must differ; got %s for both", sigA)
 	}
 }
+
+func TestCorrelateUsesConfiguredClusterForUnlabelledAlerts(t *testing.T) {
+	sigs := []Signature{{
+		Name:    "Incident",
+		Reason:  "Alerts match",
+		Trigger: func(Alert) bool { return true },
+		Scope:   func(Alert, Alert) bool { return true },
+	}}
+
+	labelled := alert("Incident", "default", "warning", 0)
+	labelled.Labels["cluster"] = "main"
+	unlabelled := alert("Incident", "default", "warning", 0)
+
+	groups := Correlate([]Alert{labelled, unlabelled}, nil, sigs, time.Minute, "main")
+	if len(groups) != 1 {
+		t.Fatalf("expected labelled and configured-cluster alerts to correlate together, got %d groups", len(groups))
+	}
+	if groups[0].Cluster != "main" {
+		t.Errorf("expected group cluster main, got %q", groups[0].Cluster)
+	}
+	if got, want := groups[0].Title(), "[main] Incident"; got != want {
+		t.Errorf("expected title %q, got %q", want, got)
+	}
+	utilityGroups := Correlate([]Alert{unlabelled}, nil, sigs, time.Minute, "utility")
+	if len(utilityGroups) != 1 {
+		t.Fatalf("expected one configured-cluster group, got %d", len(utilityGroups))
+	}
+	if groups[0].Signature() == utilityGroups[0].Signature() {
+		t.Errorf("expected configured clusters to produce different signatures, both got %q", groups[0].Signature())
+	}
+}
+
+func TestCorrelateWithoutConfiguredClusterKeepsDefault(t *testing.T) {
+	sigs := []Signature{{
+		Name:    "Incident",
+		Reason:  "Alerts match",
+		Trigger: func(Alert) bool { return true },
+		Scope:   func(Alert, Alert) bool { return true },
+	}}
+
+	unlabelled := alert("Incident", "default", "warning", 0)
+	groups := Correlate([]Alert{unlabelled}, nil, sigs, time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("expected one group, got %d", len(groups))
+	}
+	if groups[0].Cluster != "" {
+		t.Errorf("expected unlabelled group cluster to remain empty, got %q", groups[0].Cluster)
+	}
+	if got, want := groups[0].Title(), "[default] Incident"; got != want {
+		t.Errorf("expected default title %q, got %q", want, got)
+	}
+}
