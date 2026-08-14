@@ -24,6 +24,7 @@ type kube struct {
 	base    string
 	token   string
 	hc      *http.Client
+	logs    *logsBackend
 	cluster string // cluster label this client belongs to (empty = local/default)
 }
 
@@ -57,6 +58,7 @@ func newKube(cluster string) (*kube, error) {
 			Timeout:   15 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
 		},
+		logs: newLogsBackend(),
 	}, nil
 }
 
@@ -157,6 +159,11 @@ type Enrichment struct {
 	Nodes         []string
 	UnhealthyPods []string
 	PodLogs       map[string]string // pod key -> tail of previous container log
+	// BackendLogs are workload-authored and untrusted. BackendState is
+	// "off", "empty", or "error" so missing configuration is not confused with
+	// a successful query that returned no lines.
+	BackendLogs   []string
+	BackendState  string
 	Events        []string
 	RecentChanges []string
 	// Ambient is cluster-wide context gathered when the alert names no subject
@@ -170,7 +177,8 @@ type Enrichment struct {
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
+		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
+		len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -243,6 +251,7 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	// confident story told over no evidence looks exactly like a good one.
 	if k.cluster != "" && g.Cluster != "" && k.cluster != g.Cluster {
 		e.Scope = fmt.Sprintf("cluster state unavailable (group is from cluster %q, this client serves %q)", g.Cluster, k.cluster)
+		e.BackendState = "unavailable"
 		return e
 	}
 
@@ -313,6 +322,20 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.PodLogs = k.fetchPodLogs(e.UnhealthyPods)
+	if k.logs != nil {
+		var err error
+		e.BackendLogs, err = k.logs.fetchBackendLogsResult(g, window)
+		if err != nil {
+			e.BackendState = "error"
+			logf("enrich: backend logs: %v", err)
+		} else if len(e.BackendLogs) == 0 {
+			e.BackendState = "empty"
+		} else {
+			e.BackendState = "ok"
+		}
+	} else {
+		e.BackendState = "off"
+	}
 	e.Events = capList(dedupe(e.Events), 8)
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
 	// Ambient only has to be enough for the model to rule things out.

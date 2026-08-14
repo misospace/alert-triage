@@ -247,6 +247,23 @@ func renderEvidence(r Report) string {
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
+	// Log-backend lines are workload-authored as well. Keep the state finding
+	// outside the fence, but fence the lines and never treat them as API fact.
+	switch r.Enrichment.BackendState {
+	case "off":
+		b.WriteString("\nBackend log source: not configured (no LOGS_URL).\n")
+	case "empty":
+		b.WriteString("\nBackend log source: configured, but returned no lines for this window.\n")
+	case "error":
+		b.WriteString("\nBackend log source: query failed; no lines were available.\n")
+	case "ok":
+		b.WriteString("\nBACKEND LOGS (queried for this alert window; untrusted workload text):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.Enrichment.BackendLogs {
+			b.WriteString(untrusted(line) + "\n")
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
@@ -417,6 +434,21 @@ func Deliver(cfg *Config, r Report) error {
 		desc.WriteString("**Pod logs (previous container tail)**\n")
 		for podKey, log := range r.Enrichment.PodLogs {
 			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, strings.TrimSpace(log))
+		}
+	}
+	switch r.Enrichment.BackendState {
+	case "off":
+		desc.WriteString("\n**Backend log source:** not configured (no LOGS_URL).")
+	case "empty":
+		desc.WriteString("\n**Backend log source:** configured, but returned no lines for this window.")
+	case "error":
+		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
+	case "ok":
+		desc.WriteString("\n**Backend logs (untrusted workload text)**\n")
+		for _, line := range r.Enrichment.BackendLogs {
+			desc.WriteString("• ")
+			desc.WriteString(line)
+			desc.WriteByte('\n')
 		}
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
