@@ -36,6 +36,13 @@ type Config struct {
 	Retention      time.Duration
 	NarrateTimeout time.Duration
 
+	// NarrateConcurrency caps how many model calls run at once for a
+	// single flush. The host is parallel-capable, but LiteLLM's
+	// `self-hosted` profile tops out at max_parallel_requests: 2, so
+	// exceeding it only queues upstream. Default 2; raise only with
+	// a model backend that can absorb it.
+	NarrateConcurrency int
+
 	// TriageLabel, when set, makes the webhook drop any alert whose
 	// labels[TriageLabel] is not "true". It defaults to empty so a fresh
 	// deployment triages everything (fail-open, matching WEBHOOK_TOKEN):
@@ -70,26 +77,27 @@ type Config struct {
 
 func loadConfig() Config {
 	return Config{
-		ListenAddr:     envDefault("LISTEN_ADDR", ":8080"),
-		WebhookToken:   os.Getenv("WEBHOOK_TOKEN"),
-		MaxAlerts:      envInt("MAX_ALERTS", 500),
-		MaxGroups:      envInt("MAX_GROUPS", 12),
-		LiteLLMURL:     envDefault("LITELLM_URL", ""),
-		LiteLLMKey:     os.Getenv("LITELLM_API_KEY"),
-		Model:          envDefault("MODEL", "dsv4f"),
-		DiscordURL:     os.Getenv("DISCORD_WEBHOOK_URL"),
-		HistoryPath:    envDefault("HISTORY_PATH", "/data/history.jsonl"),
-		FlushDelay:     envDuration("FLUSH_DELAY", 3*time.Minute),
-		MaxWindow:      envDuration("MAX_WINDOW", 10*time.Minute),
-		CorrelateSlack: envDuration("CORRELATE_SLACK", 5*time.Minute),
-		EvidenceWindow: envDuration("EVIDENCE_WINDOW", 30*time.Minute),
-		Retention:      envDuration("RETENTION", 7*24*time.Hour),
-		NarrateTimeout: envDuration("NARRATE_TIMEOUT", 120*time.Second),
-		TriageLabel:    os.Getenv("TRIAGE_LABEL"),
-		Cluster:        os.Getenv("CLUSTER"),
-		MetricsURL:     os.Getenv("METRICS_URL"),
-		GitOpsRepo:     os.Getenv("GITOPS_REPO"),
-		GitOpsPath:     os.Getenv("GITOPS_PATH"),
+		ListenAddr:         envDefault("LISTEN_ADDR", ":8080"),
+		WebhookToken:       os.Getenv("WEBHOOK_TOKEN"),
+		MaxAlerts:          envInt("MAX_ALERTS", 500),
+		MaxGroups:          envInt("MAX_GROUPS", 12),
+		NarrateConcurrency: envInt("NARRATE_CONCURRENCY", 2),
+		LiteLLMURL:         envDefault("LITELLM_URL", ""),
+		LiteLLMKey:         os.Getenv("LITELLM_API_KEY"),
+		Model:              envDefault("MODEL", "dsv4f"),
+		DiscordURL:         os.Getenv("DISCORD_WEBHOOK_URL"),
+		HistoryPath:        envDefault("HISTORY_PATH", "/data/history.jsonl"),
+		FlushDelay:         envDuration("FLUSH_DELAY", 3*time.Minute),
+		MaxWindow:          envDuration("MAX_WINDOW", 10*time.Minute),
+		CorrelateSlack:     envDuration("CORRELATE_SLACK", 5*time.Minute),
+		EvidenceWindow:     envDuration("EVIDENCE_WINDOW", 30*time.Minute),
+		Retention:          envDuration("RETENTION", 7*24*time.Hour),
+		NarrateTimeout:     envDuration("NARRATE_TIMEOUT", 120*time.Second),
+		TriageLabel:        os.Getenv("TRIAGE_LABEL"),
+		Cluster:            os.Getenv("CLUSTER"),
+		MetricsURL:         os.Getenv("METRICS_URL"),
+		GitOpsRepo:         os.Getenv("GITOPS_REPO"),
+		GitOpsPath:         os.Getenv("GITOPS_PATH"),
 	}
 }
 
@@ -434,23 +442,59 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 			cfg.MaxGroups, len(groups), cfg.MaxGroups)
 	}
 
+	// First pass: gather enrichment, metrics, and history. These are fast
+	// API reads; running them serially avoids putting extra pressure on the
+	// API server. Narration is the only step slow enough to be worth
+	// parallelising.
+	reports := make([]Report, len(groups))
+	narrateIdx := make([]int, 0, len(groups))
 	for i, g := range groups {
 		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
 			r.Metrics = prom.EnrichMetrics(g, cfg.EvidenceWindow)
 		}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
+		reports[i] = r
 		if cfg.MaxGroups <= 0 || i < cfg.MaxGroups {
-			metrics.observeModelCall()
-			r.Triage = Narrate(cfg, r)
+			narrateIdx = append(narrateIdx, i)
 		}
-		// A non-actionable triage without a narrative means the model call
-		// failed: the digest still ships with evidence, but the explanation
-		// was lost. This counter is the only signal that a silent narration
-		// regression has happened.
-		metrics.observeNarration(r.Triage.Narrative == "" && r.Triage.Confidence == "")
-		r.Narrative = r.Triage.Narrative
+	}
 
+	// Second pass: narration. Each call is independent — a slow or failed
+	// model call for one group must not cancel or delay the others. Bounded
+	// by NarrateConcurrency so the host isn't flooded past what the model
+	// backend can absorb. Order of completion is irrelevant: results are
+	// written back into the per-group slot, and delivery walks the slots
+	// in the original severity order.
+	concurrency := cfg.NarrateConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, i := range narrateIdx {
+		i := i
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			metrics.observeModelCall()
+			reports[i].Triage = Narrate(cfg, reports[i])
+			// A non-actionable triage without a narrative means the model
+			// call failed: the digest still ships with evidence, but the
+			// explanation was lost. This counter is the only signal that
+			// a silent narration regression has happened.
+			metrics.observeNarration(reports[i].Triage.Narrative == "" && reports[i].Triage.Confidence == "")
+			reports[i].Narrative = reports[i].Triage.Narrative
+		}()
+	}
+	wg.Wait()
+
+	// Third pass: deliver in the original severity order. Reordering would
+	// invert the most-urgent-first contract that the sort above established.
+	for i, g := range groups {
+		r := reports[i]
 		rec := DigestRecord{
 			At: time.Now(), Key: g.Key, Title: g.Title(), Severity: g.Severity(),
 			PriorSeen: r.PriorSeen, Narrative: r.Narrative, Evidence: renderEvidence(r),
