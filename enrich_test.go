@@ -210,7 +210,7 @@ func TestEnrichSkipsOnlyWhenBothClustersAreKnownAndDiffer(t *testing.T) {
 			g := Group{Key: "single/A", Cluster: tt.groupCluster, Alerts: []Alert{
 				{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
 			}}
-			got := k.Enrich(g, time.Minute)
+			got := k.Enrich(g, time.Minute, &Config{})
 
 			skipped := strings.Contains(got.Scope, "cluster state unavailable")
 			if skipped != tt.wantSkipped {
@@ -260,7 +260,7 @@ func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(g, time.Minute)
+	en := k.Enrich(g, time.Minute, &Config{})
 
 	for _, p := range en.UnhealthyPods {
 		if strings.Contains(p, "job-finished") {

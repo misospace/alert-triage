@@ -55,6 +55,13 @@ type Config struct {
 	// evidence to each alert group. Unset keeps today's behaviour.
 	MetricsURL string
 
+	// GitOpsRepo and GitOpsPath are the fallback repo URL and directory
+	// used when a workload carries no Flux or Argo annotations. They are
+	// never concatenated into a result on their own; an unset pair is a
+	// no-op rather than a fabricated location.
+	GitOpsRepo string
+	GitOpsPath string
+
 	// DroppedByLabel counts alerts the webhook dropped because they
 	// lacked the TriageLabel. Surfaced in the delivery log so a
 	// label-rule typo is visible without waiting on Prometheus metrics.
@@ -81,6 +88,8 @@ func loadConfig() Config {
 		TriageLabel:    os.Getenv("TRIAGE_LABEL"),
 		Cluster:        os.Getenv("CLUSTER"),
 		MetricsURL:     os.Getenv("METRICS_URL"),
+		GitOpsRepo:     os.Getenv("GITOPS_REPO"),
+		GitOpsPath:     os.Getenv("GITOPS_PATH"),
 	}
 }
 
@@ -426,7 +435,7 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 	}
 
 	for i, g := range groups {
-		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
+		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
 			r.Metrics = prom.EnrichMetrics(g, cfg.EvidenceWindow)
 		}

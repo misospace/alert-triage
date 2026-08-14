@@ -215,6 +215,12 @@ func renderEvidence(r Report) string {
 	if len(r.Group.Namespaces) > 0 {
 		fmt.Fprintf(&b, "Namespaces: %s\n", strings.Join(r.Group.Namespaces, ", "))
 	}
+	if len(r.Enrichment.RepoPaths) > 0 {
+		fmt.Fprintf(&b, "RepoPaths:\n")
+		for _, p := range r.Enrichment.RepoPaths {
+			fmt.Fprintf(&b, "- %s\n", untrusted(p))
+		}
+	}
 	if r.PriorSeen > 0 {
 		fmt.Fprintf(&b, "History: this shape has fired %d time(s) recently.\n", r.PriorSeen)
 	} else {
@@ -477,6 +483,13 @@ func Deliver(cfg *Config, r Report) error {
 	embed.Footer.Text = fmt.Sprintf("%s · %s · %s", r.Group.Key, r.Group.Severity(), seen)
 	if cluster := r.Group.Cluster; cluster != "" && cluster != "default" {
 		embed.Footer.Text = cluster + " · " + embed.Footer.Text
+	}
+	for _, p := range r.Enrichment.RepoPaths {
+		embed.Fields = append(embed.Fields, struct {
+			Name   string `json:"name"`
+			Value  string `json:"value"`
+			Inline bool   `json:"inline"`
+		}{Name: "Source", Value: untrusted(p), Inline: false})
 	}
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
