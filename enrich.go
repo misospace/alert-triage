@@ -81,8 +81,9 @@ func (k *kube) get(path string, out any) error {
 type podList struct {
 	Items []struct {
 		Metadata struct {
-			Name      string `json:"name"`
-			Namespace string `json:"namespace"`
+			Name        string            `json:"name"`
+			Namespace   string            `json:"namespace"`
+			Annotations map[string]string `json:"annotations"`
 		} `json:"metadata"`
 		Spec struct {
 			NodeName string `json:"nodeName"`
@@ -166,6 +167,11 @@ type Enrichment struct {
 	// Scope records what was actually inspected, so the narrative can
 	// distinguish "nothing is wrong" from "nothing was looked at".
 	Scope string
+	// RepoPaths is the GitOps-managed location of the workload(s) an alert
+	// names, resolved from Flux Kustomizations or Argo Applications the pods
+	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
+	// nothing resolves; the prose must degrade gracefully in that case.
+	RepoPaths []string
 }
 
 func (e Enrichment) empty() bool {
@@ -228,7 +234,7 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
-func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
+func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
@@ -264,6 +270,7 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
 	}
 
+	var seenPods []podRef
 	for _, ns := range g.Namespaces {
 		esc := url.PathEscape(ns)
 
@@ -277,6 +284,11 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 		}
 		var unhealthy []scoredPod
 		for _, p := range pods.Items {
+			seenPods = append(seenPods, podRef{
+				Name:        p.Metadata.Name,
+				Namespace:   p.Metadata.Namespace,
+				Annotations: p.Metadata.Annotations,
+			})
 			for _, cs := range p.Status.ContainerStatuses {
 				reason := ""
 				for state, s := range cs.State {
@@ -317,6 +329,7 @@ func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
+	e.RepoPaths = k.resolveRepoPaths(seenPods, cfg)
 	return e
 }
 
@@ -568,4 +581,152 @@ func podHealthScore(phase, reason string, ready bool, restarts int) int {
 	}
 	score += restarts * 10
 	return score
+}
+
+// resolveRepoPaths walks the pods already gathered and, for each, looks up
+// the GitOps tool that owns it. Flux-managed pods carry
+// kustomize.toolkit.fluxcd.io/name+namespace pointing at a Kustomization;
+// its spec.sourceRef names a GitRepository with the repo URL, and its
+// spec.path gives the directory. Argo-managed pods carry
+// argocd.argoproj.io/instance naming an Application whose spec.source
+// carries repoURL and path directly. When neither annotation is present,
+// the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
+// de-duplicated; unresolved entries are dropped silently so a missing
+// mapping degrades to today's prose rather than to a fabricated path.
+func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(repo, path string) {
+		repo = strings.TrimRight(repo, "/")
+		path = strings.TrimLeft(path, "/")
+		if repo == "" {
+			return
+		}
+		var entry string
+		if path == "" {
+			entry = repo
+		} else {
+			entry = repo + "/" + path
+		}
+		if seen[entry] {
+			return
+		}
+		seen[entry] = true
+		out = append(out, entry)
+	}
+
+	for _, p := range pods {
+		if kustom := p.Annotations["kustomize.toolkit.fluxcd.io/name"]; kustom != "" {
+			kuzNs := p.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+			if kuzNs == "" {
+				kuzNs = p.Namespace
+			}
+			if repo, path, ok := k.fluxPath(kuzNs, kustom); ok {
+				add(repo, path)
+				continue
+			}
+			if repo, path, ok := k.fluxHelmPath(p.Annotations); ok {
+				add(repo, path)
+				continue
+			}
+		}
+		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
+			if repo, path, ok := k.argocdPath(app); ok {
+				add(repo, path)
+				continue
+			}
+		}
+	}
+	if len(out) == 0 && cfg.GitOpsRepo != "" {
+		add(cfg.GitOpsRepo, cfg.GitOpsPath)
+	}
+	return out
+}
+
+// podRef is the minimal pod shape resolveRepoPaths needs; the project does
+// not depend on client-go, so we carry only name, namespace, and the
+// annotations the GitOps tools use to identify their owner.
+type podRef struct {
+	Name        string
+	Namespace   string
+	Annotations map[string]string
+}
+
+func (k *kube) fluxPath(ns, name string) (string, string, bool) {
+	var kuz struct {
+		Spec struct {
+			Path      string `json:"path"`
+			SourceRef struct {
+				Name string `json:"name"`
+				Kind string `json:"kind"`
+			} `json:"sourceRef"`
+		} `json:"spec"`
+	}
+	if err := k.get("/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil || kuz.Spec.Path == "" {
+		return "", "", false
+	}
+	srcKind := kuz.Spec.SourceRef.Kind
+	if srcKind == "" {
+		srcKind = "GitRepository"
+	}
+	var src struct {
+		Spec struct {
+			URL string `json:"url"`
+		} `json:"spec"`
+	}
+	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
+	if err := k.get(srcPath, &src); err != nil || src.Spec.URL == "" {
+		return "", "", false
+	}
+	return src.Spec.URL, kuz.Spec.Path, true
+}
+
+func (k *kube) fluxHelmPath(ann map[string]string) (string, string, bool) {
+	kuz := ann["kustomize.toolkit.fluxcd.io/name"]
+	if kuz == "" {
+		return "", "", false
+	}
+	ns := ann["kustomize.toolkit.fluxcd.io/namespace"]
+	if ns == "" {
+		return "", "", false
+	}
+	return k.fluxPath(ns, kuz)
+}
+
+func (k *kube) argocdPath(instance string) (string, string, bool) {
+	var app struct {
+		Spec struct {
+			Source struct {
+				RepoURL string `json:"repoURL"`
+				Path    string `json:"path"`
+			} `json:"source"`
+		} `json:"spec"`
+	}
+	for _, ns := range []string{"argocd", ""} {
+		p := "/apis/argoproj.io/v1alpha1/"
+		if ns != "" {
+			p += "namespaces/" + ns + "/"
+		}
+		p += "applications/" + instance
+		if err := k.get(p, &app); err == nil && app.Spec.Source.RepoURL != "" {
+			return app.Spec.Source.RepoURL, app.Spec.Source.Path, true
+		}
+	}
+	return "", "", false
+}
+
+func pluralLower(kind string) string {
+	switch kind {
+	case "GitRepository":
+		return "gitrepositories"
+	case "OCIRepository":
+		return "ocirepositories"
+	case "Bucket":
+		return "buckets"
+	case "HelmChart":
+		return "helmcharts"
+	case "HelmRelease":
+		return "helmreleases"
+	}
+	return strings.ToLower(kind) + "s"
 }
