@@ -459,6 +459,9 @@ func Deliver(cfg *Config, r Report) error {
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("discord: %s", resp.Status)
 	}
+	// Stamp the gauge only on a fully successful delivery; a 5xx from the
+	// channel must not roll the freshness clock forward.
+	metrics.markFlushed()
 	return nil
 }
 
