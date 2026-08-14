@@ -151,3 +151,85 @@ func TestHistoryCompactAtomicRename(t *testing.T) {
 		t.Errorf("expected history file to exist after Compact: %v", err)
 	}
 }
+
+func TestHistoryPriorSeenCountsOnlyMatchingSigs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	// Seed entries directly so we can pin the timestamps.
+	h.entries = append(h.entries,
+		sighting{Signature: "alpha", Title: "alpha-title", At: now.Add(-3 * time.Hour)},
+		sighting{Signature: "alpha", Title: "alpha-title", At: now.Add(-1 * time.Hour)},
+		sighting{Signature: "beta", Title: "beta-title", At: now.Add(-30 * time.Minute)},
+	)
+
+	if got := h.PriorSeen("alpha", "alpha-title"); got != 2 {
+		t.Errorf("PriorSeen(alpha) = %d, want 2", got)
+	}
+	if got := h.PriorSeen("beta", "beta-title"); got != 1 {
+		t.Errorf("PriorSeen(beta) = %d, want 1", got)
+	}
+	if got := h.PriorSeen("missing", "missing-title"); got != 0 {
+		t.Errorf("PriorSeen(missing) = %d, want 0", got)
+	}
+
+	// PriorSeen must not record a sighting; Record still returns prior==2 next time.
+	if got := h.Record("alpha", "alpha-title", now); got != 2 {
+		t.Errorf("Record(alpha) prior = %d, want 2 (PriorSeen must not have mutated state)", got)
+	}
+}
+
+func TestHistoryPriorSeenExcludesExpired(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 1 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	h.entries = append(h.entries,
+		sighting{Signature: "old", Title: "old", At: now.Add(-3 * time.Hour)},
+		sighting{Signature: "fresh", Title: "fresh", At: now.Add(-10 * time.Minute)},
+	)
+
+	if got := h.PriorSeen("old", "old"); got != 0 {
+		t.Errorf("PriorSeen should drop expired entry, got %d", got)
+	}
+	if got := h.PriorSeen("fresh", "fresh"); got != 1 {
+		t.Errorf("PriorSeen should keep in-window entry, got %d", got)
+	}
+}
+
+func TestHistoryNewHistorySurvivesUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 1 * time.Hour
+
+	// Point the history at a path that cannot be opened (a directory
+	// stands in for a permission-denied / corrupted-mount case: os.Open
+	// on a directory fails on every supported platform).
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatalf("NewHistory should not return an error for an unreadable file, got %v", err)
+	}
+	if h == nil {
+		t.Fatal("NewHistory returned a nil history")
+	}
+	if len(h.entries) != 0 {
+		t.Errorf("expected empty history when load cannot read the file, got %d entries", len(h.entries))
+	}
+}

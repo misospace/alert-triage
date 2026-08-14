@@ -199,7 +199,7 @@ func main() {
 
 	hist, err := NewHistory(cfg.HistoryPath, cfg.Retention)
 	if err != nil {
-		log.Fatalf("history: %v", err)
+		logf("history: %v", err)
 	}
 	k, err := newKube(cfg.Cluster)
 	if err != nil {
