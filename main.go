@@ -426,7 +426,12 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 	}
 
 	for i, g := range groups {
-		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow)}
+		backend, backendErr := newLogsBackend()
+		if backendErr == errNoLogsBackend {
+			backend = nil
+			backendErr = nil
+		}
+		r := Report{Group: g, Enrichment: k.enrich(g, cfg.EvidenceWindow, backend, backendErr)}
 		if prom != nil {
 			r.Metrics = prom.EnrichMetrics(g, cfg.EvidenceWindow)
 		}

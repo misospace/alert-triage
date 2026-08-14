@@ -159,6 +159,11 @@ type Enrichment struct {
 	PodLogs       map[string]string // pod key -> tail of previous container log
 	Events        []string
 	RecentChanges []string
+	// BackendLogs are workload-authored records from the optional log backend.
+	// They must remain outside the evidence this service vouches for.
+	BackendLogs  []string
+	BackendState string
+	BackendError string
 	// Ambient is cluster-wide context gathered when the alert names no subject
 	// to scope to. It is NOT known to concern the alert, and is kept apart so a
 	// coincidence is not read as a cause.
@@ -169,8 +174,8 @@ type Enrichment struct {
 }
 
 func (e Enrichment) empty() bool {
-	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
+	return e.BackendState == "" && len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
+		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -229,7 +234,13 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
 func (k *kube) Enrich(g Group, window time.Duration) Enrichment {
+	b, err := newLogsBackend()
+	return k.enrich(g, window, b, err)
+}
+
+func (k *kube) enrich(g Group, window time.Duration, b *logsBackend, backendErr error) Enrichment {
 	var e Enrichment
+	e.BackendState, e.BackendLogs, e.BackendError = fetchBackendLogsWithBackend(g, window, b, backendErr)
 	if k == nil {
 		e.Scope = "cluster state unavailable"
 		return e

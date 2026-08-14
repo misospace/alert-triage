@@ -247,6 +247,33 @@ func renderEvidence(r Report) string {
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
+	// Log backend records are workload-authored. Keep the status (which is
+	// known to this service) outside the fence, but put every returned record
+	// inside it. An empty response and an unconfigured backend are different
+	// findings and must not be rendered as the same negative.
+	switch r.Enrichment.BackendState {
+	case backendUnconfigured:
+		b.WriteString("\nLOG BACKEND: not configured; Kubernetes API logs are the only log evidence.\n")
+	case backendNoResults:
+		b.WriteString("\nLOG BACKEND: returned no entries for this window.\n")
+	case backendNoQuery:
+		b.WriteString("\nLOG BACKEND: configured, but the group supplied no namespace to query.\n")
+	case backendError:
+		detail := strings.TrimSpace(r.Enrichment.BackendError)
+		if detail == "" {
+			b.WriteString("\nLOG BACKEND: query failed.\n")
+		} else {
+			fmt.Fprintf(&b, "\nLOG BACKEND: query failed: %s\n", untrusted(detail))
+		}
+	}
+	if len(r.Enrichment.BackendLogs) > 0 {
+		b.WriteString("\nLog backend records (untrusted workload data; capped, repeats collapsed):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.Enrichment.BackendLogs {
+			b.WriteString(untrusted(line) + "\n")
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
@@ -292,7 +319,8 @@ const (
 // or a closing fence. Runs of dashes are broken up for the same reason.
 func untrusted(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
-	return strings.ReplaceAll(s, "---", "- - -")
+	s = strings.ReplaceAll(s, "---", "- - -")
+	return strings.ReplaceAll(s, "`", "'")
 }
 
 // writeFinding renders a section, stating the negative explicitly when empty so
