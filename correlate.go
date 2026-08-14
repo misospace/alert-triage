@@ -119,6 +119,33 @@ func DefaultSignatures() []Signature {
 	ignoreTrigger := func(f func(Alert) bool) func(Alert, Alert) bool {
 		return func(_, candidate Alert) bool { return f(candidate) }
 	}
+	// subsystemLabelKeys are the labels that identify the component a workload
+	// belongs to rather than the alert itself. A shared value on one of these is
+	// the strongest signal we have that two alerts describe the same component,
+	// even if their alertnames, namespaces and nodes disagree.
+	subsystemLabelKeys := []string{"job", "service", "app", "component"}
+	subsystemSig := func() Signature {
+		return Signature{
+			Name:   "subsystem",
+			Reason: "Alerts share a subsystem label (job/service/app/component); one component, multiple symptoms",
+			Trigger: func(a Alert) bool {
+				_, k := subsystemKey(a, subsystemLabelKeys)
+				return k != ""
+			},
+			// Scope is bounded by the exact (key, value) pair on the trigger,
+			// not by the candidate's label name: a candidate carrying job=foo
+			// must not be joined to a trigger with service=foo, because those
+			// values are not comparable across label names.
+			Scope: func(trigger, candidate Alert) bool {
+				tv, tk := subsystemKey(trigger, subsystemLabelKeys)
+				if tk == "" {
+					return false
+				}
+				cv, ck := subsystemKey(candidate, subsystemLabelKeys)
+				return tk == ck && tv == cv && tv != ""
+			},
+		}
+	}
 	return []Signature{
 		{
 			Name:    "nfs",
@@ -157,7 +184,21 @@ func DefaultSignatures() []Signature {
 					textContains(a, "timeout") || textContains(a, "unreachable")
 			}),
 		},
+		subsystemSig(),
 	}
+}
+
+// subsystemKey returns the first non-empty subsystem label on a, lower-cased,
+// along with the label name it came from. The label name matters: a candidate
+// carrying service=foo must not be joined to a trigger carrying job=foo, since
+// those values are not comparable across label names.
+func subsystemKey(a Alert, keys []string) (value, key string) {
+	for _, k := range keys {
+		if v := strings.ToLower(a.Labels[k]); v != "" {
+			return v, k
+		}
+	}
+	return "", ""
 }
 
 // overlaps reports whether two alerts were active at the same time, allowing

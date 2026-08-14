@@ -225,6 +225,111 @@ func TestNodeSignatureScopesToItsNode(t *testing.T) {
 	}
 }
 
+// Three LiteLLM alertnames — DeploymentOutage, AuthOrQuotaFailures,
+// ModelFailover — share no alertname, namespace or node, but they all carry
+// job=litellm-gateway. That label identifies one component, and the issue
+// asks for those alerts to be reported as one incident.
+func TestSubsystemLabelGroupsRelatedAlerts(t *testing.T) {
+	a := alert("LiteLLMDeploymentOutage", "gateway", "critical", 0, "deployment down")
+	a.Labels["job"] = "litellm-gateway"
+	b := alert("LiteLLMAuthOrQuotaFailures", "gateway", "warning", time.Minute, "auth failing")
+	b.Labels["job"] = "litellm-gateway"
+	c := alert("LiteLLMModelFailover", "models", "warning", 2*time.Minute, "failover")
+	c.Labels["job"] = "litellm-gateway"
+	d := alert("LiteLLMDeploymentOutage", "models", "critical", 3*time.Minute, "deployment down")
+	d.Labels["job"] = "litellm-gateway"
+
+	groups := Correlate([]Alert{a, b, c, d}, nil, DefaultSignatures(), 5*time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("want one group for one subsystem, got %d", len(groups))
+	}
+	if groups[0].Key != "signature/subsystem" {
+		t.Errorf("want signature/subsystem, got %s", groups[0].Key)
+	}
+	if len(groups[0].Alerts) != 4 {
+		t.Errorf("want all four alerts grouped, got %d", len(groups[0].Alerts))
+	}
+}
+
+// Two alerts that share no subsystem label must not get pulled into a
+// subsystem group by accident — a single alertname carrying nothing but
+// severity labels must stay as an alertname-group (or a lone alert), not a
+// "subsystem" group. This is the over-grouping shape the issue warns about.
+func TestSubsystemLabelDoesNotPullInUnlabelledAlerts(t *testing.T) {
+	a := alert("LiteLLMDeploymentOutage", "gateway", "critical", 0, "down")
+	a.Labels["job"] = "litellm-gateway"
+	b := alert("LiteLLMDeploymentOutage", "gateway", "critical", time.Minute, "down")
+	// b carries no job/service/app/component label.
+
+	groups := Correlate([]Alert{a, b}, nil, DefaultSignatures(), 5*time.Minute)
+	for _, g := range groups {
+		if g.Key == "signature/subsystem" {
+			t.Errorf("an alert without any subsystem label was pulled into a subsystem group")
+		}
+	}
+}
+
+// An alertname-only group with no subsystem label on any member must not
+// be relabeled as a subsystem group. The subsystem signature is opt-in.
+func TestSubsystemSignatureIgnoresGroupWithoutSharedLabel(t *testing.T) {
+	a := alert("SomeOtherAlert", "ns-a", "warning", 0, "x")
+	b := alert("SomeOtherAlert", "ns-a", "warning", time.Minute, "y")
+
+	groups := Correlate([]Alert{a, b}, nil, DefaultSignatures(), 5*time.Minute)
+	for _, g := range groups {
+		if g.Key == "signature/subsystem" {
+			t.Errorf("unlabelled alertname-group became a subsystem group: %s", g.Key)
+		}
+	}
+}
+
+// Same string value across two different label names is not the same signal:
+// a candidate carrying service=foo must not be pulled into a trigger with
+// job=foo, because we have no way to know those values are comparable.
+func TestSubsystemSignatureKeyDoesNotCrossLabelNames(t *testing.T) {
+	a := alert("LiteLLMDeploymentOutage", "gateway", "critical", 0, "down")
+	a.Labels["job"] = "litellm-gateway"
+	b := alert("OtherDeploymentOutage", "other", "critical", time.Minute, "down")
+	b.Labels["service"] = "litellm-gateway"
+
+	groups := Correlate([]Alert{a, b}, nil, DefaultSignatures(), 5*time.Minute)
+	if len(groups) != 2 {
+		t.Fatalf("want two groups when the shared value is on different label names, got %d (keys=%v)",
+			len(groups), groupKeys(groups))
+	}
+	for _, g := range groups {
+		if g.Key == "signature/subsystem" {
+			t.Errorf("service=foo must not match job=foo")
+		}
+	}
+}
+
+// Two alerts sharing the same (key, value) subsystem label but otherwise
+// unrelated must still fuse under the subsystem signature.
+func TestSubsystemSignatureMatchesOnSharedLabelPair(t *testing.T) {
+	a := alert("ServiceDown", "ns-a", "critical", 0, "down")
+	a.Labels["app"] = "checkout"
+	b := alert("HighErrorRate", "ns-b", "warning", time.Minute, "errors")
+	b.Labels["app"] = "checkout"
+
+	groups := Correlate([]Alert{a, b}, nil, DefaultSignatures(), 5*time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("want one group for shared app=checkout, got %d (keys=%v)",
+			len(groups), groupKeys(groups))
+	}
+	if groups[0].Key != "signature/subsystem" {
+		t.Errorf("want signature/subsystem, got %s", groups[0].Key)
+	}
+}
+
+func groupKeys(groups []Group) []string {
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, g.Key)
+	}
+	return out
+}
+
 // The same alert across namespaces is one story about a shared cause.
 func TestSameAlertAcrossNamespacesGroups(t *testing.T) {
 	var alerts []Alert
