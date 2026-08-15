@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -415,10 +416,25 @@ func severityColor(s string) int {
 	}
 }
 
-// Deliver posts one incident to the digest webhook.
+// Deliver posts one incident to the digest webhook. When GitHub is configured
+// and the triage is actionable it is also mirrored to a GitHub issue keyed on
+// the group signature; see issue #14. Unset env keeps the original chat-only
+// behaviour.
 func Deliver(cfg *Config, r Report) error {
 	if cfg.DiscordURL == "" {
 		return fmt.Errorf("no discord webhook configured")
+	}
+
+	gh := newGitHub(cfg)
+	var ghAction issueAction
+	if gh != nil && r.Triage.Actionable() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		act, err := deliverGitHub(ctx, gh, cfg, r)
+		cancel()
+		if err != nil {
+			logf("github: %v", err)
+		}
+		ghAction = act
 	}
 
 	var desc strings.Builder
@@ -490,6 +506,16 @@ func Deliver(cfg *Config, r Report) error {
 			Value  string `json:"value"`
 			Inline bool   `json:"inline"`
 		}{Name: "Source", Value: untrusted(p), Inline: false})
+	}
+
+	// When a GitHub issue now exists, the chat becomes a pointer plus a one-
+	// line summary; the full body lives in the issue so verbose evidence can
+	// be folded under <details>. Behaviour is unchanged when ghAction is
+	// empty (env unset) or Outcome=="none" (non-actionable).
+	if ghAction.URL != "" && ghAction.Outcome != "none" {
+		fmt.Fprintf(&desc, "\nTracked: <%s>", ghAction.URL)
+	} else if ghAction.Outcome == "none" && ghAction.URL != "" {
+		fmt.Fprintf(&desc, "\nTracked: <%s>", ghAction.URL)
 	}
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
