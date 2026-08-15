@@ -69,6 +69,17 @@ type Config struct {
 	GitOpsRepo string
 	GitOpsPath string
 
+	// GitHubRepo / GitHubToken mirror actionable incidents as GitHub issues,
+	// keyed on the group signature so re-fires update one durable record.
+	// Both unset keeps the original chat-only behaviour; see issue #14.
+	GitHubRepo  string
+	GitHubToken string
+
+	// IssueCommentInterval sets the floor between comments on a re-firing
+	// issue. Default 12h; severity changes bypass the gate so an alert that
+	// escalates to critical is always noted.
+	IssueCommentInterval time.Duration
+
 	// DroppedByLabel counts alerts the webhook dropped because they
 	// lacked the TriageLabel. Surfaced in the delivery log so a
 	// label-rule typo is visible without waiting on Prometheus metrics.
@@ -77,27 +88,30 @@ type Config struct {
 
 func loadConfig() Config {
 	return Config{
-		ListenAddr:         envDefault("LISTEN_ADDR", ":8080"),
-		WebhookToken:       os.Getenv("WEBHOOK_TOKEN"),
-		MaxAlerts:          envInt("MAX_ALERTS", 500),
-		MaxGroups:          envInt("MAX_GROUPS", 12),
-		NarrateConcurrency: envInt("NARRATE_CONCURRENCY", 2),
-		LiteLLMURL:         envDefault("LITELLM_URL", ""),
-		LiteLLMKey:         os.Getenv("LITELLM_API_KEY"),
-		Model:              envDefault("MODEL", "dsv4f"),
-		DiscordURL:         os.Getenv("DISCORD_WEBHOOK_URL"),
-		HistoryPath:        envDefault("HISTORY_PATH", "/data/history.jsonl"),
-		FlushDelay:         envDuration("FLUSH_DELAY", 3*time.Minute),
-		MaxWindow:          envDuration("MAX_WINDOW", 10*time.Minute),
-		CorrelateSlack:     envDuration("CORRELATE_SLACK", 5*time.Minute),
-		EvidenceWindow:     envDuration("EVIDENCE_WINDOW", 30*time.Minute),
-		Retention:          envDuration("RETENTION", 7*24*time.Hour),
-		NarrateTimeout:     envDuration("NARRATE_TIMEOUT", 120*time.Second),
-		TriageLabel:        os.Getenv("TRIAGE_LABEL"),
-		Cluster:            os.Getenv("CLUSTER"),
-		MetricsURL:         os.Getenv("METRICS_URL"),
-		GitOpsRepo:         os.Getenv("GITOPS_REPO"),
-		GitOpsPath:         os.Getenv("GITOPS_PATH"),
+		ListenAddr:           envDefault("LISTEN_ADDR", ":8080"),
+		WebhookToken:         os.Getenv("WEBHOOK_TOKEN"),
+		MaxAlerts:            envInt("MAX_ALERTS", 500),
+		MaxGroups:            envInt("MAX_GROUPS", 12),
+		NarrateConcurrency:   envInt("NARRATE_CONCURRENCY", 2),
+		LiteLLMURL:           envDefault("LITELLM_URL", ""),
+		LiteLLMKey:           os.Getenv("LITELLM_API_KEY"),
+		Model:                envDefault("MODEL", "dsv4f"),
+		DiscordURL:           os.Getenv("DISCORD_WEBHOOK_URL"),
+		HistoryPath:          envDefault("HISTORY_PATH", "/data/history.jsonl"),
+		FlushDelay:           envDuration("FLUSH_DELAY", 3*time.Minute),
+		MaxWindow:            envDuration("MAX_WINDOW", 10*time.Minute),
+		CorrelateSlack:       envDuration("CORRELATE_SLACK", 5*time.Minute),
+		EvidenceWindow:       envDuration("EVIDENCE_WINDOW", 30*time.Minute),
+		Retention:            envDuration("RETENTION", 7*24*time.Hour),
+		NarrateTimeout:       envDuration("NARRATE_TIMEOUT", 120*time.Second),
+		TriageLabel:          os.Getenv("TRIAGE_LABEL"),
+		Cluster:              os.Getenv("CLUSTER"),
+		MetricsURL:           os.Getenv("METRICS_URL"),
+		GitOpsRepo:           os.Getenv("GITOPS_REPO"),
+		GitOpsPath:           os.Getenv("GITOPS_PATH"),
+		GitHubRepo:           os.Getenv("GITHUB_REPO"),
+		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
+		IssueCommentInterval: envDuration("ISSUE_COMMENT_INTERVAL", 12*time.Hour),
 	}
 }
 
