@@ -511,10 +511,9 @@ func Deliver(cfg *Config, r Report) error {
 	// When a GitHub issue now exists, the chat becomes a pointer plus a one-
 	// line summary; the full body lives in the issue so verbose evidence can
 	// be folded under <details>. Behaviour is unchanged when ghAction is
-	// empty (env unset) or Outcome=="none" (non-actionable).
-	if ghAction.URL != "" && ghAction.Outcome != "none" {
-		fmt.Fprintf(&desc, "\nTracked: <%s>", ghAction.URL)
-	} else if ghAction.Outcome == "none" && ghAction.URL != "" {
+	// empty (env unset) or Outcome=="none" (non-actionable), since both
+	// paths leave ghAction.URL unset.
+	if ghAction.URL != "" {
 		fmt.Fprintf(&desc, "\nTracked: <%s>", ghAction.URL)
 	}
 
