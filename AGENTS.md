@@ -67,10 +67,12 @@ instance needed no shared credentials or state. That invariant was replaced
 because running one instance per cluster doubles what has to be watched and
 there are no metrics yet (#17), so a dead instance looks like a quiet cluster.
 
-**Stdlib only.** No `client-go`, no SDKs. The Kubernetes client is plain HTTP
-against the apiserver using the in-cluster ServiceAccount token. Four GETs do
-not justify the dependency tree. If you need a new resource, add a struct and a
-path, not a library.
+**Stdlib plus one YAML library.** No `client-go`, no SDKs. The Kubernetes client is plain HTTP
+against the apiserver using the in-cluster ServiceAccount token; four GETs do
+not justify the dependency tree (if you need a new resource, add a struct and a
+path, not a library).
+
+**YAML dependency carve-out:** `gopkg.in/yaml.v3` is the sole allowed non-stdlib import. It exists so `propose.go` can round-trip a Kubernetes manifest before and after an edit instead of replacing by regex — a regex against a three-container manifest silently rewrites the wrong container and reconciles as if nothing happened. The dep is direct in `go.mod` and pinned in `go.sum`; do not add a second YAML library, and do not import its transitive tree. Anything richer than parse/encode must stay in stdlib.
 
 **`Signature.Scope` must bound itself to its trigger.** A scope that ignores the
 triggering alert and accepts everything swallows an entire window. This was a
