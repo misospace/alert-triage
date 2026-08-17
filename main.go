@@ -75,6 +75,15 @@ type Config struct {
 	GitHubRepo  string
 	GitHubToken string
 
+	// GrafanaURL is the base URL of a Grafana instance. When set, digests
+	// gain an Explore link for the alerting expression and (if GrafanaLogsDS
+	// is also set) a logs Explore link scoped to the same window. Unset keeps
+	// the linkless behaviour; a malformed value is worse than none, so a
+	// relative or scheme-less URL is dropped at config time.
+	GrafanaURL       string
+	GrafanaMetricsDS string
+	GrafanaLogsDS    string
+
 	// IssueCommentInterval sets the floor between comments on a re-firing
 	// issue. Default 12h; severity changes bypass the gate so an alert that
 	// escalates to critical is always noted.
@@ -112,6 +121,9 @@ func loadConfig() Config {
 		GitHubRepo:           os.Getenv("GITHUB_REPO"),
 		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
 		IssueCommentInterval: envDuration("ISSUE_COMMENT_INTERVAL", 12*time.Hour),
+		GrafanaURL:           envGrafanaURL("GRAFANA_URL"),
+		GrafanaMetricsDS:     os.Getenv("GRAFANA_METRICS_DS"),
+		GrafanaLogsDS:        os.Getenv("GRAFANA_LOGS_DS"),
 	}
 }
 
@@ -463,7 +475,7 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
 	for i, g := range groups {
-		r := Report{Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, cfg)}
+		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
 			r.Metrics = prom.EnrichMetrics(g, cfg.EvidenceWindow)
 		}
@@ -550,6 +562,8 @@ func envInt(key string, fallback int) int {
 	logf("bad integer for %s=%q, using %d", key, v, fallback)
 	return fallback
 }
+
+func osGetenvReal(key string) string { return os.Getenv(key) }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
 	v := os.Getenv(key)

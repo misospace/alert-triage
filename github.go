@@ -202,6 +202,21 @@ func renderIssueBody(r Report, sig string) string {
 		fmt.Fprintf(&b, "**What to change**\n\n%s\n\n", w)
 	}
 
+	// Grafana Explore links: same construction as the Discord embed, so the
+	// issue body and the chat digest agree on where the evidence lives. Links
+	// are emitted only when GRAFANA_URL and the relevant datasource UID are
+	// set; otherwise the body reads exactly as it did before.
+	if metricsLink, logsLink := grafanaLinks(r.Cfg, firstExpression(r.Group.Alerts), firstNamespace(r.Group.Alerts), groupWindow(r.Group)); metricsLink != "" || logsLink != "" {
+		b.WriteString("**Grafana**\n\n")
+		if metricsLink != "" {
+			fmt.Fprintf(&b, "• [Metrics explore](%s)\n", metricsLink)
+		}
+		if logsLink != "" {
+			fmt.Fprintf(&b, "• [Logs explore](%s)\n", logsLink)
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString("**Alerts**\n\n")
 	b.WriteString("| Severity | Alert | Namespace | Since |\n")
 	b.WriteString("| --- | --- | --- | --- |\n")
