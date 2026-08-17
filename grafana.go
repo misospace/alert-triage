@@ -63,9 +63,9 @@ func grafanaExplore(base, ds, expr string, from, to time.Time, datasourceType st
 					"uid":  ds,
 					"type": datasourceType,
 				},
-				"expr":      expr,
-				"range":     true,
-				"instant":   false,
+				"expr":    expr,
+				"range":   true,
+				"instant": false,
 			},
 		},
 		"range": map[string]string{
