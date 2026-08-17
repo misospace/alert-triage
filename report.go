@@ -13,6 +13,7 @@ import (
 
 // Report is one correlated incident, ready to deliver.
 type Report struct {
+	Cfg        *Config
 	Group      Group
 	Enrichment Enrichment
 	PriorSeen  int
@@ -476,6 +477,21 @@ func Deliver(cfg *Config, r Report) error {
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
 
+	// Grafana Explore links: own construction, so it lives outside the
+	// untrusted fence; emitted only when GRAFANA_URL and the relevant
+	// datasource UID are both set, otherwise the digest reads exactly as
+	// it did before. The window is the alert's own firing range so the
+	// operator lands already scoped to the incident.
+	if metricsLink, logsLink := grafanaLinks(cfg, firstExpression(r.Group.Alerts), firstNamespace(r.Group.Alerts), groupWindow(r.Group)); metricsLink != "" || logsLink != "" {
+		desc.WriteString("\n**Grafana**\n")
+		if metricsLink != "" {
+			fmt.Fprintf(&desc, "• [Metrics explore](%s)\n", metricsLink)
+		}
+		if logsLink != "" {
+			fmt.Fprintf(&desc, "• [Logs explore](%s)\n", logsLink)
+		}
+	}
+
 	if loc := r.Triage.FixLocation; loc != "" && loc != "unknown" {
 		fmt.Fprintf(&desc, "\n**Fix belongs in:** %s", loc)
 		if r.Triage.Confidence == "low" {
@@ -533,6 +549,32 @@ func Deliver(cfg *Config, r Report) error {
 	// channel must not roll the freshness clock forward.
 	metrics.markFlushed()
 	return nil
+}
+
+// firstExpression returns the PromQL/LogQL expression the group was firing
+// on, best-effort from annotations. Empty if the alert payload didn't carry
+// one - in which case the metrics link is silently omitted rather than
+// emitting a broken Explore URL.
+func firstExpression(alerts []Alert) string {
+	for _, a := range alerts {
+		for _, key := range []string{"expr", "expression", "query"} {
+			if v := strings.TrimSpace(a.Annotations[key]); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// firstNamespace returns the first non-empty namespace across the group's
+// alerts, mirroring the grouping logic in correlate.go.
+func firstNamespace(alerts []Alert) string {
+	for _, a := range alerts {
+		if ns := a.namespace(); ns != "" {
+			return ns
+		}
+	}
+	return ""
 }
 
 func writeDiscordSection(b *strings.Builder, title string, items []string) {
