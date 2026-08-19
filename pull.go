@@ -36,6 +36,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -121,7 +122,7 @@ func deliverPull(ctx context.Context, gh *gitHubClient, prcfg *PRConfig, r Repor
 	if gh == nil {
 		return PRAction{Outcome: "off"}, nil
 	}
-	if !proposalEligible(r.Triage) {
+	if !prEligible(r.Triage) {
 		return PRAction{Outcome: "skipped"}, nil
 	}
 
@@ -174,10 +175,10 @@ func deliverPull(ctx context.Context, gh *gitHubClient, prcfg *PRConfig, r Repor
 	return PRAction{Outcome: "updated", URL: existing.HTMLURL, Branch: existing.Head.Ref}, nil
 }
 
-// proposalEligible is the gating predicate for fix_location == "git".
-// Pulled out of the Triage type so it can be tested independently of the
-// narrative parser.
-func proposalEligible(t Triage) bool {
+// prEligible is the gating predicate for opening PRs.
+// Per issue #36, PRs require fix_location=git AND confidence=high — strictly
+// tighter than proposalEligible, which also admits "partial" locations.
+func prEligible(t Triage) bool {
 	return strings.EqualFold(strings.TrimSpace(t.FixLocation), "git") &&
 		strings.EqualFold(strings.TrimSpace(t.Confidence), "high")
 }
@@ -577,6 +578,12 @@ func applyPatch(original, patch string) (string, bool) {
 		default:
 			return "", false
 		}
+	}
+	// Preserve any trailing lines that fall outside the patched hunk's old
+	// range. oldStart is 1-indexed; oldCount lines are consumed starting there.
+	trailingStart := oldStart - 1 + oldCount
+	if trailingStart < len(orig) {
+		out = append(out, orig[trailingStart:]...)
 	}
 	return strings.Join(out, "\n"), true
 }

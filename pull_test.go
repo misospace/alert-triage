@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -134,13 +136,13 @@ func TestLoadPRConfigTokenWithoutRepoReturnsNil(t *testing.T) {
 // --- proposalEligible ---
 
 func TestProposalEligible(t *testing.T) {
-	if proposalEligible(Triage{FixLocation: "git", Confidence: "high"}) != true {
+	if prEligible(Triage{FixLocation: "git", Confidence: "high"}) != true {
 		t.Errorf("git+high should be eligible")
 	}
-	if proposalEligible(Triage{FixLocation: "partial", Confidence: "high"}) != false {
+	if prEligible(Triage{FixLocation: "partial", Confidence: "high"}) != false {
 		t.Errorf("partial must not be eligible")
 	}
-	if proposalEligible(Triage{FixLocation: "git", Confidence: "low"}) != false {
+	if prEligible(Triage{FixLocation: "git", Confidence: "low"}) != false {
 		t.Errorf("low confidence must not be eligible")
 	}
 }
@@ -156,7 +158,7 @@ func newFakeGH(t *testing.T, existing *ghPR) (*gitHubClient, *httptest.Server, *
 			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"content":  "memory: 256Mi\n",
+				"content":  base64.StdEncoding.EncodeToString([]byte("apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        resources:\n          limits:\n            memory: 256Mi\n")),
 				"sha":      "abc",
 				"encoding": "base64",
 			})
@@ -194,11 +196,13 @@ func TestDeliverPullCreatesOnePRPerSignature(t *testing.T) {
 	cfg := &PRConfig{OptIn: true, Allowlist: []string{"deploy/"}, DailyCap: 5}
 
 	r := Report{
-		Group:  Group{SignatureValue: "XPodCrash::default::app"},
+		Group:  Group{Key: "XPodCrash::default::app", Cluster: "default", Alerts: []Alert{{Labels: map[string]string{"alertname": "XPodCrash"}}}},
 		Triage: Triage{FixLocation: "git", Confidence: "high", WhatToChange: "raise memory limit in deploy/app.yaml", Narrative: "memory"},
 	}
 
-	a, err := deliverPull(context.Background(), gh, cfg, r, "memory: 256Mi", "https://digest/1", 0)
+	const origYAML = "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        resources:\n          limits:\n            memory: 256Mi\n"
+
+	a, err := deliverPull(context.Background(), gh, cfg, r, origYAML, "https://digest/1", 0)
 	if err != nil {
 		t.Fatalf("deliverPull: %v", err)
 	}
@@ -214,22 +218,24 @@ func TestDeliverPullCreatesOnePRPerSignature(t *testing.T) {
 }
 
 func TestDeliverPullRecurrenceUpdates(t *testing.T) {
+	recurrenceGroup := Group{Cluster: "default", Alerts: []Alert{{Labels: map[string]string{"alertname": "XPodCrash"}}}}
 	existing := &ghPR{
 		Number:  11,
 		State:   "open",
 		HTMLURL: "https://pr/11",
-		Body:    fmt.Sprintf(prMarker, "XPodCrash::default::app"),
+		Body:    fmt.Sprintf(prMarker, recurrenceGroup.Signature()),
 	}
 	gh, srv, prCalls := newFakeGH(t, existing)
 	t.Cleanup(srv.Close)
 	cfg := &PRConfig{OptIn: true, Allowlist: []string{"deploy/"}, DailyCap: 5}
 
 	r := Report{
-		Group:    Group{SignatureValue: "XPodCrash::default::app"},
+		Group:    Group{Key: "XPodCrash::default::app", Cluster: "default", Alerts: []Alert{{Labels: map[string]string{"alertname": "XPodCrash"}}}},
 		Triage:   Triage{FixLocation: "git", Confidence: "high", WhatToChange: "raise memory limit in deploy/app.yaml", Narrative: "memory"},
 		PriorSeen: 3,
 	}
-	a, err := deliverPull(context.Background(), gh, cfg, r, "memory: 256Mi", "https://digest/2", 1)
+	const origYAML = "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        resources:\n          limits:\n            memory: 256Mi\n"
+	a, err := deliverPull(context.Background(), gh, cfg, r, origYAML, "https://digest/2", 1)
 	if err != nil {
 		t.Fatalf("deliverPull: %v", err)
 	}
@@ -247,10 +253,11 @@ func TestDeliverPullHonoursDailyCap(t *testing.T) {
 	cfg := &PRConfig{Allowlist: []string{"deploy/"}, DailyCap: 1}
 
 	r := Report{
-		Group:  Group{SignatureValue: "s1"},
+		Group:  Group{Key: "s1"},
 		Triage: Triage{FixLocation: "git", Confidence: "high", WhatToChange: "deploy/x.yaml"},
 	}
-	a, err := deliverPull(context.Background(), gh, cfg, r, "old", "", 1)
+	const origYAML = "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        resources:\n          limits:\n            memory: 256Mi\n"
+	a, err := deliverPull(context.Background(), gh, cfg, r, origYAML, "", 1)
 	if err != nil {
 		t.Fatalf("deliverPull: %v", err)
 	}
@@ -272,7 +279,7 @@ func TestDeliverPullOffWhenConfigNil(t *testing.T) {
 func TestDeliverPullMissingPathSkips(t *testing.T) {
 	cfg := &PRConfig{Allowlist: []string{"deploy/"}, DailyCap: 5}
 	r := Report{
-		Group:  Group{SignatureValue: "s1"},
+		Group:  Group{Key: "s1"},
 		Triage: Triage{FixLocation: "git", Confidence: "high", WhatToChange: "no path here"},
 	}
 	a, err := deliverPull(context.Background(), &gitHubClient{}, cfg, r, "", "", 0)
@@ -287,7 +294,7 @@ func TestDeliverPullMissingPathSkips(t *testing.T) {
 func TestDeliverPullPathNotUnderAllowlistSkips(t *testing.T) {
 	cfg := &PRConfig{Allowlist: []string{"deploy/"}, DailyCap: 5}
 	r := Report{
-		Group:  Group{SignatureValue: "s1"},
+		Group:  Group{Key: "s1"},
 		Triage: Triage{FixLocation: "git", Confidence: "high", WhatToChange: "fix apps/foo.yaml"},
 	}
 	a, err := deliverPull(context.Background(), &gitHubClient{}, cfg, r, "", "", 0)
@@ -302,7 +309,7 @@ func TestDeliverPullPathNotUnderAllowlistSkips(t *testing.T) {
 func TestDeliverPullLowConfidenceSkips(t *testing.T) {
 	cfg := &PRConfig{Allowlist: []string{"deploy/"}, DailyCap: 5}
 	r := Report{
-		Group:  Group{SignatureValue: "s1"},
+		Group:  Group{Key: "s1"},
 		Triage: Triage{FixLocation: "git", Confidence: "low", WhatToChange: "deploy/x.yaml"},
 	}
 	a, err := deliverPull(context.Background(), &gitHubClient{}, cfg, r, "", "", 0)
@@ -317,7 +324,7 @@ func TestDeliverPullLowConfidenceSkips(t *testing.T) {
 func TestDeliverPullPartialSkips(t *testing.T) {
 	cfg := &PRConfig{Allowlist: []string{"deploy/"}, DailyCap: 5}
 	r := Report{
-		Group:  Group{SignatureValue: "s1"},
+		Group:  Group{Key: "s1"},
 		Triage: Triage{FixLocation: "partial", Confidence: "high", WhatToChange: "deploy/x.yaml"},
 	}
 	a, err := deliverPull(context.Background(), &gitHubClient{}, cfg, r, "", "", 0)
