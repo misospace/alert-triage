@@ -265,13 +265,21 @@ func prEligible(t Triage) bool {
 // extractPath pulls the first repo-relative path token out of what_to_change.
 // The model is told to name a file; we accept the token that looks most like a
 // path and reject anything that could escape the repository root (traversal
-// or an absolute path). Returns "" when nothing qualifies.
+// or an absolute path) or carry a NUL byte. Returns "" when nothing qualifies.
 func extractPath(s string) string {
 	for _, f := range strings.Fields(s) {
 		f = strings.Trim(f, "`\"'")
 		if !strings.Contains(f, "/") {
 			continue
 		}
+		// A NUL byte survives both Fields (it is not whitespace) and
+		// path.Clean; reject it here so it never reaches the allowlist or the
+		// API, where its percent-encoding is left to the URL machinery.
+		if strings.Contains(f, "\x00") {
+			continue
+		}
+		// The "//" form is a protocol-relative URL, rejected for clarity:
+		// after Clean it would also trip the absolute-path check below.
 		if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") ||
 			strings.HasPrefix(f, "//") {
 			continue
@@ -292,11 +300,15 @@ func extractPath(s string) string {
 // allowed root. Both sides are cleaned and the prefix test carries a trailing
 // slash so "deploy/foo" never slips past an allowlist entry that names a
 // different root like "deploy-other/". A wildcard ('.'), an escape, or an
-// absolute root never authorises a write: that would make the whole repo (or
-// outside of it) writable, which is exactly what the allowlist is for.
+// absolute root, or a NUL-bearing path never authorises a write: that would
+// make the whole repo (or outside of it) writable, which is exactly what the
+// allowlist is for.
 func pathAllowed(p string, allow []string) bool {
 	p = path.Clean(p)
-	if p == "." || strings.HasPrefix(p, "../") || p == ".." || strings.HasPrefix(p, "/") {
+	// path.Clean preserves a NUL byte, so it is checked here rather than
+	// trusted to the downstream API to reject.
+	if strings.Contains(p, "\x00") ||
+		p == "." || strings.HasPrefix(p, "../") || p == ".." || strings.HasPrefix(p, "/") {
 		return false
 	}
 	for _, a := range allow {
@@ -305,7 +317,7 @@ func pathAllowed(p string, allow []string) bool {
 			continue
 		}
 		a = path.Clean(a)
-		if a == "." || a == ".." || strings.HasPrefix(a, "/") {
+		if strings.Contains(a, "\x00") || a == "." || a == ".." || strings.HasPrefix(a, "/") {
 			continue
 		}
 		if a == p {
@@ -640,7 +652,11 @@ func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string,
 }
 
 // getFile returns the decoded contents and the blob SHA of a file on a branch.
-// The blob SHA is the precondition for the subsequent Contents PUT.
+// The blob SHA is the precondition for the subsequent Contents PUT. It
+// requires the Contents API to report type "file": a symlink's content is the
+// target *path*, not the target's file, and a PUT at that path does not land
+// where the allowlist says — so symlinks, submodules and anything else fail
+// closed at the read, before any write.
 func (g *gitHubClient) getFile(ctx context.Context, branch, file string) (content, sha string, err error) {
 	u := g.apiURL + "/repos/" + g.repo + "/contents/" + url.PathEscape(file) + "?ref=" + url.QueryEscape(branch)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -661,12 +677,16 @@ func (g *gitHubClient) getFile(ctx context.Context, branch, file string) (conten
 		return "", "", fmt.Errorf("github get file: %s: %s", resp.Status, string(body))
 	}
 	var out struct {
+		Type     string `json:"type"`
 		Content  string `json:"content"`
 		SHA      string `json:"sha"`
 		Encoding string `json:"encoding"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", "", err
+	}
+	if out.Type != "file" {
+		return "", "", fmt.Errorf("github get file: %s on %s is not a regular file (type %q)", file, branch, out.Type)
 	}
 	if out.Encoding != "base64" {
 		return "", "", fmt.Errorf("github get file: unexpected encoding %q", out.Encoding)

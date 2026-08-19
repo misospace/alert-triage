@@ -29,6 +29,9 @@ func TestPathAllowedDirectAndNested(t *testing.T) {
 		{"README.md", false},
 		{"../escape.yaml", false},
 		{"/abs/path.yaml", false},
+		{"deploy/web\x00.yaml", false},
+		{"deploy/\x00web.yaml", false},
+		{"\x00deploy/web.yaml", false},
 	}
 	for _, c := range cases {
 		if got := pathAllowed(c.path, allow); got != c.want {
@@ -49,6 +52,9 @@ func TestPathAllowedWildcardIsNotWritable(t *testing.T) {
 	if allowlistIsWildcard([]string{"deploy/"}) {
 		t.Errorf("a plain allowlist must not be flagged as a wildcard")
 	}
+	if pathAllowed("deploy/web.yaml", []string{"deploy/\x00"}) {
+		t.Errorf("a NUL-bearing allowlist root must not authorise a path")
+	}
 	for _, allow := range [][]string{{"."}, {"deploy/", "."}, {"deploy/", "a/.."}, {"."}} {
 		if !allowlistIsWildcard(allow) {
 			t.Errorf("allowlist %v should be flagged as a wildcard", allow)
@@ -68,6 +74,9 @@ func TestExtractPath(t *testing.T) {
 		{"see http://example.com/a.yaml", ""},
 		{"../escape.yaml is bad", ""},
 		{"/etc/passwd style", ""},
+		{"fix deploy/web\x00.yaml", ""},
+		{"fix \x00deploy/web.yaml", ""},
+		{"fix deploy/\x00web.yaml", ""},
 	}
 	for _, c := range cases {
 		if got := extractPath(c.in); got != c.want {
@@ -378,6 +387,7 @@ func (f *fakeGH) handle(w http.ResponseWriter, r *http.Request) {
 			"content":  base64.StdEncoding.EncodeToString([]byte(patchableManifest)),
 			"sha":      "blobsha123",
 			"encoding": "base64",
+			"type":     "file",
 		})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
 		if f.existing != nil {
@@ -628,6 +638,7 @@ func TestDeliverPullSkipsWhenProposeRefuses(t *testing.T) {
 				"content":  base64.StdEncoding.EncodeToString([]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n")),
 				"sha":      "blobsha1",
 				"encoding": "base64",
+				"type":     "file",
 			})
 			return
 		}
@@ -733,6 +744,46 @@ func TestFindOpenPRPaginatesPastFirstPage(t *testing.T) {
 	}
 }
 
+func TestGetFileRejectsNonFileTypes(t *testing.T) {
+	// The Contents API reports "symlink" for symlinks (with content holding
+	// the target *path*, not the target's file), "dir" and "submodule" for
+	// other non-regular entries. Only type "file" is a patch target; anything
+	// else — including a missing type — must fail closed at the read.
+	cases := []struct {
+		name   string
+		typ    string
+		wantOK bool
+	}{
+		{"file", "file", true},
+		{"symlink", "symlink", false},
+		{"dir", "dir", false},
+		{"submodule", "submodule", false},
+		{"missing", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"content":  base64.StdEncoding.EncodeToString([]byte("hello\n")),
+					"sha":      "sha1",
+					"encoding": "base64",
+					"type":     c.typ,
+				})
+			}))
+			t.Cleanup(srv.Close)
+			gh := &gitHubClient{token: "t", repo: "o/r", hc: &http.Client{}, apiURL: srv.URL}
+			got, _, err := gh.getFile(context.Background(), "main", "deploy/web.yaml")
+			if c.wantOK {
+				if err != nil || got != "hello\n" {
+					t.Fatalf("type %q: got (%q, %v), want (hello, nil)", c.typ, got, err)
+				}
+			} else if err == nil {
+				t.Fatalf("type %q must fail closed, got content %q", c.typ, got)
+			}
+		})
+	}
+}
+
 // --- idempotent recovery against partial writes ---
 
 // fakeRepoServer is a stateful fake of the few GitHub endpoints the PR arm
@@ -743,6 +794,7 @@ func TestFindOpenPRPaginatesPastFirstPage(t *testing.T) {
 type branchState struct {
 	content string
 	sha     string
+	typ     string // Contents API type; "file" unless a test says otherwise
 }
 
 type fakeRepoServer struct {
@@ -750,6 +802,7 @@ type fakeRepoServer struct {
 	defaultHead   string
 	defaultFile   string
 	defaultSha    string
+	defaultTyp    string
 	defaultBranch string
 	branches      map[string]branchState // topic branch name → file state
 	failCreatePR  bool
@@ -766,6 +819,7 @@ func newFakeRepo(t *testing.T, defaultFile string) *fakeRepoServer {
 		defaultHead:   "headsha123",
 		defaultFile:   defaultFile,
 		defaultSha:    "defaultblob123",
+		defaultTyp:    "file",
 		defaultBranch: "main",
 		branches:      map[string]branchState{},
 		nextBlob:      1,
@@ -803,22 +857,23 @@ func (f *fakeRepoServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
 		ref := r.URL.Query().Get("ref")
-		var content, sha string
+		var content, sha, typ string
 		switch {
 		case ref == f.defaultBranch || ref == f.defaultHead:
-			content, sha = f.defaultFile, f.defaultSha
+			content, sha, typ = f.defaultFile, f.defaultSha, f.defaultTyp
 		default:
 			b, ok := f.branches[ref]
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			content, sha = b.content, b.sha
+			content, sha, typ = b.content, b.sha, b.typ
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
 			"sha":      sha,
 			"encoding": "base64",
+			"type":     typ,
 		})
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
 		_ = json.NewEncoder(w).Encode([]ghPR{})
@@ -831,8 +886,9 @@ func (f *fakeRepoServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// A new branch is cut at the default HEAD, so it carries the default
-		// file and blob SHA — exactly what GitHub returns for a fresh ref.
-		f.branches[branch] = branchState{content: f.defaultFile, sha: f.defaultSha}
+		// file, blob SHA and type — exactly what GitHub returns for a fresh
+		// ref.
+		f.branches[branch] = branchState{content: f.defaultFile, sha: f.defaultSha, typ: f.defaultTyp}
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
 		var payload map[string]string
@@ -856,7 +912,7 @@ func (f *fakeRepoServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		newSHA := fmt.Sprintf("blob%d", f.nextBlob)
 		f.nextBlob++
-		f.branches[payload["branch"]] = branchState{content: string(raw), sha: newSHA}
+		f.branches[payload["branch"]] = branchState{content: string(raw), sha: newSHA, typ: b.typ}
 		f.putCount++
 		f.lastPutSha = payload["sha"]
 		w.WriteHeader(http.StatusOK)
@@ -939,7 +995,7 @@ func TestDeliverPullAdoptsBranchMissingOnlyPR(t *testing.T) {
 	r := triageReport()
 	branch := "alert-triage/" + branchSlug(r.Group.Signature())
 	f.mu.Lock()
-	f.branches[branch] = branchState{content: patchableManifest, sha: "defaultblob123"}
+	f.branches[branch] = branchState{content: patchableManifest, sha: "defaultblob123", typ: "file"}
 	f.mu.Unlock()
 
 	act, err := deliverPull(context.Background(), gh, prCfg(), r)
@@ -976,7 +1032,7 @@ func TestDeliverPullFailsClosedOnUnexpectedBranchContent(t *testing.T) {
 	branch := "alert-triage/" + branchSlug(r.Group.Signature())
 	unexpected := "kind: Deployment\nmetadata:\n  name: someone-else\n"
 	f.mu.Lock()
-	f.branches[branch] = branchState{content: unexpected, sha: "weirdsha"}
+	f.branches[branch] = branchState{content: unexpected, sha: "weirdsha", typ: "file"}
 	f.mu.Unlock()
 
 	if _, err := deliverPull(context.Background(), gh, prCfg(), r); err == nil {
@@ -992,5 +1048,34 @@ func TestDeliverPullFailsClosedOnUnexpectedBranchContent(t *testing.T) {
 	}
 	if f.branchContent(branch) != unexpected {
 		t.Errorf("unexpected branch content was modified:\n%s", f.branchContent(branch))
+	}
+}
+
+func TestDeliverPullRefusesSymlinkTarget(t *testing.T) {
+	// The allowlisted path on the default branch is a symlink: the Contents
+	// API reports type "symlink" with content = the target path, not the
+	// target's file. Treating that as a regular file would patch the wrong
+	// thing. The write arm must fail closed on the read — before any branch
+	// creation, file PUT, or PR.
+	f := newFakeRepo(t, patchableManifest)
+	f.mu.Lock()
+	f.defaultTyp = "symlink"
+	f.mu.Unlock()
+	gh := f.client()
+
+	if _, err := deliverPull(context.Background(), gh, prCfg(), triageReport()); err == nil {
+		t.Fatalf("expected an error when the target path is a symlink")
+	}
+	if f.putCount != 0 {
+		t.Errorf("a symlink target must not be written, got %d PUTs", f.putCount)
+	}
+	if f.prCount != 0 {
+		t.Errorf("a symlink target must not open a PR, got %d", f.prCount)
+	}
+	f.mu.Lock()
+	n := len(f.branches)
+	f.mu.Unlock()
+	if n != 0 {
+		t.Errorf("a symlink target must not create a branch, got %d", n)
 	}
 }
