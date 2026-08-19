@@ -132,10 +132,20 @@ func shouldComment(existing *ghIssue, r Report, interval time.Duration) bool {
 	if interval <= 0 {
 		interval = 12 * time.Hour
 	}
-	// Severity change always warrants a note.
-	want := severityLabel(r.Group.Severity())
-	for _, l := range existing.Labels {
-		if l.Name == want {
+	// Severity change always warrants a note. Only judge a change when the
+	// issue actually carries labels: labelsFor stamps one severity label on
+	// creation, so a missing current-severity label means the severity moved.
+	if want := severityLabel(r.Group.Severity()); want != "" && len(existing.Labels) > 0 {
+		changed := true
+		for _, l := range existing.Labels {
+			if l.Name == want {
+				// The issue already carries the current severity: no change,
+				// so fall through to the interval gate below.
+				changed = false
+				break
+			}
+		}
+		if changed {
 			return true
 		}
 	}

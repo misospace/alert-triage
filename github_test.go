@@ -28,9 +28,11 @@ func TestNewGitHubUnset(t *testing.T) {
 func TestShouldCommentInterval(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name string
-		iss  *ghIssue
-		want bool
+		name   string
+		iss    *ghIssue
+		labels []ghLabel
+		sev    string
+		want   bool
 	}{
 		{
 			name: "fresh open, no recent comment, no severity match",
@@ -47,10 +49,46 @@ func TestShouldCommentInterval(t *testing.T) {
 			iss:  &ghIssue{CreatedAt: now.Add(-2 * 24 * time.Hour), UpdatedAt: now.Add(-13 * time.Hour), Comments: 2},
 			want: true,
 		},
+		// Severity-change gate: the issue already carries the current
+		// severity label, so unchanged re-fires obey the interval gate.
+		{
+			name:   "unchanged severity within interval is suppressed",
+			iss:    &ghIssue{CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Minute), Comments: 1},
+			labels: []ghLabel{{Name: "alert-triage"}, {Name: "warning"}},
+			sev:    "warning",
+			want:   false,
+		},
+		{
+			name:   "unchanged severity after interval passes",
+			iss:    &ghIssue{CreatedAt: now.Add(-2 * 24 * time.Hour), UpdatedAt: now.Add(-13 * time.Hour), Comments: 2},
+			labels: []ghLabel{{Name: "alert-triage"}, {Name: "warning"}},
+			sev:    "warning",
+			want:   true,
+		},
+		// Severity moved (issue still labelled warning, group now critical):
+		// always warrants a note, even inside the interval.
+		{
+			name:   "escalated severity within interval passes",
+			iss:    &ghIssue{CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Minute), Comments: 1},
+			labels: []ghLabel{{Name: "alert-triage"}, {Name: "warning"}},
+			sev:    "critical",
+			want:   true,
+		},
+		{
+			name:   "escalated severity after interval passes",
+			iss:    &ghIssue{CreatedAt: now.Add(-2 * 24 * time.Hour), UpdatedAt: now.Add(-13 * time.Hour), Comments: 2},
+			labels: []ghLabel{{Name: "alert-triage"}, {Name: "warning"}},
+			sev:    "critical",
+			want:   true,
+		},
 	}
 	r := Report{Group: Group{Key: "KubeJobFailed"}}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			if c.sev != "" {
+				r.Group.Alerts = []Alert{{Labels: map[string]string{"severity": c.sev}}}
+			}
+			c.iss.Labels = c.labels
 			if got := shouldComment(c.iss, r, 12*time.Hour); got != c.want {
 				t.Fatalf("want %v got %v", c.want, got)
 			}
