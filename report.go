@@ -545,6 +545,22 @@ func Deliver(cfg *Config, r Report) error {
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("discord: %s", resp.Status)
 	}
+
+	// PR write arm (issue #36). Runs only after the digest has shipped: the
+	// digest is the primary, time-critical output, so an opt-in GitHub write
+	// (many sequential API calls) must not sit on its critical path or delay
+	// the next digest in the sequential delivery loop. A failure here — a
+	// revoked token, a timeout, a 4xx/5xx — is logged and degrades to
+	// proposal-only; the error is swallowed so it can never fail a delivery
+	// that already succeeded.
+	if cfg.GitHubPR != nil && cfg.GitHubPR.OptIn && gh != nil && prEligible(r.Triage) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if _, err := deliverPull(ctx, gh, cfg.GitHubPR, r); err != nil {
+			logf("github-pr: %v", err)
+		}
+		cancel()
+	}
+
 	// Stamp the gauge only on a fully successful delivery; a 5xx from the
 	// channel must not roll the freshness clock forward.
 	metrics.markFlushed()

@@ -75,6 +75,11 @@ type Config struct {
 	GitHubRepo  string
 	GitHubToken string
 
+	// GitHubPR holds the opt-in gate for the PR write arm (issue #36). It is
+	// nil unless GITHUB_PR_OPT_IN is set with a token, repo and path
+	// allowlist; see loadPRConfig. A nil value keeps the pre-#36 behaviour.
+	GitHubPR *PRConfig
+
 	// GrafanaURL is the base URL of a Grafana instance. When set, digests
 	// gain an Explore link for the alerting expression and (if GrafanaLogsDS
 	// is also set) a logs Explore link scoped to the same window. Unset keeps
@@ -120,6 +125,7 @@ func loadConfig() Config {
 		GitOpsPath:           os.Getenv("GITOPS_PATH"),
 		GitHubRepo:           os.Getenv("GITHUB_REPO"),
 		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
+		GitHubPR:             loadPRConfig(),
 		IssueCommentInterval: envDuration("ISSUE_COMMENT_INTERVAL", 12*time.Hour),
 		GrafanaURL:           envGrafanaURL("GRAFANA_URL"),
 		GrafanaMetricsDS:     os.Getenv("GRAFANA_METRICS_DS"),
