@@ -258,7 +258,7 @@ func main() {
 	if cfg.MetricsURL != "" {
 		prom = &Prometheus{
 			url: cfg.MetricsURL,
-			hc:  http.DefaultClient,
+			hc:  &http.Client{Timeout: 15 * time.Second},
 		}
 		log.Printf("metrics backend configured at %s", cfg.MetricsURL)
 	}
@@ -282,7 +282,7 @@ func main() {
 	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
 	mux.HandleFunc("/metrics", metricsHandler())
 
-	go runFlushLoop(&cfg, buf, k, hist, seen, prom)
+	go runFlushLoop(context.Background(), &cfg, buf, k, hist, seen, prom)
 	go runCompactLoop(hist)
 
 	srv := &http.Server{
@@ -317,7 +317,7 @@ func main() {
 			buf.alerts = nil
 			buf.seen = nil
 			buf.mu.Unlock()
-			process(&cfg, alerts, k, hist, seen, prom)
+			process(ctx, &cfg, alerts, k, hist, seen, prom)
 			drained += len(alerts)
 		}
 		log.Printf("shutdown: flushed %d buffered alert(s)", drained)
@@ -417,7 +417,7 @@ func authorized(token string, r *http.Request) bool {
 
 var warnUnauthenticated sync.Once
 
-func runFlushLoop(cfg *Config, buf *buffer, k *kube, hist *History, seen *recent, prom *Prometheus) {
+func runFlushLoop(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *History, seen *recent, prom *Prometheus) {
 	// Poll well inside the flush delay so the window is honoured rather than
 	// rounded up to the tick.
 	interval := cfg.FlushDelay / 4
@@ -429,12 +429,17 @@ func runFlushLoop(cfg *Config, buf *buffer, k *kube, hist *History, seen *recent
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		alerts := buf.take(time.Now(), cfg.FlushDelay, cfg.MaxWindow)
 		if len(alerts) == 0 {
 			continue
 		}
-		process(cfg, alerts, k, hist, seen, prom)
+		process(ctx, cfg, alerts, k, hist, seen, prom)
 	}
 }
 
@@ -448,7 +453,7 @@ func runCompactLoop(hist *History) {
 	}
 }
 
-func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
+func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
 	nodeOf := k.ResolveNodes(alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack, cfg.Cluster)
 	// Count groups once per flush; if the count stays at zero while alerts
@@ -475,9 +480,9 @@ func process(cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, 
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
 	for i, g := range groups {
-		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(g, cfg.EvidenceWindow, cfg)}
+		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetrics(g, cfg.EvidenceWindow)
+			r.Metrics = prom.EnrichMetrics(ctx, g, cfg.EvidenceWindow)
 		}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		reports[i] = r

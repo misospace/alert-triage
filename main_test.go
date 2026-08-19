@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -468,7 +469,7 @@ func TestShutdownDrainFlushesBuffer(t *testing.T) {
 		buf.alerts = nil
 		buf.seen = nil
 		buf.mu.Unlock()
-		process(&cfg, alerts, nil, hist, &seen, nil)
+		process(context.Background(), &cfg, alerts, nil, hist, &seen, nil)
 		drained += len(alerts)
 	}
 

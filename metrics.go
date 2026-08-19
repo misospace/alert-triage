@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,12 @@ import (
 // Prometheus queries a Prometheus-compatible metrics backend.
 // The HTTP API is a de-facto standard shared by Prometheus, VictoriaMetrics,
 // Thanos, Mimir and promxy — a single METRICS_URL covers all of them.
+//
+// The HTTP client is supplied by the caller and must carry a Timeout: a stalled
+// backend that accepts the TCP connection but never responds must not be
+// allowed to block the flush loop or the shutdown drain. All request methods
+// take a context so cancellation propagates from the flush loop, from the
+// SIGTERM drain, and from the client's own timeout.
 type Prometheus struct {
 	url string
 	hc  *http.Client
@@ -63,8 +70,8 @@ type queryResult struct {
 
 // fetchRules retrieves alerting rules and returns a map of alert name to
 // PromQL expression. Only rules of type "alert" are included.
-func (p *Prometheus) fetchRules() (map[string]string, error) {
-	data, err := p.get("/api/v1/rules")
+func (p *Prometheus) fetchRules(ctx context.Context) (map[string]string, error) {
+	data, err := p.get(ctx, "/api/v1/rules")
 	if err != nil {
 		return nil, err
 	}
@@ -91,14 +98,14 @@ func (p *Prometheus) fetchRules() (map[string]string, error) {
 
 // queryRange evaluates a PromQL expression over a time range and returns
 // compact summaries for each series in the result.
-func (p *Prometheus) queryRange(expr string, start, end time.Time, step time.Duration) ([]metricSummary, error) {
+func (p *Prometheus) queryRange(ctx context.Context, expr string, start, end time.Time, step time.Duration) ([]metricSummary, error) {
 	values := url.Values{}
 	values.Set("query", expr)
 	values.Set("start", strconv.FormatFloat(float64(start.Unix()), 'f', -1, 64))
 	values.Set("end", strconv.FormatFloat(float64(end.Unix()), 'f', -1, 64))
 	values.Set("step", fmt.Sprintf("%ds", int(step.Seconds())))
 
-	data, err := p.get("/api/v1/query_range?" + values.Encode())
+	data, err := p.get(ctx, "/api/v1/query_range?"+values.Encode())
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +213,11 @@ func (s *metricSummary) render() string {
 // alerts. Returns compact one-liner summaries. Nil is returned when no metrics
 // backend is configured; a non-nil slice with error lines distinguishes an
 // unreachable backend from "not configured".
-func (p *Prometheus) EnrichMetrics(g Group, window time.Duration) []string {
+//
+// The supplied context is propagated to every underlying request so a stalled
+// backend cannot outlive the caller's deadline (the flush loop's tick or the
+// SIGTERM drain's 30s budget).
+func (p *Prometheus) EnrichMetrics(ctx context.Context, g Group, window time.Duration) []string {
 	if !p.isConfigured() {
 		return nil
 	}
@@ -222,7 +233,7 @@ func (p *Prometheus) EnrichMetrics(g Group, window time.Duration) []string {
 	}
 
 	// Fetch rules to find expressions for our alerts.
-	rules, err := p.fetchRules()
+	rules, err := p.fetchRules(ctx)
 	if err != nil {
 		lines = append(lines, fmt.Sprintf("metrics backend error: %v", err))
 		return lines
@@ -252,7 +263,7 @@ func (p *Prometheus) EnrichMetrics(g Group, window time.Duration) []string {
 			continue
 		}
 
-		summaries, err := p.queryRange(expr, start, now, step)
+		summaries, err := p.queryRange(ctx, expr, start, now, step)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("query error for %s: %v", name, err))
 			continue
@@ -272,7 +283,7 @@ func (p *Prometheus) EnrichMetrics(g Group, window time.Duration) []string {
 	ns := g.Label("namespace")
 	pod := g.Label("pod")
 	if ns != "" {
-		contextMetrics := p.queryContextMetrics(ns, pod, start, now, step)
+		contextMetrics := p.queryContextMetrics(ctx, ns, pod, start, now, step)
 		lines = append(lines, contextMetrics...)
 	}
 
@@ -282,7 +293,7 @@ func (p *Prometheus) EnrichMetrics(g Group, window time.Duration) []string {
 // queryContextMetrics queries a fixed set of operational metrics for the given
 // namespace and optional pod: container restarts, memory working set vs limit,
 // CPU throttling ratio.
-func (p *Prometheus) queryContextMetrics(ns, pod string, start, end time.Time, step time.Duration) []string {
+func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, start, end time.Time, step time.Duration) []string {
 	var lines []string
 
 	labelFilter := fmt.Sprintf(`namespace="%s"`, escapeLabelValue(ns))
@@ -302,7 +313,7 @@ func (p *Prometheus) queryContextMetrics(ns, pod string, start, end time.Time, s
 	}
 
 	for _, q := range queries {
-		summaries, err := p.queryRange(q.expr, start, end, step)
+		summaries, err := p.queryRange(ctx, q.expr, start, end, step)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("%s: query error: %v", q.name, err))
 			continue
@@ -325,8 +336,8 @@ func escapeLabelValue(v string) string {
 	return strings.ReplaceAll(v, `"`, `\"`)
 }
 
-func (p *Prometheus) get(path string) ([]byte, error) {
-	req, err := http.NewRequest("GET", p.url+path, nil)
+func (p *Prometheus) get(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", p.url+path, nil)
 	if err != nil {
 		return nil, err
 	}

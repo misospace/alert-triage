@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,12 @@ const defaultLogLimit = 50
 // logsBackend is an optional, stdlib-only client for a VictoriaLogs or Loki
 // HTTP endpoint. The URL is the base URL; the backend-specific query path is
 // appended by endpoint.
+//
+// The HTTP client is supplied by the caller and must carry a Timeout: a stalled
+// backend that accepts the TCP connection but never responds must not be
+// allowed to block the flush loop or the shutdown drain. All request methods
+// take a context so cancellation propagates from the flush loop, from the
+// SIGTERM drain, and from the client's own timeout.
 type logsBackend struct {
 	url    string
 	base   string
@@ -89,8 +96,8 @@ func (b *logsBackend) endpoint() (string, error) {
 // fetchBackendLogs keeps the original, convenient method for callers while
 // recording backend errors in the service log. Enrich uses the result variant
 // below so a configured-but-empty backend is distinguishable from an outage.
-func (b *logsBackend) fetchBackendLogs(g Group, window time.Duration) []string {
-	lines, err := b.fetchBackendLogsResult(g, window)
+func (b *logsBackend) fetchBackendLogs(ctx context.Context, g Group, window time.Duration) []string {
+	lines, err := b.fetchBackendLogsResult(ctx, g, window)
 	if err != nil {
 		logf("enrich: backend logs: %v", err)
 		return lines
@@ -104,7 +111,7 @@ type backendLog struct {
 	count   int
 }
 
-func (b *logsBackend) fetchBackendLogsResult(g Group, window time.Duration) ([]string, error) {
+func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, window time.Duration) ([]string, error) {
 	if b == nil {
 		return nil, nil
 	}
@@ -149,7 +156,7 @@ func (b *logsBackend) fetchBackendLogsResult(g Group, window time.Duration) ([]s
 				continue
 			}
 			seenQueries[queryKey] = struct{}{}
-			records, err := b.query(namespace, pod, start, now)
+			records, err := b.query(ctx, namespace, pod, start, now)
 			if err != nil {
 				return nil, err
 			}
@@ -175,7 +182,7 @@ func (b *logsBackend) fetchBackendLogsResult(g Group, window time.Duration) ([]s
 	return collapseAndCap(seen, order, b.limit), nil
 }
 
-func (b *logsBackend) query(namespace, pod string, start, end time.Time) ([]backendLog, error) {
+func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, end time.Time) ([]backendLog, error) {
 	endpoint, err := b.endpoint()
 	if err != nil {
 		return nil, err
@@ -191,13 +198,16 @@ func (b *logsBackend) query(namespace, pod string, start, end time.Time) ([]back
 	if b.limit > 0 {
 		params.Set("limit", strconv.Itoa(b.limit))
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint+"?"+params.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
 	client := b.hc
 	if client == nil {
-		client = http.DefaultClient
+		// Defensive default: never reach the network through http.DefaultClient,
+		// which has no timeout. Callers in main() inject a 15s client; this
+		// fallback only fires in unit tests that don't wire one up.
+		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
