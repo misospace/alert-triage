@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -174,7 +175,7 @@ func TestPrometheusFetchRules(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	rules, err := p.fetchRules()
+	rules, err := p.fetchRules(context.Background())
 	if err != nil {
 		t.Fatalf("fetchRules error: %v", err)
 	}
@@ -219,7 +220,7 @@ func TestPrometheusQueryRange(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	summaries, err := p.queryRange("up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
+	summaries, err := p.queryRange(context.Background(), "up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
 	if err != nil {
 		t.Fatalf("queryRange error: %v", err)
 	}
@@ -238,7 +239,7 @@ func TestPrometheusQueryRange(t *testing.T) {
 func TestPrometheusEnrichMetricsNoConfig(t *testing.T) {
 	var p *Prometheus
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}}
-	result := p.EnrichMetrics(g, 1*time.Hour)
+	result := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 	if result != nil {
 		t.Errorf("expected nil for unconfigured Prometheus, got %v", result)
 	}
@@ -287,7 +288,7 @@ func TestPrometheusEnrichMetricsWithBackend(t *testing.T) {
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}}}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	if len(lines) == 0 {
 		t.Fatal("expected at least one metric line")
@@ -315,7 +316,7 @@ func TestPrometheusEnrichMetricsNoRuleMatch(t *testing.T) {
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "UnknownAlert"}}}}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line for missing rule, got %d", len(lines))
@@ -333,7 +334,7 @@ func TestPrometheusEnrichMetricsBackendError(t *testing.T) {
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	if len(lines) == 0 {
 		t.Fatal("expected error line for backend failure")
@@ -424,7 +425,7 @@ func TestQueryRangeNoData(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	summaries, err := p.queryRange("up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
+	summaries, err := p.queryRange(context.Background(), "up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
 	if err != nil {
 		t.Fatalf("queryRange error: %v", err)
 	}
@@ -471,7 +472,7 @@ func TestEnrichMetricsWithNamespaceContext(t *testing.T) {
 	g := Group{Alerts: []Alert{
 		{Labels: map[string]string{"alertname": "HighMemory", "namespace": "default", "pod": "web-1"}},
 	}}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	// Should have queried rules + context metrics (3 queries).
 	if callCount < 4 {
@@ -496,7 +497,7 @@ func TestEnrichMetricsDistinguishesNoConfigFromNoData(t *testing.T) {
 	// Unconfigured returns nil.
 	var p *Prometheus
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "Test"}}}}
-	if got := p.EnrichMetrics(g, 1*time.Hour); got != nil {
+	if got := p.EnrichMetrics(context.Background(), g, 1*time.Hour); got != nil {
 		t.Errorf("unconfigured Prometheus should return nil, got %v", got)
 	}
 
@@ -511,7 +512,7 @@ func TestEnrichMetricsDistinguishesNoConfigFromNoData(t *testing.T) {
 	defer srv.Close()
 
 	p = &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 	if lines == nil {
 		t.Fatal("configured Prometheus with no data should return non-nil")
 	}
@@ -543,7 +544,7 @@ func TestQueryRangeHandlesNaNInf(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	summaries, err := p.queryRange("test", time.Unix(1000, 0), time.Unix(1030, 0), 10*time.Second)
+	summaries, err := p.queryRange(context.Background(), "test", time.Unix(1000, 0), time.Unix(1030, 0), 10*time.Second)
 	if err != nil {
 		t.Fatalf("queryRange error: %v", err)
 	}
@@ -598,7 +599,7 @@ func TestEnrichMetricsMultipleAlertNames(t *testing.T) {
 		{Labels: map[string]string{"alertname": "HighMemory"}},
 		{Labels: map[string]string{"alertname": "HighCPU"}},
 	}}
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	if len(lines) < 2 {
 		t.Errorf("expected at least 2 lines for 2 alert names, got %d: %v", len(lines), lines)
@@ -633,43 +634,43 @@ func TestEnrichMetricsStepCalculation(t *testing.T) {
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}}
 
 	// Very small window should clamp step to 15s.
-	p.EnrichMetrics(g, 30*time.Second)
+	p.EnrichMetrics(context.Background(), g, 30*time.Second)
 	if capturedStep != "15s" {
 		t.Errorf("step for 30s window = %q, want 15s", capturedStep)
 	}
 
 	// Very large window should clamp step to 300s (5 min cap).
-	p.EnrichMetrics(g, 24*time.Hour)
+	p.EnrichMetrics(context.Background(), g, 24*time.Hour)
 	if capturedStep != "300s" {
 		t.Errorf("step for 24h window = %q, want 300s", capturedStep)
 	}
 
 	// 1h window: step = 360s, which exceeds 5min cap → clamped to 300s.
-	p.EnrichMetrics(g, 1*time.Hour)
+	p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 	if capturedStep != "300s" {
 		t.Errorf("step for 1h window = %q, want 300s", capturedStep)
 	}
 
 	// 2min window: step = 12s, clamped to 15s.
-	p.EnrichMetrics(g, 2*time.Minute)
+	p.EnrichMetrics(context.Background(), g, 2*time.Minute)
 	if capturedStep != "15s" {
 		t.Errorf("step for 2m window = %q, want 15s", capturedStep)
 	}
 
 	// 10min window: step = 60s, within bounds.
-	p.EnrichMetrics(g, 10*time.Minute)
+	p.EnrichMetrics(context.Background(), g, 10*time.Minute)
 	if capturedStep != "60s" {
 		t.Errorf("step for 10m window = %q, want 60s", capturedStep)
 	}
 
 	// 6min window: step = 36s, within bounds.
-	p.EnrichMetrics(g, 6*time.Minute)
+	p.EnrichMetrics(context.Background(), g, 6*time.Minute)
 	if capturedStep != "36s" {
 		t.Errorf("step for 6m window = %q, want 36s", capturedStep)
 	}
 
 	// 3min window: step = 18s, within bounds.
-	p.EnrichMetrics(g, 3*time.Minute)
+	p.EnrichMetrics(context.Background(), g, 3*time.Minute)
 	if capturedStep != "18s" {
 		t.Errorf("step for 3m window = %q, want 18s", capturedStep)
 	}
@@ -681,7 +682,7 @@ func TestEnrichMetricsFailOpen(t *testing.T) {
 	p := &Prometheus{url: "http://localhost:59999", hc: &http.Client{Timeout: 100 * time.Millisecond}}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}}
 
-	lines := p.EnrichMetrics(g, 1*time.Hour)
+	lines := p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 	if len(lines) == 0 {
 		t.Fatal("expected error lines for unreachable backend")
 	}
@@ -722,7 +723,7 @@ func TestEnrichMetricsDeduplicatesAlertNames(t *testing.T) {
 		{Labels: map[string]string{"alertname": "HighMemory", "instance": "b"}},
 		{Labels: map[string]string{"alertname": "HighMemory", "instance": "c"}},
 	}}
-	p.EnrichMetrics(g, 1*time.Hour)
+	p.EnrichMetrics(context.Background(), g, 1*time.Hour)
 
 	if queryCount != 1 {
 		t.Errorf("expected 1 query_range for deduplicated alert name, got %d", queryCount)
@@ -779,7 +780,7 @@ func TestPrometheusGetHTTPError(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	_, err := p.get("/api/v1/rules")
+	_, err := p.get(context.Background(), "/api/v1/rules")
 	if err == nil {
 		t.Fatal("expected error for 404 response")
 	}
@@ -796,7 +797,7 @@ func TestPrometheusParseError(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	_, err := p.fetchRules()
+	_, err := p.fetchRules(context.Background())
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -809,7 +810,7 @@ func TestQueryRangeParseError(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	_, err := p.queryRange("up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
+	_, err := p.queryRange(context.Background(), "up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -823,7 +824,7 @@ func TestQueryRangeNonSuccessStatus(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	_, err := p.queryRange("up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
+	_, err := p.queryRange(context.Background(), "up", time.Unix(1000, 0), time.Unix(1020, 0), 10*time.Second)
 	if err == nil {
 		t.Fatal("expected error for non-success status")
 	}
@@ -837,7 +838,7 @@ func TestRulesNonSuccessStatus(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	_, err := p.fetchRules()
+	_, err := p.fetchRules(context.Background())
 	if err == nil {
 		t.Fatal("expected error for non-success status")
 	}

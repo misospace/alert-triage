@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -252,7 +253,7 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
-func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
+func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *Config) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
@@ -378,7 +379,7 @@ func (k *kube) Enrich(g Group, window time.Duration, cfg *Config) Enrichment {
 	e.PodLogs = k.fetchPodLogs(e.UnhealthyPods)
 	if k.logs != nil {
 		var err error
-		e.BackendLogs, err = k.logs.fetchBackendLogsResult(g, window)
+		e.BackendLogs, err = k.logs.fetchBackendLogsResult(ctx, g, window)
 		if err != nil {
 			e.BackendState = "error"
 			logf("enrich: backend logs: %v", err)
