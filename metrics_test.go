@@ -845,6 +845,9 @@ func TestRulesNonSuccessStatus(t *testing.T) {
 	}
 }
 
+// TestPrometheusGetCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #65: the flush-loop goroutine must not buffer a
+// Prometheus response larger than the configured cap.
 func TestPrometheusGetCapsOverSizeResponse(t *testing.T) {
 	// Server streams a body larger than metricsBodyCap. get must fail rather
 	// than buffering the whole thing, matching the logs backend's behaviour.
