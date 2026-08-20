@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -841,5 +842,50 @@ func TestRulesNonSuccessStatus(t *testing.T) {
 	_, err := p.fetchRules(context.Background())
 	if err == nil {
 		t.Fatal("expected error for non-success status")
+	}
+}
+
+func TestPrometheusGetCapsOverSizeResponse(t *testing.T) {
+	// Server streams a body larger than metricsBodyCap. get must fail rather
+	// than buffering the whole thing, matching the logs backend's behaviour.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "")
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("a"), 64<<10)
+		for i := 0; i < 256; i++ { // 16 MiB total, well over the 4 MiB cap
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	body, err := p.get(context.Background(), "/api/v1/rules")
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if body != nil {
+		t.Errorf("expected nil body on over-cap error, got %d bytes", len(body))
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}
+
+func TestPrometheusGetReadsNormalResponse(t *testing.T) {
+	// Sanity-check that a sub-cap body still decodes as before the cap landed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"success","data":{"groups":[]}}`)
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	body, err := p.get(context.Background(), "/api/v1/rules")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(string(body), `"status":"success"`) {
+		t.Errorf("body = %q, want JSON success envelope", string(body))
 	}
 }
