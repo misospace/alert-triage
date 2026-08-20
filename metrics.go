@@ -336,6 +336,13 @@ func escapeLabelValue(v string) string {
 	return strings.ReplaceAll(v, `"`, `\"`)
 }
 
+// metricsBodyCap bounds how much of a Prometheus response we'll buffer before
+// failing the request. It mirrors the limit the logs backend applies (4 MiB)
+// so the two enrichment paths are consistent. A misconfigured backend that
+// streams a runaway /api/v1/rules or /api/v1/query_range reply otherwise
+// forces the whole body into memory on the flush-loop goroutine.
+const metricsBodyCap = 4 << 20
+
 func (p *Prometheus) get(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", p.url+path, nil)
 	if err != nil {
@@ -349,5 +356,16 @@ func (p *Prometheus) get(ctx context.Context, path string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, path)
 	}
-	return io.ReadAll(resp.Body)
+	// Read cap+1 bytes so an over-cap response is unambiguously detectable:
+	// io.LimitReader silently truncates, but a body whose payload exceeds
+	// metricsBodyCap will yield cap+1 bytes here and we surface that as an
+	// error instead of allocating unboundedly or returning a truncated reply.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, metricsBodyCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > metricsBodyCap {
+		return nil, fmt.Errorf("metrics: response from %s exceeded %d bytes", path, metricsBodyCap)
+	}
+	return body, nil
 }
