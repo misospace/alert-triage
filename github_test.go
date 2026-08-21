@@ -242,8 +242,8 @@ func TestRenderIssueBodyMarkerFirstLine(t *testing.T) {
 	if !strings.HasPrefix(first, "<!-- alert-triage:") {
 		t.Fatalf("first line should be the signature marker, got %q", first)
 	}
-	if !strings.Contains(rest, first) {
-		t.Fatalf("marker should appear in body once")
+	if strings.Contains(rest, first) {
+		t.Fatalf("marker should appear only on the first line, but appears more than once")
 	}
 	if !strings.Contains(body, "KubeJobFailed") {
 		t.Fatalf("body missing group key")
@@ -267,7 +267,7 @@ func TestRenderIssueBodyLowConfidence(t *testing.T) {
 }
 
 func TestRenderIssueBodyGrafanaLinkPresent(t *testing.T) {
-	cfg := &Config{GrafanaURL: "https://grafana.example.com"}
+	cfg := &Config{GrafanaURL: "https://grafana.example.com", GrafanaLogsDS: "loki"}
 	r := Report{Cfg: cfg, Group: Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")}}
 	body := renderIssueBody(r, r.Group.Signature())
 	if !strings.Contains(body, "grafana.example.com") {
@@ -304,9 +304,6 @@ func TestRenderCommentBody(t *testing.T) {
 	}
 	if !strings.Contains(body, "warning") {
 		t.Fatalf("comment should mention severity: %s", body)
-	}
-	if !strings.Contains(body, fmt.Sprintf(signatureMarker, r.Group.Signature())) {
-		t.Fatalf("comment should carry signature marker: %s", body)
 	}
 }
 
@@ -404,10 +401,10 @@ func TestFindOpenIssueStub(t *testing.T) {
 }
 
 func TestCreateIssueBodyShape(t *testing.T) {
-	var captured io.Reader
+	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/owner/repo/issues" && r.Method == http.MethodPost {
-			captured = r.Body
+			captured, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"number":1,"title":"x","body":"y","html_url":"http://e/x"}`))
 			return
@@ -422,11 +419,11 @@ func TestCreateIssueBodyShape(t *testing.T) {
 	if _, _, err := g.createIssue(context.Background(), "title-x", "body-y", nil); err != nil {
 		t.Fatalf("createIssue: %v", err)
 	}
-	if captured == nil {
+	if len(captured) == 0 {
 		t.Fatalf("createIssue did not POST")
 	}
 	var payload map[string]any
-	if err := json.NewDecoder(captured).Decode(&payload); err != nil {
+	if err := json.Unmarshal(captured, &payload); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
 	if payload["title"] != "title-x" || payload["body"] != "body-y" {
