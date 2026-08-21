@@ -277,16 +277,16 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/recent", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/recent", requireAuth(cfg.WebhookToken, "recent", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(seen.snapshot()); err != nil {
 			logf("recent: encode: %v", err)
 		}
-	})
+	}))
 	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
-	mux.HandleFunc("/metrics", metricsHandler())
+	mux.HandleFunc("/metrics", requireAuth(cfg.WebhookToken, "metrics", metricsHandler()))
 
 	go runFlushLoop(context.Background(), &cfg, buf, k, hist, seen, prom)
 	go runCompactLoop(hist)
@@ -419,6 +419,20 @@ func authorized(token string, r *http.Request) bool {
 	}
 	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	return subtle.ConstantTimeCompare([]byte(bearer), []byte(token)) == 1
+}
+
+// requireAuth guards a read endpoint (e.g. /recent, /metrics) with the same
+// token check as /webhook. When the token is unset it fails open, matching the
+// webhook's documented behaviour, so a fresh deployment does not break.
+func requireAuth(token, name string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(token, r) {
+			logf("%s: rejected request without a valid token", name)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 var warnUnauthenticated sync.Once

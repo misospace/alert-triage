@@ -325,6 +325,46 @@ func TestWebhookResolvedSkipsLabelCounter(t *testing.T) {
 	}
 }
 
+// The read endpoints (/recent, /metrics) must be gated by the same token as
+// /webhook: 401 without it, 200 with it, and fail-open when no token is
+// configured so a fresh deployment does not break.
+func TestRequireAuth(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	tests := []struct {
+		name   string
+		token  string
+		bearer string
+		header string
+		want   int
+	}{
+		{name: "no token configured fails open", token: "", want: http.StatusOK},
+		{name: "missing token rejected", token: "secret", want: http.StatusUnauthorized},
+		{name: "wrong token rejected", token: "secret", bearer: "wrong", want: http.StatusUnauthorized},
+		{name: "bearer token accepted", token: "secret", bearer: "secret", want: http.StatusOK},
+		{name: "X-Webhook-Token header accepted", token: "secret", header: "secret", want: http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/recent", nil)
+			if tt.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tt.bearer)
+			}
+			if tt.header != "" {
+				req.Header.Set("X-Webhook-Token", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			requireAuth(tt.token, "recent", inner)(rec, req)
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, want %d", rec.Code, tt.want)
+			}
+		})
+	}
+}
+
 // Concurrent deliveries must each contribute to the cumulative counter
 // without losing updates. atomic.Int64 is what keeps this safe.
 func TestWebhookDroppedCounterConcurrent(t *testing.T) {
