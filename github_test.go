@@ -287,9 +287,9 @@ func TestRenderIssueBodyGrafanaLinkAbsent(t *testing.T) {
 func TestRenderIssueBodyPayloadDetails(t *testing.T) {
 	cfg := &Config{}
 	r := Report{
-		Cfg:    cfg,
-		Group:  Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")},
-		Raw:    `{"alerts":[]}`,
+		Cfg:   cfg,
+		Group: Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")},
+		Raw:   `{"alerts":[]}`,
 	}
 	body := renderIssueBody(r, r.Group.Signature())
 	if !strings.Contains(body, "<details>") {
