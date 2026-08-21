@@ -84,6 +84,13 @@ func TestShouldCommentInterval(t *testing.T) {
 			sev:    "critical",
 			want:   true,
 		},
+		{
+			name:   "escalated severity after interval passes",
+			iss:    &ghIssue{CreatedAt: now.Add(-2 * 24 * time.Hour), UpdatedAt: now.Add(-13 * time.Hour), Comments: 2},
+			labels: []ghLabel{{Name: "alert-triage"}, {Name: "warning"}},
+			sev:    "critical",
+			want:   true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
