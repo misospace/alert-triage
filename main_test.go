@@ -335,11 +335,11 @@ func TestRequireAuth(t *testing.T) {
 	})
 
 	tests := []struct {
-		name    string
-		token   string
-		bearer  string
-		header  string
-		want    int
+		name   string
+		token  string
+		bearer string
+		header string
+		want   int
 	}{
 		{name: "no token configured fails open", token: "", want: http.StatusOK},
 		{name: "missing token rejected", token: "secret", want: http.StatusUnauthorized},
