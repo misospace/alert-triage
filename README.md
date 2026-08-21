@@ -152,9 +152,15 @@ Read-only, cluster-wide: `pods` and `events` in `""`, `helmreleases` in
 ## Endpoints
 
 - `POST /webhook` — Alertmanager receiver
-- `GET /healthz` — liveness
+- `GET /healthz` — liveness (unauthenticated, for probes)
 - `GET /recent` — the last 20 delivered digests as JSON, including the evidence
   the model was given and the narrative it wrote
+- `GET /metrics` — Prometheus counters for deliveries, narration, and alerts
+
+`/recent` and `/metrics` require the same `WEBHOOK_TOKEN` as `/webhook`
+(`Authorization: Bearer <token>` or `X-Webhook-Token: <token>`); they return
+401 without it. When `WEBHOOK_TOKEN` is unset they fail open, matching the
+webhook.
 
 ## Reviewing what it said
 
@@ -163,7 +169,8 @@ in a chat client. Two ways to get at them without one:
 
 ```sh
 kubectl port-forward -n observability svc/alert-triage 8080:8080
-curl -s localhost:8080/recent | jq '.[] | {key, title, narrative}'
+TOKEN=$(kubectl -n observability get secret alert-triage -o jsonpath='{.data.WEBHOOK_TOKEN}' | base64 -d)
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/recent | jq '.[] | {key, title, narrative}'
 ```
 
 Each digest is also logged as a single line (`digest <key> [severity] <title> |
