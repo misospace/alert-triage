@@ -530,6 +530,17 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// During shutdown the drain context carries the pod's termination
+			// deadline. Once it is spent, stop issuing narrate calls: the
+			// digest still ships with its evidence, but a model call would only
+			// push the drain past the grace period and get cut off by SIGKILL.
+			// The skip is logged and counted so silent narration loss stays
+			// visible.
+			if err := ctx.Err(); err != nil {
+				logf("narrate %s: skipped, shutdown deadline reached: %v", reports[i].Group.Key, err)
+				metrics.observeNarration(true)
+				return
+			}
 			metrics.observeModelCall()
 			reports[i].Triage = Narrate(cfg, reports[i])
 			// A non-actionable triage without a narrative means the model
