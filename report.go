@@ -138,6 +138,13 @@ type message struct {
 	Content string `json:"content"`
 }
 
+type anthropicReq struct {
+	Model     string             `json:"model"`
+	Messages  []message          `json:"messages"`
+	System    string             `json:"system"`
+	MaxTokens int                `json:"max_tokens"`
+}
+
 type chatResp struct {
 	Choices []struct {
 		Message struct {
@@ -147,6 +154,13 @@ type chatResp struct {
 	} `json:"choices"`
 }
 
+type anthropicResp struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
 // Narrate asks the model for a story and a judgement about where a fix belongs.
 // A failure here is not fatal: the digest still ships with its evidence, just
 // without the summary.
@@ -154,26 +168,48 @@ func Narrate(cfg *Config, r Report) Triage {
 	if cfg.LiteLLMURL == "" {
 		return Triage{}
 	}
-	body, err := json.Marshal(chatReq{
-		Model: cfg.Model,
-		Messages: []message{
-			{Role: "system", Content: narratePrompt},
-			{Role: "user", Content: renderEvidence(r)},
-		},
-	})
+	var body []byte
+	var err error
+	if strings.EqualFold(cfg.APIFormat, "anthropic") {
+		body, err = json.Marshal(anthropicReq{
+			Model: cfg.Model,
+			Messages: []message{
+				{Role: "user", Content: renderEvidence(r)},
+			},
+			System:    narratePrompt,
+			MaxTokens: 2048,
+		})
+	} else {
+		body, err = json.Marshal(chatReq{
+			Model: cfg.Model,
+			Messages: []message{
+				{Role: "system", Content: narratePrompt},
+				{Role: "user", Content: renderEvidence(r)},
+			},
+		})
+	}
 	if err != nil {
 		logf("narrate: marshal: %v", err)
 		return Triage{}
 	}
 
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+"/chat/completions", bytes.NewReader(body))
+	path := "/chat/completions"
+	if strings.EqualFold(cfg.APIFormat, "anthropic") {
+		path = "/messages"
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		logf("narrate: request: %v", err)
 		return Triage{}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.LiteLLMKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.LiteLLMKey)
+		if strings.EqualFold(cfg.APIFormat, "anthropic") {
+			req.Header.Set("x-api-key", cfg.LiteLLMKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+cfg.LiteLLMKey)
+		}
 	}
 
 	hc := &http.Client{Timeout: cfg.NarrateTimeout}
@@ -186,6 +222,20 @@ func Narrate(cfg *Config, r Report) Triage {
 	if resp.StatusCode != http.StatusOK {
 		logf("narrate: %s", resp.Status)
 		return Triage{}
+	}
+	if strings.EqualFold(cfg.APIFormat, "anthropic") {
+		var out anthropicResp
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			logf("narrate: decode: %v", err)
+			return Triage{}
+		}
+		var text strings.Builder
+		for _, block := range out.Content {
+			if block.Type == "text" {
+				text.WriteString(block.Text)
+			}
+		}
+		return parseTriage(text.String())
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
