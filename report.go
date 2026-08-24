@@ -139,10 +139,10 @@ type message struct {
 }
 
 type anthropicReq struct {
-	Model     string             `json:"model"`
-	Messages  []message          `json:"messages"`
-	System    string             `json:"system"`
-	MaxTokens int                `json:"max_tokens"`
+	Model     string    `json:"model"`
+	Messages  []message `json:"messages"`
+	System    string    `json:"system"`
+	MaxTokens int       `json:"max_tokens"`
 }
 
 type chatResp struct {
@@ -229,13 +229,25 @@ func Narrate(cfg *Config, r Report) Triage {
 			logf("narrate: decode: %v", err)
 			return Triage{}
 		}
+		// Some reasoning models put the answer in thinking and leave text
+		// empty; others do the opposite. Try text first, fall back to
+		// thinking (or any other non-empty block) when text is blank.
 		var text strings.Builder
 		for _, block := range out.Content {
 			if block.Type == "text" {
 				text.WriteString(block.Text)
 			}
 		}
-		return parseTriage(text.String())
+		if trimmed := strings.TrimSpace(text.String()); trimmed != "" {
+			return parseTriage(trimmed)
+		}
+		var fallback strings.Builder
+		for _, block := range out.Content {
+			if block.Type != "text" && block.Text != "" {
+				fallback.WriteString(block.Text)
+			}
+		}
+		return parseTriage(fallback.String())
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
