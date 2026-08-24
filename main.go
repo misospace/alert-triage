@@ -27,6 +27,7 @@ type Config struct {
 	LiteLLMURL     string
 	LiteLLMKey     string
 	Model          string
+	APIFormat      string
 	DiscordURL     string
 	HistoryPath    string
 	FlushDelay     time.Duration
@@ -110,6 +111,7 @@ func loadConfig() Config {
 		LiteLLMURL:           envDefault("LITELLM_URL", ""),
 		LiteLLMKey:           os.Getenv("LITELLM_API_KEY"),
 		Model:                envDefault("MODEL", "dsv4f"),
+		APIFormat:            envDefault("API_FORMAT", "openai"),
 		DiscordURL:           os.Getenv("DISCORD_WEBHOOK_URL"),
 		HistoryPath:          envDefault("HISTORY_PATH", "/data/history.jsonl"),
 		FlushDelay:           envDuration("FLUSH_DELAY", 3*time.Minute),
