@@ -58,17 +58,20 @@ func newLogsBackend() *logsBackend {
 	}
 
 	base := strings.TrimRight(rawURL, "/")
-	backend := &logsBackend{
+	logs := &logsBackend{
 		url:    base,
 		base:   base,
 		flavor: flavor,
 		limit:  limit,
 	}
-	if _, err := backend.endpoint(); err != nil {
+	// The constructor owns the HTTP client: a 15s timeout so a stalled backend
+	// can never block the flush loop or the shutdown drain.
+	logs.hc = &http.Client{Timeout: 15 * time.Second}
+	if _, err := logs.endpoint(); err != nil {
 		logf("enrich: invalid LOGS_URL: %v", err)
 		return nil
 	}
-	return backend
+	return logs
 }
 
 func (b *logsBackend) endpoint() (string, error) {
@@ -205,8 +208,8 @@ func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, e
 	client := b.hc
 	if client == nil {
 		// Defensive default: never reach the network through http.DefaultClient,
-		// which has no timeout. Callers in main() inject a 15s client; this
-		// fallback only fires in unit tests that don't wire one up.
+		// which has no timeout. newLogsBackend always sets hc; this fallback
+		// only fires for backends built directly in unit tests.
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	resp, err := client.Do(req)
