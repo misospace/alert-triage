@@ -221,8 +221,8 @@ func narrateCfg(url, apiFormat, model string) *Config {
 	return &Config{
 		LiteLLMURL: url,
 		LiteLLMKey: "test-key",
-		Model:     model,
-		APIFormat: apiFormat,
+		Model:      model,
+		APIFormat:  apiFormat,
 	}
 }
 

@@ -316,10 +316,13 @@ func TestResolveRepoPathsFluxKustomization(t *testing.T) {
 	}
 }
 
-// TestResolveRepoPathsFluxHelmRelease exercises the fluxHelmPath branch —
-// the pod has a kustomize.toolkit.fluxcd.io/name annotation but not the
-// matching namespace annotation, so fluxPath should fall through.
-func TestResolveRepoPathsFluxHelmRelease(t *testing.T) {
+// TestResolveRepoPathsFluxPath exercises the fluxPath branch via
+// resolveRepoPaths: the pod carries both the kustomize.toolkit.fluxcd.io/name
+// and the kustomize.toolkit.fluxcd.io/namespace annotations, so resolveRepoPaths
+// routes the lookup through k.fluxPath(annotation-ns, kustomization-name) and
+// resolves the repo+path from the Kustomization + GitRepository pair. The
+// fluxHelmPath guard test below covers the fluxHelmPath branch.
+func TestResolveRepoPathsFluxPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
