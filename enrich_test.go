@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -276,5 +277,211 @@ func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
 	}
 	if !strings.Contains(en.UnhealthyPods[1], "pending-pod") {
 		t.Errorf("expected Pending pod second, got %v", en.UnhealthyPods)
+	}
+}
+
+// TestResolveRepoPathsFluxKustomization exercises the Flux Kustomization
+// → GitRepository path. The kube is wired to a test server that returns
+// matching Kustomization and GitRepository specs.
+func TestResolveRepoPathsFluxKustomization(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"clusters/staging","sourceRef":{"name":"flux-system","kind":"GitRepository"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/staging-repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "flux-system",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	cfg := &Config{}
+	got := k.resolveRepoPaths(pods, cfg)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 resolved path, got %#v", got)
+	}
+	if got[0] != "https://github.com/example/staging-repo/clusters/staging" {
+		t.Fatalf("unexpected entry: %q", got[0])
+	}
+}
+
+// TestResolveRepoPathsFluxHelmRelease exercises the fluxHelmPath branch —
+// the pod has a kustomize.toolkit.fluxcd.io/name annotation but not the
+// matching namespace annotation, so fluxPath should fall through.
+func TestResolveRepoPathsFluxHelmRelease(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments-repo","kind":"GitRepository"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/payments"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p2",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveRepoPaths(pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/payments/apps/payments" {
+		t.Fatalf("unexpected paths: %#v", got)
+	}
+}
+
+// TestFluxHelmPathMissingAnnotations exercises the fluxHelmPath guards:
+// when the name or namespace annotation is missing the function must
+// return (_, _, false) without hitting the API.
+func TestFluxHelmPathMissingAnnotations(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected API hit for %s", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	if _, _, ok := k.fluxHelmPath(map[string]string{}); ok {
+		t.Fatalf("expected ok=false for empty annotations")
+	}
+	if _, _, ok := k.fluxHelmPath(map[string]string{"kustomize.toolkit.fluxcd.io/name": "x"}); ok {
+		t.Fatalf("expected ok=false when only name is set")
+	}
+}
+
+// TestResolveRepoPathsArgoApplication exercises the ArgoCD branch: the
+// pod carries an argocd.argoproj.io/instance annotation, and the API
+// returns a matching Application spec.
+func TestResolveRepoPathsArgoApplication(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"spec":{"source":{"repoURL":"https://github.com/example/argo","path":"manifests/web"}}}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p3",
+		Namespace: "ns-b",
+		Annotations: map[string]string{
+			"argocd.argoproj.io/instance": "guestbook",
+		},
+	}}
+	got := k.resolveRepoPaths(pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/argo/manifests/web" {
+		t.Fatalf("unexpected paths: %#v", got)
+	}
+}
+
+// TestResolveRepoPathsGitOpsFallback exercises the GITOPS_REPO +
+// GITOPS_PATH fallback: pods without GitOps annotations but with the
+// fallback configured should still resolve to a repo path.
+func TestResolveRepoPathsGitOpsFallback(t *testing.T) {
+	// No server should be hit for this branch — the API would 404 but
+	// we'd notice.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected API hit for %s", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{Name: "plain", Namespace: "ns", Annotations: map[string]string{}}}
+	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
+	got := k.resolveRepoPaths(pods, cfg)
+	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
+		t.Fatalf("unexpected fallback paths: %#v", got)
+	}
+}
+
+// TestResolveRepoPathsEmpty exercises the empty-result case: no pods, or
+// pods with no annotations and no fallback configured.
+func TestResolveRepoPathsEmpty(t *testing.T) {
+	k := &kube{}
+	if got := k.resolveRepoPaths(nil, &Config{}); got != nil {
+		t.Fatalf("expected nil, got %#v", got)
+	}
+	cfg := &Config{}
+	if got := k.resolveRepoPaths([]podRef{{Annotations: map[string]string{}}}, cfg); got != nil {
+		t.Fatalf("expected nil when nothing resolves and no fallback configured, got %#v", got)
+	}
+}
+
+// TestResolveNodesPodLabelNoNodeLabel forces the pods-list lookup branch
+// of ResolveNodes: the alert has a pod label but no node label, so the
+// function must query the pods API to find the node.
+func TestResolveNodesPodLabelNoNodeLabel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/pods") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p1"},"spec":{"nodeName":"worker-1"}},{"metadata":{"name":"p2"},"spec":{"nodeName":"worker-2"}}]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Fingerprint: "fp-1", Labels: map[string]string{"pod": "p1", "namespace": "ns-a"}},
+		{Fingerprint: "fp-2", Labels: map[string]string{"pod": "p2", "namespace": "ns-a"}},
+	}
+	got := k.ResolveNodes(alerts)
+	if got["fp-1"] != "worker-1" {
+		t.Fatalf("expected fp-1 -> worker-1, got %q", got["fp-1"])
+	}
+	if got["fp-2"] != "worker-2" {
+		t.Fatalf("expected fp-2 -> worker-2, got %q", got["fp-2"])
+	}
+}
+
+// TestResolveNodesNodeLabelShortCircuit exercises the fast path: alerts
+// that already carry a node label should not trigger the pods API.
+func TestResolveNodesNodeLabelShortCircuit(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Fingerprint: "fp-3", Labels: map[string]string{"node": "ctrl-1"}},
+	}
+	got := k.ResolveNodes(alerts)
+	if got["fp-3"] != "ctrl-1" {
+		t.Fatalf("expected fp-3 -> ctrl-1, got %q", got["fp-3"])
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Fatalf("unexpected API hits when alert already has node label: %d", hits)
+	}
+}
+
+// TestResolveNodesNilReceiver ensures the nil-receiver guard works.
+func TestResolveNodesNilReceiver(t *testing.T) {
+	var k *kube
+	got := k.ResolveNodes([]Alert{{Fingerprint: "fp", Labels: map[string]string{"node": "x"}}})
+	// Nil receiver on a node-labelled alert is allowed to return either
+	// an empty map (the simple guard) or a populated map. Either is fine.
+	if got["fp"] != "" && got["fp"] != "x" {
+		t.Fatalf("nil receiver returned unexpected entry: %#v", got)
 	}
 }

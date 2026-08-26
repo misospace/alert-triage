@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -287,5 +289,105 @@ func TestQueryLokiStatusError(t *testing.T) {
 	}
 	if _, err := b.query(context.Background(), "ns-a", "", time.Now().Add(-time.Minute), time.Now()); err == nil {
 		t.Fatalf("expected error for non-success loki status")
+	}
+}
+
+// TestFetchBackendLogsDedup verifies the per-(namespace,pod) query dedup:
+// N alerts sharing the same pod in the same namespace must result in only
+// two backend hits (one namespace-only + one pod-specific), not N+1.
+func TestFetchBackendLogsDedup(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"result":[]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "alertname": "x"}},
+			{Labels: map[string]string{"pod": "p1", "alertname": "y"}},
+			{Labels: map[string]string{"pod": "p1", "alertname": "z"}},
+		},
+	}
+	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute); err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected exactly 2 queries (namespace + pod) after dedup, got %d", got)
+	}
+}
+
+// TestFetchBackendLogsEmptyNamespace verifies the short-circuit when the
+// group has no namespaces — the backend should not be hit at all.
+func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"result":[]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "x"}}}}
+	lines, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute)
+	if err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if lines != nil {
+		t.Fatalf("expected nil lines for empty namespace, got %v", lines)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("expected zero backend hits for empty-namespace short-circuit, got %d", got)
+	}
+}
+
+// TestFetchBackendLogsNilReceiver ensures the nil-receiver guard works.
+func TestFetchBackendLogsNilReceiver(t *testing.T) {
+	var b *logsBackend
+	lines, err := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute)
+	if err != nil {
+		t.Fatalf("nil receiver should be a no-op, got err=%v", err)
+	}
+	if lines != nil {
+		t.Fatalf("nil receiver should return nil lines, got %v", lines)
+	}
+}
+
+// TestFetchBackendLogsConvenienceWrapper verifies the wrapper logs the
+// error and returns whatever lines the result variant produced.
+func TestFetchBackendLogsConvenienceWrapper(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	t.Cleanup(srv.Close)
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{Namespaces: []string{"ns"}}
+	lines := b.fetchBackendLogs(context.Background(), g, time.Minute)
+	if lines != nil {
+		t.Fatalf("expected nil lines on backend JSON error, got %v", lines)
 	}
 }
