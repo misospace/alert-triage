@@ -154,10 +154,13 @@ func (m *triageMetrics) writePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "alert_triage_scrape_timestamp_seconds %d\n", now)
 }
 
-// metricsHandler serves /metrics in Prometheus text format. It deliberately
-// has no auth: scrapers do not carry secrets, and a hard requirement on one
-// would mean a misconfigured ServiceMonitor looks identical to a quiet week,
-// which is exactly the failure mode this endpoint exists to prevent.
+// metricsHandler serves /metrics in Prometheus text format. It is wrapped in
+// requireAuth in main.go, the same wrapper guarding /recent: when
+// WEBHOOK_TOKEN is set the endpoint enforces it (bearer token or
+// X-Webhook-Token), and when it is unset the check fails open, matching the
+// rest of the webhook surface. So a ServiceMonitor must carry the token as a
+// bearer secret whenever WEBHOOK_TOKEN is configured; only an unauthenticated
+// deployment accepts scrapes without one.
 func metricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
