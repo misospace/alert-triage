@@ -488,3 +488,95 @@ func TestResolveNodesNilReceiver(t *testing.T) {
 		t.Fatalf("nil receiver returned unexpected entry: %#v", got)
 	}
 }
+
+// TestFluxHelmPathSuccess exercises the success branch of fluxHelmPath
+// (and, transitively, resolveRepoPaths): when both Flux annotations are
+// present, the function must drive both the Kustomization and the
+// GitRepository lookups and return (url, path, true).
+func TestFluxHelmPathSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomize.toolkit.fluxcd.io/"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"clusters/prod","sourceRef":{"name":"podinfo","kind":"GitRepository"}}}`)
+		case strings.Contains(r.URL.Path, "/source.toolkit.fluxcd.io/"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/flux-helm"}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	ann := map[string]string{
+		"kustomize.toolkit.fluxcd.io/name":      "podinfo",
+		"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+	}
+	repo, path, ok := k.fluxHelmPath(ann)
+	if !ok {
+		t.Fatalf("expected ok=true, got false")
+	}
+	if repo != "https://github.com/example/flux-helm" || path != "clusters/prod" {
+		t.Fatalf("unexpected (repo, path): (%q, %q)", repo, path)
+	}
+	// And via the public resolveRepoPaths entry point.
+	pods := []podRef{{Name: "p1", Namespace: "ns-a", Annotations: ann}}
+	got := k.resolveRepoPaths(pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/flux-helm/clusters/prod" {
+		t.Fatalf("unexpected resolveRepoPaths output: %#v", got)
+	}
+}
+
+// TestResolveRepoPathsEdgeCaseInputs exercises the elevated must-check
+// for edge-case inputs that could lead to path injection if a future
+// regression lets annotation values or GitOps config flow unchecked into
+// the kube URL builder. Each case asserts the call does not panic; the
+// resulting path is logged so a future sanitisation PR is a real
+// behaviour change, not an accidental one.
+func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"spec":{"path":"clusters/staging","sourceRef":{"name":"podinfo","kind":"GitRepository"}}}`)
+	}))
+	defer srv.Close()
+
+	cases := []struct {
+		name string
+		ann  map[string]string
+	}{
+		{"dotdot", map[string]string{"kustomize.toolkit.fluxcd.io/name": "podinfo", "kustomize.toolkit.fluxcd.io/namespace": "../../etc"}},
+		{"nullbyte", map[string]string{"kustomize.toolkit.fluxcd.io/name": "podinfo\x00evil", "kustomize.toolkit.fluxcd.io/namespace": "flux-system"}},
+		{"absnamespace", map[string]string{"kustomize.toolkit.fluxcd.io/name": "podinfo", "kustomize.toolkit.fluxcd.io/namespace": "/etc/passwd"}},
+		{"percentencoded", map[string]string{"kustomize.toolkit.fluxcd.io/name": "podinfo%2F..%2F..", "kustomize.toolkit.fluxcd.io/namespace": "flux-system"}},
+		{"backslash", map[string]string{"kustomize.toolkit.fluxcd.io/name": "podinfo\\..\\..", "kustomize.toolkit.fluxcd.io/namespace": "flux-system"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("resolveRepoPaths panicked on %s: %v", tc.name, r)
+				}
+			}()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			pods := []podRef{{Name: "p", Namespace: "ns", Annotations: tc.ann}}
+			got := k.resolveRepoPaths(pods, &Config{})
+			t.Logf("%s -> %#v", tc.name, got)
+		})
+	}
+
+	t.Run("gitops_fallback_traversal", func(t *testing.T) {
+		// GITOPS_PATH with `..` segments is a common misconfiguration;
+		// ensure the fallback does not panic and either rejects or
+		// returns the value verbatim.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("resolveRepoPaths panicked on traversal fallback: %v", r)
+			}
+		}()
+		k := &kube{}
+		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "../../etc/secrets"}
+		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		t.Logf("fallback -> %#v", got)
+	})
+}

@@ -314,20 +314,7 @@ func main() {
 		// Drain any alerts still sitting in the buffer. The flush loop is no
 		// longer running (the process is about to exit), so we call process
 		// directly for every remaining batch.
-		drained := 0
-		for {
-			buf.mu.Lock()
-			if len(buf.alerts) == 0 {
-				buf.mu.Unlock()
-				break
-			}
-			alerts := buf.alerts
-			buf.alerts = nil
-			buf.seen = nil
-			buf.mu.Unlock()
-			process(ctx, &cfg, alerts, k, hist, seen, prom)
-			drained += len(alerts)
-		}
+		drained := drainBuffer(ctx, &cfg, buf, k, hist, seen, prom)
 		log.Printf("shutdown: flushed %d buffered alert(s)", drained)
 		os.Exit(0)
 	}()
@@ -472,6 +459,26 @@ func runCompactLoop(hist *History) {
 		if err := hist.Compact(); err != nil {
 			logf("history: compact: %v", err)
 		}
+	}
+}
+
+// drainBuffer empties the buffer synchronously by calling process on
+// every remaining batch. It is the SIGTERM "flush before exit" path,
+// extracted into a helper so a test can assert process runs and the
+// buffer is empty on return without driving the full signal goroutine.
+func drainBuffer(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *History, seen *recent, prom *Prometheus) (drained int) {
+	for {
+		buf.mu.Lock()
+		if len(buf.alerts) == 0 {
+			buf.mu.Unlock()
+			return drained
+		}
+		alerts := buf.alerts
+		buf.alerts = nil
+		buf.seen = nil
+		buf.mu.Unlock()
+		process(ctx, cfg, alerts, k, hist, seen, prom)
+		drained += len(alerts)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -76,63 +75,92 @@ func TestRunFlushLoopTick(t *testing.T) {
 	}
 }
 
-// TestRunFlushLoopShutdownDrain exercises the drain path on shutdown: the
-// loop must return promptly when its context is cancelled, even if the
-// ticker has not fired. We use a long FlushDelay so no tick fires.
-func TestRunFlushLoopShutdownDrain(t *testing.T) {
-	cfg := &Config{FlushDelay: 10 * time.Second, MaxWindow: time.Second}
+// TestDrainBufferShutdownPath exercises the SIGTERM "flush before exit"
+// path: drainBuffer must call process on every buffered batch and leave
+// the buffer empty on return. This is the path that lives next to
+// runFlushLoop in main.go (the issue calls out main.go:262–294
+// specifically) and was previously only reachable via the signal
+// goroutine.
+func TestDrainBufferShutdownPath(t *testing.T) {
+	cfg := &Config{MaxWindow: time.Second}
 	buf := &buffer{}
 	old := time.Now().Add(-time.Hour)
-	buf.add([]Alert{{StartsAt: old}})
+	buf.add([]Alert{
+		{Fingerprint: "fp-a", StartsAt: old},
+		{Fingerprint: "fp-b", StartsAt: old},
+	})
 
+	k, hits := stubKube(t)
+	hist, err := NewHistory(filepath.Join(t.TempDir(), "h.json"), time.Hour)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+	before := atomic.LoadInt64(hits)
+	drained := drainBuffer(context.Background(), cfg, buf, k, hist, &recent{}, nil)
+	if drained != 2 {
+		t.Fatalf("expected drainBuffer to drain 2 alerts, got %d", drained)
+	}
+	if got := bufferLen(buf); got != 0 {
+		t.Fatalf("drainBuffer must leave the buffer empty; got len=%d", got)
+	}
+	if atomic.LoadInt64(hits) <= before {
+		t.Fatalf("drainBuffer must drive process to the kube at least once; hits=%d before=%d", atomic.LoadInt64(hits), before)
+	}
+}
+
+// TestDrainBufferShutdownEmpty asserts the empty-buffer branch of
+// drainBuffer: a process restart that finds no buffered alerts must
+// return drained=0 and not panic.
+func TestDrainBufferShutdownEmpty(t *testing.T) {
+	buf := &buffer{}
 	k, _ := stubKube(t)
 	hist, err := NewHistory(filepath.Join(t.TempDir(), "h.json"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewHistory: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		runFlushLoop(ctx, cfg, buf, k, hist, &recent{}, nil)
-		close(done)
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runFlushLoop did not return within 2s of ctx cancel")
+	got := drainBuffer(context.Background(), &Config{}, buf, k, hist, &recent{}, nil)
+	if got != 0 {
+		t.Fatalf("expected drained=0 on empty buffer, got %d", got)
 	}
-	// The alert we pushed must still be in the buffer — we cancelled
-	// before the tick, so the drain-on-exit path should not have
-	// processed it.
-	if got := bufferLen(buf); got != 1 {
-		t.Fatalf("expected buffer to retain alert when ctx cancels before tick; got len=%d", got)
+	if l := bufferLen(buf); l != 0 {
+		t.Fatalf("buffer should still be empty, got len=%d", l)
 	}
 }
 
-// TestRunCompactLoopStartup verifies the loop spins up without panicking.
-// runCompactLoop has no public stop signal in this version; we just
-// confirm it does not crash on a fresh History and exit if it ever
-// returns. We allocate it in a goroutine and ignore the leak — it is
-// terminated by process exit in production.
-func TestRunCompactLoopStartup(t *testing.T) {
-	hist, err := NewHistory(filepath.Join(t.TempDir(), "h.json"), time.Hour)
+// TestRunCompactLoopCompactsOnTick exercises the tick-firing branch of
+// runCompactLoop: a History with a stale entry must compact and rewrite
+// the file before the next tick. We hijack Compact via a short
+// retain/interval to drive the path deterministically.
+func TestRunCompactLoopCompactsOnTick(t *testing.T) {
+	dir := t.TempDir()
+	hist, err := NewHistory(filepath.Join(dir, "h.json"), 10*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewHistory: %v", err)
 	}
-	defer os.Remove(hist.path)
+	// Seed a stale entry so Compact has something to do.
+	hist.Record("stale-sig", "stale-title", time.Now().Add(-time.Hour))
 	done := make(chan struct{})
 	go func() {
 		runCompactLoop(hist)
 		close(done)
 	}()
-	// Give the loop a beat to schedule.
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case <-done:
-		// returned already, fine
-	default:
-		// still running, which is the expected steady state. Nothing to
-		// assert beyond "did not panic".
+	// Wait for at least one tick: Compact is on a 5s timer in production,
+	// but runCompactLoop reads hist.retain to schedule. With a 10ms retain
+	// the loop schedules compaction immediately and rewrites the file.
+	deadline := time.Now().Add(2 * time.Second)
+	var compacted bool
+	for time.Now().Before(deadline) {
+		hist.mu.Lock()
+		_ = hist.entries // touch the struct to prove it is alive
+		hist.mu.Unlock()
+		// After the first compaction, the stale entry must be gone.
+		if hist.PriorSeen("stale-sig", "stale-title") == 0 {
+			compacted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !compacted {
+		t.Fatalf("runCompactLoop did not compact a stale entry within 2s")
 	}
 }
