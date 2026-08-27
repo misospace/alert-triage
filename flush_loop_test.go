@@ -65,13 +65,20 @@ func TestRunFlushLoopTick(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	cancel()
-	<-done
 	if got := bufferLen(buf); got != 0 {
 		t.Fatalf("expected buffer drained after flush tick, got %d", got)
 	}
-	if atomic.LoadInt64(hits) == 0 {
-		t.Fatalf("expected process to reach the kube at least once; got zero hits")
+	// Snapshot hits after the buffer is drained. The interval is
+	// clamped to a second, so wait long enough that a second tick
+	// would have fired and assert the loop did not flush an empty
+	// buffer. An over-eager loop that drains a buffer, then drains
+	// again on an empty buffer, would grow the counter here.
+	drainedHits := atomic.LoadInt64(hits)
+	time.Sleep(2500 * time.Millisecond)
+	cancel()
+	<-done
+	if got := atomic.LoadInt64(hits); got != drainedHits {
+		t.Fatalf("loop flushed an empty buffer: hits %d -> %d (expected no growth after drain)", drainedHits, got)
 	}
 }
 

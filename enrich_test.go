@@ -614,13 +614,56 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("nullbyte fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_nullbyte", got)
+		if len(got) != 0 {
+			t.Fatalf("gitops_fallback_nullbyte: expected entry to be omitted when GitOpsPath contains NUL, got %#v", got)
+		}
+	})
+
+	t.Run("gitops_fallback_percentencoded", func(t *testing.T) {
+		// Percent-encoded traversal such as `%2F..%2F` is not collapsed
+		// by path.Clean and would be emitted verbatim. The sanitiser
+		// must drop the entry rather than render an unsafe URL.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("resolveRepoPaths panicked on percent-encoded fallback: %v", r)
+			}
+		}()
+		k := &kube{}
+		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "podinfo%2F..%2F.."}
+		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		t.Logf("percentencoded fallback -> %#v", got)
+		assertRepoURLsSafe(t, "gitops_fallback_percentencoded", got)
+		if len(got) != 0 {
+			t.Fatalf("gitops_fallback_percentencoded: expected entry to be omitted when GitOpsPath contains '%%', got %#v", got)
+		}
+	})
+
+	t.Run("gitops_fallback_backslash", func(t *testing.T) {
+		// Backslashes are Windows separators that path.Clean (a
+		// Unix-style package) leaves untouched. The sanitiser must
+		// drop the entry rather than emit a URL GitHub will 404.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("resolveRepoPaths panicked on backslash fallback: %v", r)
+			}
+		}()
+		k := &kube{}
+		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: `podinfo\..\..`}
+		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		t.Logf("backslash fallback -> %#v", got)
+		assertRepoURLsSafe(t, "gitops_fallback_backslash", got)
+		if len(got) != 0 {
+			t.Fatalf("gitops_fallback_backslash: expected entry to be omitted when GitOpsPath contains backslash, got %#v", got)
+		}
 	})
 }
 
-// assertRepoURLsSafe fails the test if any entry contains an unescaped
-// `..` traversal segment or a null byte. These are the two safety
+// assertRepoURLsSafe fails the test if any entry contains a null byte,
+// an unescaped `..` traversal segment, a percent-encoded traversal
+// segment (the literal substring `%2F` or `%2E` after percent-decoding
+// by a URL consumer), or a backslash separator. These are the safety
 // invariants the resolveRepoPaths sanitiser is responsible for: the
-// output is rendered as a clickable link in the digest, and either of
+// output is rendered as a clickable link in the digest, and any of
 // these would render a link the operator did not intend.
 func assertRepoURLsSafe(t *testing.T, name string, entries []string) {
 	t.Helper()
@@ -628,9 +671,22 @@ func assertRepoURLsSafe(t *testing.T, name string, entries []string) {
 		if strings.Contains(e, "\x00") {
 			t.Fatalf("%s: entry contains null byte: %q", name, e)
 		}
-		// Split on `/` and reject any segment that is `..`. We do not
-		// decode percent-encoding here; the contract is that resolveRepoPaths
-		// never emits an unescaped `..` segment in the first place.
+		if strings.Contains(e, `\`) {
+			t.Fatalf("%s: entry contains backslash separator: %q", name, e)
+		}
+		// Reject percent-encoded traversal segments such as `%2F..%2F`
+		// or `%2E%2E`. A consumer that decodes the URL before routing
+		// would see `..` segments after decoding, which the link the
+		// operator intended did not contain.
+		lower := strings.ToLower(e)
+		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") {
+			t.Fatalf("%s: entry contains percent-encoded traversal: %q", name, e)
+		}
+		// Split on `/` and reject any segment that is `..`. The path
+		// part of a GitHub URL is what path.Clean collapses against the
+		// leading-slash wrapper; any unescaped `..` surviving here
+		// means the sanitiser let an operator-controlled traversal
+		// slip through.
 		for _, seg := range strings.Split(e, "/") {
 			if seg == ".." {
 				t.Fatalf("%s: entry contains unescaped `..` segment: %q", name, e)

@@ -672,11 +672,33 @@ func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
 		// Defense in depth: the path component originates either from
 		// the apiserver response (Flux Kustomization / Argo Application
 		// spec) or from operator-controlled config (GitOpsRepo /
-		// GitOpsPath fallback). Collapse `..` traversal segments with
-		// path.Clean against a leading slash so they cannot escape the
-		// repo URL root, and reject null bytes outright so they cannot
-		// smuggle a second URL segment into a Discord clickable link.
-		if strings.Contains(path, "\x00") {
+		// GitOpsPath fallback). Three classes of input must be dropped
+		// outright before any sanitisation:
+		//
+		//   - NUL (\x00), which truncates a URL on some renderers and
+		//     would smuggle a second URL segment into a Discord
+		//     clickable link.
+		//   - `\` (backslash), which Go's path.Clean (a Unix-style
+		//     package) treats as text. A path like `podinfo\..\..`
+		//     would pass through path.Clean untouched and route to a
+		//     404, but the operator did not configure it either way.
+		//     GitHub URLs use forward slashes; backslashes in a path
+		//     can only be an error or an attack.
+		//   - `%` (percent), used for percent-encoded traversal such
+		//     as `%2F..%2F` that path.Clean does not decode and that
+		//     some URL consumers decode before routing. Legitimate
+		//     Flux / Argo paths are file paths, not URLs, and a `%`
+		//     can only have appeared as a percent-encoding attempt.
+		//
+		// After rejection, collapse `..` traversal with path.Clean
+		// against a leading slash so leading `..` segments collapse
+		// against the root rather than resolving relative to the
+		// caller's CWD. The leading-slash wrapper is load-bearing:
+		// path.Clean("/../../etc") returns "/etc" (the desired
+		// behaviour here) only because Clean treats leading `..` as
+		// relative to the root. Removing the wrapper would turn
+		// "../../etc" into "../../etc" unchanged. Do not simplify.
+		if strings.ContainsAny(path, "\x00\\%") {
 			return
 		}
 		if path != "" {
