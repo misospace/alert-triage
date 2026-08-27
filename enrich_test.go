@@ -531,12 +531,20 @@ func TestFluxHelmPathSuccess(t *testing.T) {
 // TestResolveRepoPathsEdgeCaseInputs exercises the elevated must-check
 // for edge-case inputs that could lead to path injection if a future
 // regression lets annotation values or GitOps config flow unchecked into
-// the kube URL builder. Each case asserts the call does not panic; the
-// resulting path is logged so a future sanitisation PR is a real
-// behaviour change, not an accidental one.
+// the kube URL builder. Each case asserts the call does not panic and
+// that the resulting entries do not smuggle a `..` traversal segment or
+// a null byte into the URL that becomes a clickable Discord link.
 func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Distinguish the Kustomization lookup from the GitRepository
+		// lookup so fluxPath receives both `spec.path` (from the
+		// Kustomization) and `spec.url` (from the GitRepository) — the
+		// only combination that makes fluxPath return (url, path, true).
+		if strings.Contains(r.URL.Path, "/gitrepositories/") {
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/flux-helm"}}`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"spec":{"path":"clusters/staging","sourceRef":{"name":"podinfo","kind":"GitRepository"}}}`)
 	}))
 	defer srv.Close()
@@ -562,13 +570,18 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 			pods := []podRef{{Name: "p", Namespace: "ns", Annotations: tc.ann}}
 			got := k.resolveRepoPaths(pods, &Config{})
 			t.Logf("%s -> %#v", tc.name, got)
+			assertRepoURLsSafe(t, tc.name, got)
 		})
 	}
 
 	t.Run("gitops_fallback_traversal", func(t *testing.T) {
-		// GITOPS_PATH with `..` segments is a common misconfiguration;
-		// ensure the fallback does not panic and either rejects or
-		// returns the value verbatim.
+		// GITOPS_PATH with `..` segments is a common misconfiguration.
+		// The fallback must not panic, and the produced URL must not
+		// contain an unescaped `..` segment — a clickable Discord link
+		// that resolved to a directory the operator did not configure
+		// would be a user-visible bug at 03:00. resolveRepoPaths
+		// sanitises with path.Clean, so `../../etc/secrets` collapses
+		// to `etc/secrets`.
 		defer func() {
 			if r := recover(); r != nil {
 				t.Fatalf("resolveRepoPaths panicked on traversal fallback: %v", r)
@@ -578,5 +591,50 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "../../etc/secrets"}
 		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("fallback -> %#v", got)
+		assertRepoURLsSafe(t, "gitops_fallback_traversal", got)
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one fallback entry, got %#v", got)
+		}
+		if got[0] != "https://github.com/example/fallback/etc/secrets" {
+			t.Fatalf("traversal segments not collapsed: got %q", got[0])
+		}
 	})
+
+	t.Run("gitops_fallback_nullbyte", func(t *testing.T) {
+		// A null byte in GITOPS_PATH must not produce an entry at all;
+		// the result would otherwise be a clickable link with a NUL
+		// smuggled into the rendered URL.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("resolveRepoPaths panicked on null-byte fallback: %v", r)
+			}
+		}()
+		k := &kube{}
+		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "pods\x00evil"}
+		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		t.Logf("nullbyte fallback -> %#v", got)
+		assertRepoURLsSafe(t, "gitops_fallback_nullbyte", got)
+	})
+}
+
+// assertRepoURLsSafe fails the test if any entry contains an unescaped
+// `..` traversal segment or a null byte. These are the two safety
+// invariants the resolveRepoPaths sanitiser is responsible for: the
+// output is rendered as a clickable link in the digest, and either of
+// these would render a link the operator did not intend.
+func assertRepoURLsSafe(t *testing.T, name string, entries []string) {
+	t.Helper()
+	for _, e := range entries {
+		if strings.Contains(e, "\x00") {
+			t.Fatalf("%s: entry contains null byte: %q", name, e)
+		}
+		// Split on `/` and reject any segment that is `..`. We do not
+		// decode percent-encoding here; the contract is that resolveRepoPaths
+		// never emits an unescaped `..` segment in the first place.
+		for _, seg := range strings.Split(e, "/") {
+			if seg == ".." {
+				t.Fatalf("%s: entry contains unescaped `..` segment: %q", name, e)
+			}
+		}
+	}
 }

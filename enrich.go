@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"regexp"
 	"sort"
 	"strings"
@@ -667,6 +668,24 @@ func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
 		path = strings.TrimLeft(path, "/")
 		if repo == "" {
 			return
+		}
+		// Defense in depth: the path component originates either from
+		// the apiserver response (Flux Kustomization / Argo Application
+		// spec) or from operator-controlled config (GitOpsRepo /
+		// GitOpsPath fallback). Collapse `..` traversal segments with
+		// path.Clean against a leading slash so they cannot escape the
+		// repo URL root, and reject null bytes outright so they cannot
+		// smuggle a second URL segment into a Discord clickable link.
+		if strings.Contains(path, "\x00") {
+			return
+		}
+		if path != "" {
+			cleaned := pathpkg.Clean("/" + path)
+			if cleaned == "/" {
+				path = ""
+			} else {
+				path = strings.TrimLeft(cleaned, "/")
+			}
 		}
 		var entry string
 		if path == "" {
