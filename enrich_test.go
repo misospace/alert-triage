@@ -656,6 +656,29 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 			t.Fatalf("gitops_fallback_backslash: expected entry to be omitted when GitOpsPath contains backslash, got %#v", got)
 		}
 	})
+
+	// Absolute paths (e.g. `/etc/secrets`) — GitOpsPath is operator-supplied
+	// and an absolute path would normally be a misconfiguration, but the
+	// sanitiser must not emit a URL like `https://github.com/example/etc/secrets`
+	// because that would route the operator to the wrong repo subtree. The
+	// contract: leading slashes are stripped (joining onto the repo's
+	// subtree), so the resulting URL lands on the same default branch
+	// root as an operator who left GitOpsPath empty.
+	t.Run("gitops_fallback_absolutepath", func(t *testing.T) {
+		k := &kube{}
+		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback"}
+		cfg.GitOpsPath = "/etc/secrets"
+		pods := []podRef{{Namespace: "ns", Name: "pod"}}
+		got := k.resolveRepoPaths(pods, cfg)
+		if len(got) != 1 {
+			t.Fatalf("gitops_fallback_absolutepath: want one entry, got %#v", got)
+		}
+		const want = "https://github.com/example/fallback/etc/secrets"
+		if got[0] != want {
+			t.Fatalf("gitops_fallback_absolutepath: leading-slash not stripped, want %q got %q", want, got[0])
+		}
+		assertRepoURLsSafe(t, "gitops_fallback_absolutepath", got)
+	})
 }
 
 // assertRepoURLsSafe fails the test if any entry contains a null byte,

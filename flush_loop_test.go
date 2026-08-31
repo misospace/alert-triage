@@ -1,5 +1,14 @@
 package main
 
+// Tests for runFlushLoop / drainBuffer / runCompactLoop.
+//
+// Issue #83 named main_test.go as the expected home for the shutdown-drain
+// test, but drainBuffer is package-private state on the same goroutine-shape
+// as runFlushLoop itself — exercising the drain path here keeps the flush
+// tests grouped with their buffer mechanism rather than mixed into TestMain
+// shape tests in main_test.go. The earlier delta extracted drainBuffer from
+// inline closure to a method for this exact reason.
+
 import (
 	"context"
 	"net/http"

@@ -687,6 +687,11 @@ func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
 		//   - `%` (percent), used for percent-encoded traversal such
 		//     as `%2F..%2F` that path.Clean does not decode and that
 		//     some URL consumers decode before routing. Legitimate
+		//     GitHub paths do not contain `%`. Note: this value is
+		//     only ever rendered as a clickable Discord link and
+		//     never passed to os.Open, so symlink resolution is not
+		//     a concern here — the only attack surface is the URL
+		//     string the consumer sees before clicking.
 		//     Flux / Argo paths are file paths, not URLs, and a `%`
 		//     can only have appeared as a percent-encoding attempt.
 		//
