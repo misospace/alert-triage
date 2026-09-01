@@ -1,5 +1,5 @@
 module github.com/misospace/alert-triage
 
-go 1.27
+go 1.27.1
 
 require gopkg.in/yaml.v3 v3.0.1
