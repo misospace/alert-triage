@@ -215,3 +215,70 @@ func TestClamp(t *testing.T) {
 		t.Errorf("clamp short = %q, want %q", got2, short)
 	}
 }
+
+// narrateCfg builds a Config wired to a model API URL (the test server).
+func narrateCfg(url, apiFormat, model string) *Config {
+	return &Config{
+		LiteLLMURL: url,
+		LiteLLMKey: "test-key",
+		Model:      model,
+		APIFormat:  apiFormat,
+	}
+}
+
+func TestNarrateMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "this is not json at all")
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	r := Report{Group: Group{}}
+	tri := Narrate(cfg, r)
+	if tri.Narrative != "" {
+		t.Fatalf("expected empty narrative on malformed JSON, got %q", tri.Narrative)
+	}
+}
+
+func TestNarrateNon200HTTP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream exploded", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	r := Report{Group: Group{}}
+	tri := Narrate(cfg, r)
+	if tri.Narrative != "" {
+		t.Fatalf("expected empty narrative on non-200 reply, got %q", tri.Narrative)
+	}
+}
+
+func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// First content block has empty text — Narrate must fall back
+		// to the thinking block.
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":""},{"type":"thinking","text":"thinking block fallback narrative"}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "anthropic", "claude")
+	r := Report{Group: Group{}}
+	tri := Narrate(cfg, r)
+	if tri.Narrative != "thinking block fallback narrative" {
+		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
+	}
+}
+
+func TestNarrateOpenAIEmptyContentFallsBackToReasoning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"","reasoning_content":"reasoning_content fallback narrative"}}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	r := Report{Group: Group{}}
+	tri := Narrate(cfg, r)
+	if tri.Narrative != "reasoning_content fallback narrative" {
+		t.Fatalf("expected fallback to reasoning_content, got %q", tri.Narrative)
+	}
+}
