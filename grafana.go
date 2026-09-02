@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -12,7 +13,7 @@ import (
 // incident is worse than no link, and the same reasoning already governs
 // what_to_change never naming a path it was not shown.
 func envGrafanaURL(key string) string {
-	raw := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(osGetenvImpl(key)), "/"))
+	raw := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(os.Getenv(key)), "/"))
 	if raw == "" {
 		return ""
 	}
@@ -41,8 +42,6 @@ func groupWindow(g Group) [2]time.Time {
 	}
 	return [2]time.Time{from, to}
 }
-
-var osGetenvImpl = func(key string) string { return osGetenvReal(key) }
 
 // grafanaExplore builds a /explore URL whose left pane carries one query
 // against ds and the [from, to] range. expr is the PromQL/LogQL string the

@@ -291,7 +291,7 @@ func main() {
 	mux.HandleFunc("/metrics", requireAuth(cfg.WebhookToken, "metrics", metricsHandler()))
 
 	go runFlushLoop(context.Background(), &cfg, buf, k, hist, seen, prom)
-	go runCompactLoop(hist)
+	go runCompactLoop(context.Background(), hist)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -452,10 +452,15 @@ func runFlushLoop(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *
 	}
 }
 
-func runCompactLoop(hist *History) {
+func runCompactLoop(ctx context.Context, hist *History) {
 	tick := time.NewTicker(6 * time.Hour)
 	defer tick.Stop()
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		if err := hist.Compact(); err != nil {
 			logf("history: compact: %v", err)
 		}
@@ -483,7 +488,7 @@ func drainBuffer(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *H
 }
 
 func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
-	nodeOf := k.ResolveNodes(alerts)
+	nodeOf := k.ResolveNodes(ctx, alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack, cfg.Cluster)
 	// Count groups once per flush; if the count stays at zero while alerts
 	// arrive, the correlation rules are misbehaving, not the network.
@@ -506,12 +511,21 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	// API reads; running them serially avoids putting extra pressure on the
 	// API server. Narration is the only step slow enough to be worth
 	// parallelising.
+	//
+	// The rules payload is identical for every group in a flush, so fetch it
+	// once here and share it across the per-group metric enrichment instead
+	// of re-downloading /api/v1/rules for each group (issue #66).
+	var rules map[string]string
+	var rulesErr error
+	if prom != nil && len(groups) > 0 {
+		rules, rulesErr = prom.FetchRules(ctx)
+	}
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
 	for i, g := range groups {
 		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetrics(ctx, g, cfg.EvidenceWindow)
+			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
 		}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		reports[i] = r
@@ -607,8 +621,6 @@ func envInt(key string, fallback int) int {
 	logf("bad integer for %s=%q, using %d", key, v, fallback)
 	return fallback
 }
-
-func osGetenvReal(key string) string { return os.Getenv(key) }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
 	v := os.Getenv(key)

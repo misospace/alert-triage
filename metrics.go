@@ -209,6 +209,14 @@ func (s *metricSummary) render() string {
 	return fmt.Sprintf("min=%.2f max=%.2f last=%.2f %s%s", s.min, s.max, s.last, s.direction, labelCtx)
 }
 
+// FetchRules downloads the cluster's alerting rules once and returns the
+// alertname -> PromQL expression map. A flush that enriches several groups
+// should call this once and share the result via EnrichMetricsWithRules,
+// rather than re-downloading /api/v1/rules for every group (issue #66).
+func (p *Prometheus) FetchRules(ctx context.Context) (map[string]string, error) {
+	return p.fetchRules(ctx)
+}
+
 // EnrichMetrics queries the Prometheus backend for evidence about the group's
 // alerts. Returns compact one-liner summaries. Nil is returned when no metrics
 // backend is configured; a non-nil slice with error lines distinguishes an
@@ -217,7 +225,23 @@ func (s *metricSummary) render() string {
 // The supplied context is propagated to every underlying request so a stalled
 // backend cannot outlive the caller's deadline (the flush loop's tick or the
 // SIGTERM drain's 30s budget).
+//
+// EnrichMetrics fetches /api/v1/rules itself, so callers enriching several
+// groups in one flush should prefer FetchRules + EnrichMetricsWithRules to
+// share a single rules download (issue #66).
 func (p *Prometheus) EnrichMetrics(ctx context.Context, g Group, window time.Duration) []string {
+	if !p.isConfigured() {
+		return nil
+	}
+	rules, err := p.fetchRules(ctx)
+	return p.EnrichMetricsWithRules(ctx, g, window, rules, err)
+}
+
+// EnrichMetricsWithRules is EnrichMetrics with the rules map supplied by the
+// caller, so a flush that enriches several groups fetches /api/v1/rules once
+// and reuses it. A non-nil rulesErr (from a failed FetchRules) still yields
+// the single "metrics backend error" line, matching EnrichMetrics.
+func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) []string {
 	if !p.isConfigured() {
 		return nil
 	}
@@ -232,10 +256,8 @@ func (p *Prometheus) EnrichMetrics(ctx context.Context, g Group, window time.Dur
 		}
 	}
 
-	// Fetch rules to find expressions for our alerts.
-	rules, err := p.fetchRules(ctx)
-	if err != nil {
-		lines = append(lines, fmt.Sprintf("metrics backend error: %v", err))
+	if rulesErr != nil {
+		lines = append(lines, fmt.Sprintf("metrics backend error: %v", rulesErr))
 		return lines
 	}
 
