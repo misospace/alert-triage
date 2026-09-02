@@ -506,12 +506,21 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	// API reads; running them serially avoids putting extra pressure on the
 	// API server. Narration is the only step slow enough to be worth
 	// parallelising.
+	//
+	// The rules payload is identical for every group in a flush, so fetch it
+	// once here and share it across the per-group metric enrichment instead
+	// of re-downloading /api/v1/rules for each group (issue #66).
+	var rules map[string]string
+	var rulesErr error
+	if prom != nil && len(groups) > 0 {
+		rules, rulesErr = prom.FetchRules(ctx)
+	}
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
 	for i, g := range groups {
 		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetrics(ctx, g, cfg.EvidenceWindow)
+			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
 		}
 		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
 		reports[i] = r
