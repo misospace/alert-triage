@@ -157,7 +157,7 @@ func TestRunCompactLoopCompactsOnTick(t *testing.T) {
 	hist.Record("stale-sig", "stale-title", time.Now().Add(-time.Hour))
 	done := make(chan struct{})
 	go func() {
-		runCompactLoop(hist)
+		runCompactLoop(context.Background(), hist)
 		close(done)
 	}()
 	// Wait for at least one tick: Compact is on a 5s timer in production,
@@ -178,5 +178,32 @@ func TestRunCompactLoopCompactsOnTick(t *testing.T) {
 	}
 	if !compacted {
 		t.Fatalf("runCompactLoop did not compact a stale entry within 2s")
+	}
+}
+
+// TestRunCompactLoopExitsOnContextCancel exercises the SIGTERM shutdown
+// path of runCompactLoop: cancelling the context must cause the loop to
+// return within the next tick window rather than keep its 6-hour timer
+// running. This guards the issue #95 fix that added a <-ctx.Done() arm
+// to the select, so a leaked goroutine on shutdown is caught in CI.
+func TestRunCompactLoopExitsOnContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	hist, err := NewHistory(filepath.Join(dir, "h.json"), 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runCompactLoop(ctx, hist)
+		close(done)
+	}()
+	// Give the loop a moment to enter its select on the first tick.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runCompactLoop did not return within 2s of context cancel")
 	}
 }

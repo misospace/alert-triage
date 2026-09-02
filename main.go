@@ -291,7 +291,7 @@ func main() {
 	mux.HandleFunc("/metrics", requireAuth(cfg.WebhookToken, "metrics", metricsHandler()))
 
 	go runFlushLoop(context.Background(), &cfg, buf, k, hist, seen, prom)
-	go runCompactLoop(hist)
+	go runCompactLoop(context.Background(), hist)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -452,10 +452,15 @@ func runFlushLoop(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *
 	}
 }
 
-func runCompactLoop(hist *History) {
+func runCompactLoop(ctx context.Context, hist *History) {
 	tick := time.NewTicker(6 * time.Hour)
 	defer tick.Stop()
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		if err := hist.Compact(); err != nil {
 			logf("history: compact: %v", err)
 		}
