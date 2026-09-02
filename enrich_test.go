@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -96,11 +97,11 @@ func TestStripSecrets(t *testing.T) {
 
 func TestFetchPodLogs_empty(t *testing.T) {
 	k := &kube{}
-	got := k.fetchPodLogs(nil)
+	got := k.fetchPodLogs(context.Background(), nil)
 	if got != nil {
 		t.Errorf("expected nil for empty pods, got %v", got)
 	}
-	got = k.fetchPodLogs([]string{})
+	got = k.fetchPodLogs(context.Background(), []string{})
 	if got != nil {
 		t.Errorf("expected nil for empty slice, got %v", got)
 	}
@@ -108,7 +109,7 @@ func TestFetchPodLogs_empty(t *testing.T) {
 
 func TestFetchPodLogs_badKey(t *testing.T) {
 	k := &kube{}
-	got := k.fetchPodLogs([]string{"no-slash"})
+	got := k.fetchPodLogs(context.Background(), []string{"no-slash"})
 	if len(got) != 0 {
 		t.Errorf("expected empty map for bad key, got %v", got)
 	}
@@ -116,7 +117,7 @@ func TestFetchPodLogs_badKey(t *testing.T) {
 
 func TestFetchPodLogs_noServer(t *testing.T) {
 	k := &kube{base: "http://127.0.0.1:1"}
-	got := k.fetchPodLogs([]string{"ns/pod"})
+	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"})
 	if len(got) != 0 {
 		t.Errorf("expected empty map when server unreachable, got %v", got)
 	}
@@ -138,7 +139,7 @@ func TestFetchPodLogs_success(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs([]string{"ns/pod"})
+	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
@@ -154,7 +155,7 @@ func TestFetchPodLogs_stripsSecrets(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs([]string{"ns/pod"})
+	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
@@ -173,7 +174,7 @@ func TestFetchPodLogs_capped(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs([]string{"ns/pod"})
+	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
@@ -307,7 +308,7 @@ func TestResolveRepoPathsFluxKustomization(t *testing.T) {
 		},
 	}}
 	cfg := &Config{}
-	got := k.resolveRepoPaths(pods, cfg)
+	got := k.resolveRepoPaths(context.Background(), pods, cfg)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 resolved path, got %#v", got)
 	}
@@ -345,7 +346,7 @@ func TestResolveRepoPathsFluxPath(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
 		},
 	}}
-	got := k.resolveRepoPaths(pods, &Config{})
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/payments/apps/payments" {
 		t.Fatalf("unexpected paths: %#v", got)
 	}
@@ -361,10 +362,10 @@ func TestFluxHelmPathMissingAnnotations(t *testing.T) {
 	}))
 	defer srv.Close()
 	k := &kube{hc: srv.Client(), base: srv.URL}
-	if _, _, ok := k.fluxHelmPath(map[string]string{}); ok {
+	if _, _, ok := k.fluxHelmPath(context.Background(), map[string]string{}); ok {
 		t.Fatalf("expected ok=false for empty annotations")
 	}
-	if _, _, ok := k.fluxHelmPath(map[string]string{"kustomize.toolkit.fluxcd.io/name": "x"}); ok {
+	if _, _, ok := k.fluxHelmPath(context.Background(), map[string]string{"kustomize.toolkit.fluxcd.io/name": "x"}); ok {
 		t.Fatalf("expected ok=false when only name is set")
 	}
 }
@@ -387,7 +388,7 @@ func TestResolveRepoPathsArgoApplication(t *testing.T) {
 			"argocd.argoproj.io/instance": "guestbook",
 		},
 	}}
-	got := k.resolveRepoPaths(pods, &Config{})
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/argo/manifests/web" {
 		t.Fatalf("unexpected paths: %#v", got)
 	}
@@ -408,7 +409,7 @@ func TestResolveRepoPathsGitOpsFallback(t *testing.T) {
 	k := &kube{hc: srv.Client(), base: srv.URL}
 	pods := []podRef{{Name: "plain", Namespace: "ns", Annotations: map[string]string{}}}
 	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
-	got := k.resolveRepoPaths(pods, cfg)
+	got := k.resolveRepoPaths(context.Background(), pods, cfg)
 	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
 		t.Fatalf("unexpected fallback paths: %#v", got)
 	}
@@ -418,11 +419,11 @@ func TestResolveRepoPathsGitOpsFallback(t *testing.T) {
 // pods with no annotations and no fallback configured.
 func TestResolveRepoPathsEmpty(t *testing.T) {
 	k := &kube{}
-	if got := k.resolveRepoPaths(nil, &Config{}); got != nil {
+	if got := k.resolveRepoPaths(context.Background(), nil, &Config{}); got != nil {
 		t.Fatalf("expected nil, got %#v", got)
 	}
 	cfg := &Config{}
-	if got := k.resolveRepoPaths([]podRef{{Annotations: map[string]string{}}}, cfg); got != nil {
+	if got := k.resolveRepoPaths(context.Background(), []podRef{{Annotations: map[string]string{}}}, cfg); got != nil {
 		t.Fatalf("expected nil when nothing resolves and no fallback configured, got %#v", got)
 	}
 }
@@ -446,7 +447,7 @@ func TestResolveNodesPodLabelNoNodeLabel(t *testing.T) {
 		{Fingerprint: "fp-1", Labels: map[string]string{"pod": "p1", "namespace": "ns-a"}},
 		{Fingerprint: "fp-2", Labels: map[string]string{"pod": "p2", "namespace": "ns-a"}},
 	}
-	got := k.ResolveNodes(alerts)
+	got := k.ResolveNodes(context.Background(), alerts)
 	if got["fp-1"] != "worker-1" {
 		t.Fatalf("expected fp-1 -> worker-1, got %q", got["fp-1"])
 	}
@@ -469,7 +470,7 @@ func TestResolveNodesNodeLabelShortCircuit(t *testing.T) {
 	alerts := []Alert{
 		{Fingerprint: "fp-3", Labels: map[string]string{"node": "ctrl-1"}},
 	}
-	got := k.ResolveNodes(alerts)
+	got := k.ResolveNodes(context.Background(), alerts)
 	if got["fp-3"] != "ctrl-1" {
 		t.Fatalf("expected fp-3 -> ctrl-1, got %q", got["fp-3"])
 	}
@@ -481,7 +482,7 @@ func TestResolveNodesNodeLabelShortCircuit(t *testing.T) {
 // TestResolveNodesNilReceiver ensures the nil-receiver guard works.
 func TestResolveNodesNilReceiver(t *testing.T) {
 	var k *kube
-	got := k.ResolveNodes([]Alert{{Fingerprint: "fp", Labels: map[string]string{"node": "x"}}})
+	got := k.ResolveNodes(context.Background(), []Alert{{Fingerprint: "fp", Labels: map[string]string{"node": "x"}}})
 	// Nil receiver on a node-labelled alert is allowed to return either
 	// an empty map (the simple guard) or a populated map. Either is fine.
 	if got["fp"] != "" && got["fp"] != "x" {
@@ -513,7 +514,7 @@ func TestFluxHelmPathSuccess(t *testing.T) {
 		"kustomize.toolkit.fluxcd.io/name":      "podinfo",
 		"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
 	}
-	repo, path, ok := k.fluxHelmPath(ann)
+	repo, path, ok := k.fluxHelmPath(context.Background(), ann)
 	if !ok {
 		t.Fatalf("expected ok=true, got false")
 	}
@@ -522,7 +523,7 @@ func TestFluxHelmPathSuccess(t *testing.T) {
 	}
 	// And via the public resolveRepoPaths entry point.
 	pods := []podRef{{Name: "p1", Namespace: "ns-a", Annotations: ann}}
-	got := k.resolveRepoPaths(pods, &Config{})
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/flux-helm/clusters/prod" {
 		t.Fatalf("unexpected resolveRepoPaths output: %#v", got)
 	}
@@ -568,7 +569,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 			}()
 			k := &kube{hc: srv.Client(), base: srv.URL}
 			pods := []podRef{{Name: "p", Namespace: "ns", Annotations: tc.ann}}
-			got := k.resolveRepoPaths(pods, &Config{})
+			got := k.resolveRepoPaths(context.Background(), pods, &Config{})
 			t.Logf("%s -> %#v", tc.name, got)
 			assertRepoURLsSafe(t, tc.name, got)
 		})
@@ -589,7 +590,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "../../etc/secrets"}
-		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_traversal", got)
 		if len(got) != 1 {
@@ -611,7 +612,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "pods\x00evil"}
-		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("nullbyte fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_nullbyte", got)
 		if len(got) != 0 {
@@ -630,7 +631,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "podinfo%2F..%2F.."}
-		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("percentencoded fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_percentencoded", got)
 		if len(got) != 0 {
@@ -649,7 +650,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: `podinfo\..\..`}
-		got := k.resolveRepoPaths([]podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("backslash fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_backslash", got)
 		if len(got) != 0 {
@@ -669,7 +670,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback"}
 		cfg.GitOpsPath = "/etc/secrets"
 		pods := []podRef{{Namespace: "ns", Name: "pod"}}
-		got := k.resolveRepoPaths(pods, cfg)
+		got := k.resolveRepoPaths(context.Background(), pods, cfg)
 		if len(got) != 1 {
 			t.Fatalf("gitops_fallback_absolutepath: want one entry, got %#v", got)
 		}
@@ -715,5 +716,81 @@ func assertRepoURLsSafe(t *testing.T, name string, entries []string) {
 				t.Fatalf("%s: entry contains unescaped `..` segment: %q", name, e)
 			}
 		}
+	}
+}
+
+// TestKubeGetContextCancelled verifies that a stalled apiserver call is
+// cancelled promptly when the caller's context is cancelled, rather than
+// blocking for the full http.Client.Timeout (15s).
+func TestKubeGetContextCancelled(t *testing.T) {
+	// Server that blocks on the read until the request's context is
+	// cancelled, simulating a stalled apiserver.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	k := &kube{
+		base: srv.URL,
+		hc:   &http.Client{Timeout: 15 * time.Second},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		var out nodeList
+		done <- k.get(ctx, "/api/v1/nodes", &out)
+	}()
+
+	// Give the request a moment to reach the server, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from cancelled context, got nil")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("get did not return promptly after context cancellation")
+	}
+}
+
+// TestFetchPodLogsContextCancelled verifies that fetchPodLogs also honours
+// context cancellation.
+func TestFetchPodLogsContextCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	k := &kube{
+		base: srv.URL,
+		hc:   &http.Client{Timeout: 15 * time.Second},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan map[string]string, 1)
+	go func() {
+		done <- k.fetchPodLogs(ctx, []string{"ns/pod"})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case got := <-done:
+		if len(got) != 0 {
+			t.Errorf("expected empty map after cancellation, got %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetchPodLogs did not return promptly after context cancellation")
 	}
 }

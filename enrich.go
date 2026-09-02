@@ -64,8 +64,8 @@ func newKube(cluster string) (*kube, error) {
 	}, nil
 }
 
-func (k *kube) get(path string, out any) error {
-	req, err := http.NewRequest(http.MethodGet, k.base+path, nil)
+func (k *kube) get(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.base+path, nil)
 	if err != nil {
 		return err
 	}
@@ -214,7 +214,7 @@ func alertNamespace(a Alert) string {
 
 // ResolveNodes maps alert fingerprints to the node their pod runs on, so
 // correlation can group by node even though most alerts only carry pod labels.
-func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
+func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]string {
 	out := map[string]string{}
 	if k == nil {
 		return out
@@ -231,7 +231,7 @@ func (k *kube) ResolveNodes(alerts []Alert) map[string]string {
 	}
 	for ns, list := range byNS {
 		var pods podList
-		if err := k.get("/api/v1/namespaces/"+url.PathEscape(ns)+"/pods", &pods); err != nil {
+		if err := k.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods", &pods); err != nil {
 			logf("enrich: pods in %s: %v", ns, err)
 			continue
 		}
@@ -277,15 +277,15 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 
 	// Node health is reported as a direct finding regardless of scope: a node in
 	// trouble plausibly explains almost any alert, and healthy nodes rule that out.
-	e.Nodes = k.unhealthyNodes()
+	e.Nodes = k.unhealthyNodes(ctx)
 
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
 		// rather than reporting no evidence. What comes back is context, not
 		// findings about this alert, and is kept separate so it cannot be
 		// mistaken for one.
-		e.Ambient = append(e.Ambient, k.warningEvents("", since)...)
-		e.Ambient = append(e.Ambient, k.fluxNotReady("", since)...)
+		e.Ambient = append(e.Ambient, k.warningEvents(ctx, "", since)...)
+		e.Ambient = append(e.Ambient, k.fluxNotReady(ctx, "", since)...)
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
 	} else {
 		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
@@ -306,7 +306,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		esc := url.PathEscape(ns)
 
 		var pods podList
-		if err := k.get("/api/v1/namespaces/"+esc+"/pods", &pods); err != nil {
+		if err := k.get(ctx, "/api/v1/namespaces/"+esc+"/pods", &pods); err != nil {
 			logf("enrich: pods in %s: %v", ns, err)
 		}
 		type scoredPod struct {
@@ -370,14 +370,14 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
 		}
 
-		e.Events = append(e.Events, k.warningEvents(esc, since)...)
-		e.RecentChanges = append(e.RecentChanges, k.fluxNotReady(esc, since)...)
+		e.Events = append(e.Events, k.warningEvents(ctx, esc, since)...)
+		e.RecentChanges = append(e.RecentChanges, k.fluxNotReady(ctx, esc, since)...)
 	}
 
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
-	e.PodLogs = k.fetchPodLogs(e.UnhealthyPods)
+	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods)
 	if k.logs != nil {
 		var err error
 		e.BackendLogs, err = k.logs.fetchBackendLogsResult(ctx, g, window)
@@ -396,15 +396,15 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
-	e.RepoPaths = k.resolveRepoPaths(seenPods, cfg)
+	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
 	return e
 }
 
 // unhealthyNodes reports nodes that are not Ready, are under pressure, or have
 // been cordoned. A healthy cluster returns nothing, which is itself evidence.
-func (k *kube) unhealthyNodes() []string {
+func (k *kube) unhealthyNodes(ctx context.Context) []string {
 	var nodes nodeList
-	if err := k.get("/api/v1/nodes", &nodes); err != nil {
+	if err := k.get(ctx, "/api/v1/nodes", &nodes); err != nil {
 		logf("enrich: nodes: %v", err)
 		return nil
 	}
@@ -431,13 +431,13 @@ func (k *kube) unhealthyNodes() []string {
 
 // warningEvents returns recent non-Normal events. An empty namespace widens the
 // query to the whole cluster.
-func (k *kube) warningEvents(namespace string, since time.Time) []string {
+func (k *kube) warningEvents(ctx context.Context, namespace string, since time.Time) []string {
 	path := "/api/v1/events?fieldSelector=type!=Normal"
 	if namespace != "" {
 		path = "/api/v1/namespaces/" + namespace + "/events?fieldSelector=type!=Normal"
 	}
 	var events eventList
-	if err := k.get(path, &events); err != nil {
+	if err := k.get(ctx, path, &events); err != nil {
 		logf("enrich: events (%s): %v", orAll(namespace), err)
 		return nil
 	}
@@ -498,7 +498,7 @@ func stripSecrets(s string) string {
 
 // fetchPodLogs retrieves the tail of the previous container log for each
 // unhealthy pod. Returns a map keyed by "namespace/name".
-func (k *kube) fetchPodLogs(pods []string) map[string]string {
+func (k *kube) fetchPodLogs(ctx context.Context, pods []string) map[string]string {
 	if len(pods) == 0 || k.hc == nil {
 		return nil
 	}
@@ -512,7 +512,7 @@ func (k *kube) fetchPodLogs(pods []string) map[string]string {
 		ns, name := parts[0], parts[1]
 
 		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?previous=true&tailLines=%d", ns, name, podLogTail)
-		req, err := http.NewRequest("GET", k.base+path, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
 		if err != nil {
 			continue
 		}
@@ -544,7 +544,7 @@ func (k *kube) fetchPodLogs(pods []string) map[string]string {
 // transitions every resource at once, so "did a deploy cause this?" turns into
 // a listing of 150 healthy Kustomizations. A reconcile is a signal only when it
 // happened in the namespace the alert is about.
-func (k *kube) fluxNotReady(namespace string, since time.Time) []string {
+func (k *kube) fluxNotReady(ctx context.Context, namespace string, since time.Time) []string {
 	scoped := namespace != ""
 	apis := []string{
 		"/apis/helm.toolkit.fluxcd.io/v2/helmreleases",
@@ -559,7 +559,7 @@ func (k *kube) fluxNotReady(namespace string, since time.Time) []string {
 	var out []string
 	for _, api := range apis {
 		var fl fluxList
-		if err := k.get(api, &fl); err != nil {
+		if err := k.get(ctx, api, &fl); err != nil {
 			continue
 		}
 		for _, item := range fl.Items {
@@ -660,7 +660,7 @@ func podHealthScore(phase, reason string, ready bool, restarts int) int {
 // the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
 // de-duplicated; unresolved entries are dropped silently so a missing
 // mapping degrades to today's prose rather than to a fabricated path.
-func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
+func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(repo, path string) {
@@ -733,17 +733,17 @@ func (k *kube) resolveRepoPaths(pods []podRef, cfg *Config) []string {
 			if kuzNs == "" {
 				kuzNs = p.Namespace
 			}
-			if repo, path, ok := k.fluxPath(kuzNs, kustom); ok {
+			if repo, path, ok := k.fluxPath(ctx, kuzNs, kustom); ok {
 				add(repo, path)
 				continue
 			}
-			if repo, path, ok := k.fluxHelmPath(p.Annotations); ok {
+			if repo, path, ok := k.fluxHelmPath(ctx, p.Annotations); ok {
 				add(repo, path)
 				continue
 			}
 		}
 		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
-			if repo, path, ok := k.argocdPath(app); ok {
+			if repo, path, ok := k.argocdPath(ctx, app); ok {
 				add(repo, path)
 				continue
 			}
@@ -764,7 +764,7 @@ type podRef struct {
 	Annotations map[string]string
 }
 
-func (k *kube) fluxPath(ns, name string) (string, string, bool) {
+func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
 	var kuz struct {
 		Spec struct {
 			Path      string `json:"path"`
@@ -774,7 +774,7 @@ func (k *kube) fluxPath(ns, name string) (string, string, bool) {
 			} `json:"sourceRef"`
 		} `json:"spec"`
 	}
-	if err := k.get("/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil || kuz.Spec.Path == "" {
+	if err := k.get(ctx, "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil || kuz.Spec.Path == "" {
 		return "", "", false
 	}
 	srcKind := kuz.Spec.SourceRef.Kind
@@ -787,13 +787,13 @@ func (k *kube) fluxPath(ns, name string) (string, string, bool) {
 		} `json:"spec"`
 	}
 	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
-	if err := k.get(srcPath, &src); err != nil || src.Spec.URL == "" {
+	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
 		return "", "", false
 	}
 	return src.Spec.URL, kuz.Spec.Path, true
 }
 
-func (k *kube) fluxHelmPath(ann map[string]string) (string, string, bool) {
+func (k *kube) fluxHelmPath(ctx context.Context, ann map[string]string) (string, string, bool) {
 	kuz := ann["kustomize.toolkit.fluxcd.io/name"]
 	if kuz == "" {
 		return "", "", false
@@ -802,10 +802,10 @@ func (k *kube) fluxHelmPath(ann map[string]string) (string, string, bool) {
 	if ns == "" {
 		return "", "", false
 	}
-	return k.fluxPath(ns, kuz)
+	return k.fluxPath(ctx, ns, kuz)
 }
 
-func (k *kube) argocdPath(instance string) (string, string, bool) {
+func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
 	var app struct {
 		Spec struct {
 			Source struct {
@@ -820,7 +820,7 @@ func (k *kube) argocdPath(instance string) (string, string, bool) {
 			p += "namespaces/" + ns + "/"
 		}
 		p += "applications/" + instance
-		if err := k.get(p, &app); err == nil && app.Spec.Source.RepoURL != "" {
+		if err := k.get(ctx, p, &app); err == nil && app.Spec.Source.RepoURL != "" {
 			return app.Spec.Source.RepoURL, app.Spec.Source.Path, true
 		}
 	}

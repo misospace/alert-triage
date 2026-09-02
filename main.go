@@ -483,7 +483,7 @@ func drainBuffer(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *H
 }
 
 func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
-	nodeOf := k.ResolveNodes(alerts)
+	nodeOf := k.ResolveNodes(ctx, alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack, cfg.Cluster)
 	// Count groups once per flush; if the count stays at zero while alerts
 	// arrive, the correlation rules are misbehaving, not the network.
