@@ -737,10 +737,6 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 				add(repo, path)
 				continue
 			}
-			if repo, path, ok := k.fluxHelmPath(ctx, p.Annotations); ok {
-				add(repo, path)
-				continue
-			}
 		}
 		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
 			if repo, path, ok := k.argocdPath(ctx, app); ok {
@@ -791,18 +787,6 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 		return "", "", false
 	}
 	return src.Spec.URL, kuz.Spec.Path, true
-}
-
-func (k *kube) fluxHelmPath(ctx context.Context, ann map[string]string) (string, string, bool) {
-	kuz := ann["kustomize.toolkit.fluxcd.io/name"]
-	if kuz == "" {
-		return "", "", false
-	}
-	ns := ann["kustomize.toolkit.fluxcd.io/namespace"]
-	if ns == "" {
-		return "", "", false
-	}
-	return k.fluxPath(ctx, ns, kuz)
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
