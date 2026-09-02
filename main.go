@@ -622,8 +622,6 @@ func envInt(key string, fallback int) int {
 	return fallback
 }
 
-func osGetenvReal(key string) string { return os.Getenv(key) }
-
 func envDuration(key string, fallback time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {

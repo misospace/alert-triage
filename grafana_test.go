@@ -64,16 +64,14 @@ func TestGrafanaLinksLogsOnlyWithoutMetricsDS(t *testing.T) {
 }
 
 func TestEnvGrafanaURLDropsRelative(t *testing.T) {
-	osGetenvImpl = func(key string) string { return "/grafana" }
-	defer func() { osGetenvImpl = func(key string) string { return osGetenvReal(key) } }()
+	t.Setenv("GRAFANA_URL", "/grafana")
 	if got := envGrafanaURL("GRAFANA_URL"); got != "" {
 		t.Fatalf("expected relative URL to be dropped, got %q", got)
 	}
 }
 
 func TestEnvGrafanaURLAcceptsAbsolute(t *testing.T) {
-	osGetenvImpl = func(key string) string { return "https://grafana.example.com/" }
-	defer func() { osGetenvImpl = func(key string) string { return osGetenvReal(key) } }()
+	t.Setenv("GRAFANA_URL", "https://grafana.example.com/")
 	if got := envGrafanaURL("GRAFANA_URL"); got != "https://grafana.example.com" {
 		t.Fatalf("expected trailing slash stripped, got %q", got)
 	}
