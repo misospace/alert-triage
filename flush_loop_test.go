@@ -181,6 +181,60 @@ func TestRunCompactLoopCompactsOnTick(t *testing.T) {
 	}
 }
 
+// TestRunFlushLoopExitsOnContextCancelMidTick asserts that cancelling the
+// loop's context while a tick is in flight causes runFlushLoop to return
+// within the cancel propagation budget (100ms) without running a stale
+// process. This is the acceptance test for issue #100: the flush loop must
+// honour a shutdown-aware context so an in-flight tick at SIGTERM exits
+// promptly instead of running for the full NarrateTimeout.
+func TestRunFlushLoopExitsOnContextCancelMidTick(t *testing.T) {
+	cfg := &Config{FlushDelay: 10 * time.Millisecond, MaxWindow: time.Second}
+	buf := &buffer{}
+	old := time.Now().Add(-time.Hour)
+	buf.add([]Alert{{Fingerprint: "fp-cancel", StartsAt: old}})
+
+	k, hits := stubKube(t)
+	hist, err := NewHistory(filepath.Join(t.TempDir(), "h.json"), time.Hour)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runFlushLoop(ctx, cfg, buf, k, hist, &recent{}, nil)
+		close(done)
+	}()
+
+	// Wait for the first tick to drain the buffer.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if bufferLen(buf) == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if bufferLen(buf) != 0 {
+		t.Fatalf("expected buffer drained before cancel, got %d", bufferLen(buf))
+	}
+	// Give process a moment to finish its kube call and return to the select.
+	time.Sleep(50 * time.Millisecond)
+	before := atomic.LoadInt64(hits)
+
+	// Cancel the context while the loop is in its select (between ticks).
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("runFlushLoop did not return within 100ms of context cancel")
+	}
+
+	// No stale process should have run after cancel.
+	if got := atomic.LoadInt64(hits); got != before {
+		t.Fatalf("stale process ran after cancel: hits %d -> %d", before, got)
+	}
+}
+
 // TestRunCompactLoopExitsOnContextCancel exercises the SIGTERM shutdown
 // path of runCompactLoop: cancelling the context must cause the loop to
 // return within the next tick window rather than keep its 6-hour timer
