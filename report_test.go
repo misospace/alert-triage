@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,7 +41,7 @@ func TestDeliverDiscord(t *testing.T) {
 
 	cfg := Config{DiscordURL: srv.URL}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1", Labels: map[string]string{"alertname": "HighCPU"}}}}}
-	if err := Deliver(&cfg, rpt); err != nil {
+	if err := Deliver(context.Background(), &cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(receivedBody, "sig-1") {
@@ -62,7 +63,7 @@ func TestDeliverClamp(t *testing.T) {
 	cfg := Config{DiscordURL: srv.URL}
 	longNarrative := strings.Repeat("x", 5000)
 	rpt := Report{Group: Group{Key: "sig-clamp", Alerts: []Alert{{Fingerprint: "fp-1"}}}, Narrative: longNarrative}
-	if err := Deliver(&cfg, rpt); err != nil {
+	if err := Deliver(context.Background(), &cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,7 +90,7 @@ func TestDeliverWithEnrichment(t *testing.T) {
 		Group:      Group{Key: "sig-enrich", Alerts: []Alert{{Fingerprint: "fp-1"}}},
 		Enrichment: Enrichment{Nodes: []string{"node1 not ready"}},
 	}
-	if err := Deliver(&cfg, rpt); err != nil {
+	if err := Deliver(context.Background(), &cfg, rpt); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(receivedBody, "node1 not ready") {
@@ -100,7 +101,7 @@ func TestDeliverWithEnrichment(t *testing.T) {
 func TestDeliverNoURL(t *testing.T) {
 	cfg := Config{}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
-	if err := Deliver(&cfg, rpt); err == nil {
+	if err := Deliver(context.Background(), &cfg, rpt); err == nil {
 		t.Error("expected error when no Discord URL configured")
 	}
 }
@@ -113,8 +114,61 @@ func TestDeliverServerFailure(t *testing.T) {
 
 	cfg := Config{DiscordURL: srv.URL}
 	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
-	if err := Deliver(&cfg, rpt); err == nil {
+	if err := Deliver(context.Background(), &cfg, rpt); err == nil {
 		t.Error("expected error on server failure")
+	}
+}
+
+// A stalled webhook must not hold the flush loop for the full 20s client
+// timeout: cancelling the caller's context must abort the in-flight POST
+// promptly (issue #104).
+func TestDeliverContextCancelledInFlight(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfg := Config{DiscordURL: srv.URL}
+	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := Deliver(ctx, &cfg, rpt)
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Deliver took %v after context cancellation, want < 200ms", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected error on context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context cancellation error, got %v", err)
+	}
+}
+
+// An un-cancelled context must still let the POST complete normally, so the
+// context plumbing does not turn every deliver into a fast-failure.
+func TestDeliverUnCancelledContextCompletes(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		receivedBody = string(data)
+	}))
+	defer srv.Close()
+
+	cfg := Config{DiscordURL: srv.URL}
+	rpt := Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Fingerprint: "fp-1"}}}}
+
+	if err := Deliver(context.Background(), &cfg, rpt); err != nil {
+		t.Fatalf("Deliver with un-cancelled context: %v", err)
+	}
+	if !strings.Contains(receivedBody, "sig-1") {
+		t.Error("expected group key in Discord payload")
 	}
 }
 

@@ -589,7 +589,7 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 		for _, a := range g.Alerts {
 			rec.Alerts = append(rec.Alerts, a.name())
 		}
-		if err := Deliver(cfg, r); err != nil {
+		if err := Deliver(ctx, cfg, r); err != nil {
 			rec.DeliverErr = err.Error()
 			metrics.observeDelivery(false)
 			logf("deliver %s: %v", g.Key, err)
