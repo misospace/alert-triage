@@ -290,8 +290,10 @@ func main() {
 	mux.HandleFunc("/webhook", webhookHandler(&cfg, buf))
 	mux.HandleFunc("/metrics", requireAuth(cfg.WebhookToken, "metrics", metricsHandler()))
 
-	go runFlushLoop(context.Background(), &cfg, buf, k, hist, seen, prom)
-	go runCompactLoop(context.Background(), hist)
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	defer loopCancel()
+	go runFlushLoop(loopCtx, &cfg, buf, k, hist, seen, prom)
+	go runCompactLoop(loopCtx, hist)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -306,6 +308,7 @@ func main() {
 	go func() {
 		<-stop
 		log.Print("shutdown signal received; draining buffer before exit")
+		loopCancel()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
