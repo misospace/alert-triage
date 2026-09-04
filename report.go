@@ -483,8 +483,9 @@ func severityColor(s string) int {
 // Deliver posts one incident to the digest webhook. When GitHub is configured
 // and the triage is actionable it is also mirrored to a GitHub issue keyed on
 // the group signature; see issue #14. Unset env keeps the original chat-only
-// behaviour.
-func Deliver(cfg *Config, r Report) error {
+// behaviour. The caller's context bounds the in-flight POST so a SIGTERM
+// drain can cancel it instead of waiting out the 20s client timeout.
+func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	if cfg.DiscordURL == "" {
 		return fmt.Errorf("no discord webhook configured")
 	}
@@ -492,8 +493,8 @@ func Deliver(cfg *Config, r Report) error {
 	gh := newGitHub(cfg)
 	var ghAction issueAction
 	if gh != nil && r.Triage.Actionable() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		act, err := deliverGitHub(ctx, gh, cfg, r)
+		ghCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		act, err := deliverGitHub(ghCtx, gh, cfg, r)
 		cancel()
 		if err != nil {
 			logf("github: %v", err)
@@ -600,7 +601,12 @@ func Deliver(cfg *Config, r Report) error {
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Post(cfg.DiscordURL, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.DiscordURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
 		return err
 	}
