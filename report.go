@@ -163,8 +163,9 @@ type anthropicResp struct {
 
 // Narrate asks the model for a story and a judgement about where a fix belongs.
 // A failure here is not fatal: the digest still ships with its evidence, just
-// without the summary.
-func Narrate(cfg *Config, r Report) Triage {
+// without the summary. The caller's context bounds the in-flight model call, so
+// a SIGTERM drain or flush-tick budget can cancel it.
+func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
 	if cfg.LiteLLMURL == "" {
 		return Triage{}
 	}
@@ -197,7 +198,7 @@ func Narrate(cfg *Config, r Report) Triage {
 	if strings.EqualFold(cfg.APIFormat, "anthropic") {
 		path = "/messages"
 	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		logf("narrate: request: %v", err)
 		return Triage{}

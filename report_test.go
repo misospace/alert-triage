@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSeverityColor(t *testing.T) {
@@ -234,7 +236,7 @@ func TestNarrateMalformedJSON(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(cfg, r)
+	tri := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "" {
 		t.Fatalf("expected empty narrative on malformed JSON, got %q", tri.Narrative)
 	}
@@ -247,7 +249,7 @@ func TestNarrateNon200HTTP(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(cfg, r)
+	tri := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "" {
 		t.Fatalf("expected empty narrative on non-200 reply, got %q", tri.Narrative)
 	}
@@ -263,7 +265,7 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "anthropic", "claude")
 	r := Report{Group: Group{}}
-	tri := Narrate(cfg, r)
+	tri := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "thinking block fallback narrative" {
 		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
 	}
@@ -277,8 +279,41 @@ func TestNarrateOpenAIEmptyContentFallsBackToReasoning(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(cfg, r)
+	tri := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "reasoning_content fallback narrative" {
 		t.Fatalf("expected fallback to reasoning_content, got %q", tri.Narrative)
+	}
+}
+
+func TestNarrateContextCancelledInFlight(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block until the test's context is cancelled, then end the handler so
+		// srv.Close() does not wait on the connection.
+		<-ctx.Done()
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	cfg.NarrateTimeout = 30 * time.Second // longer than the test's cancel, so only ctx can end the call
+
+	done := make(chan Triage, 1)
+	go func() { done <- Narrate(ctx, cfg, Report{Group: Group{}}) }()
+
+	select {
+	case <-done:
+		t.Fatal("Narrate returned before the context was cancelled")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+
+	select {
+	case tri := <-done:
+		if tri != (Triage{}) {
+			t.Fatalf("expected zero-value Triage on context cancellation, got %+v", tri)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Narrate did not return promptly after context cancellation")
 	}
 }
