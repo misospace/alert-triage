@@ -405,7 +405,7 @@ func TestDiscordPodLogsFenceEscape(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &Config{DiscordURL: srv.URL}
-	if err := Deliver(cfg, r); err != nil {
+	if err := Deliver(context.Background(), cfg, r); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 
