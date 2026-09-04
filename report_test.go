@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -369,5 +370,154 @@ func TestNarrateContextCancelledInFlight(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Narrate did not return promptly after context cancellation")
+	}
+}
+
+// TestDiscordPodLogsFenceEscape verifies that a pod log containing triple
+// backticks cannot break out of the Discord code fence and inject live
+// markdown (e.g. an @everyone ping).
+func TestDiscordPodLogsFenceEscape(t *testing.T) {
+	payload := "```\n**Pwned**: @everyone\n```\n"
+	r := Report{
+		Group: Group{
+			Alerts: []Alert{{
+				Labels: map[string]string{"alertname": "PodCrashed", "namespace": "ns", "pod": "foo"},
+			}},
+		},
+		Enrichment: Enrichment{
+			PodLogs: map[string]string{"ns/foo": payload},
+		},
+	}
+
+	var desc string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode discord body: %v", err)
+		}
+		embeds, _ := body["embeds"].([]any)
+		if len(embeds) > 0 {
+			e, _ := embeds[0].(map[string]any)
+			desc, _ = e["description"].(string)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &Config{DiscordURL: srv.URL}
+	if err := Deliver(cfg, r); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	// The pwned text must appear in the description.
+	if !strings.Contains(desc, "Pwned") {
+		t.Fatal("expected 'Pwned' in description, got:\n" + desc)
+	}
+
+	// No @everyone should appear outside a code fence.
+	// Walk the description tracking fence state, collecting outside text.
+	var outside strings.Builder
+	inFence := false
+	for i := 0; i < len(desc); i++ {
+		if strings.HasPrefix(desc[i:], "```") {
+			inFence = !inFence
+			i += 2
+			continue
+		}
+		if !inFence {
+			outside.WriteByte(desc[i])
+		}
+	}
+	if strings.Contains(outside.String(), "@everyone") {
+		t.Fatalf("@everyone found outside a code fence:\n%s", outside.String())
+	}
+}
+
+// TestGitHubPodLogsFenceEscape verifies that the GitHub body path keeps a
+// triple-backtick payload inside the untrusted fence markers.
+func TestGitHubPodLogsFenceEscape(t *testing.T) {
+	payload := "```\n**Pwned**: @everyone\n```\n"
+	r := Report{
+		Group: Group{
+			Alerts: []Alert{{
+				Labels: map[string]string{"alertname": "PodCrashed", "namespace": "ns", "pod": "foo"},
+			}},
+		},
+		Enrichment: Enrichment{
+			PodLogs: map[string]string{"ns/foo": payload},
+		},
+	}
+
+	body := renderEvidence(r)
+
+	// The pwned text must appear in the body.
+	if !strings.Contains(body, "Pwned") {
+		t.Fatal("expected 'Pwned' in GitHub body, got:\n" + body)
+	}
+
+	// The pwned text must be between a pair of untrusted markers.
+	// Find the last pair (pod logs section).
+	beginIdx := strings.LastIndex(body, untrustedBegin)
+	endIdx := strings.LastIndex(body, untrustedEnd)
+	if beginIdx < 0 || endIdx < 0 {
+		t.Fatal("expected untrusted markers in body")
+	}
+	pwnedIdx := strings.Index(body, "Pwned")
+	if pwnedIdx < beginIdx || pwnedIdx > endIdx {
+		t.Fatalf("'Pwned' at %d is outside untrusted markers [%d, %d]", pwnedIdx, beginIdx, endIdx)
+	}
+
+	// No @everyone should appear outside any untrusted marker pair.
+	// Collect all text outside markers.
+	var outside strings.Builder
+	rest := body
+	for {
+		bi := strings.Index(rest, untrustedBegin)
+		if bi < 0 {
+			outside.WriteString(rest)
+			break
+		}
+		outside.WriteString(rest[:bi])
+		ei := strings.Index(rest[bi:], untrustedEnd)
+		if ei < 0 {
+			break
+		}
+		rest = rest[bi+ei+len(untrustedEnd):]
+	}
+	if strings.Contains(outside.String(), "@everyone") {
+		t.Fatalf("@everyone found outside untrusted markers:\n%s", outside.String())
+	}
+}
+
+// TestSanitizeFenceContentLegitLogs verifies that legitimate log content
+// (no triple backticks) renders unchanged.
+func TestSanitizeFenceContentLegitLogs(t *testing.T) {
+	legit := "2024-01-01T00:00:00Z INFO starting up\n2024-01-01T00:00:01Z ERROR something failed\n"
+	if got := sanitizeFenceContent(legit); got != legit {
+		t.Fatalf("legit log changed: got %q want %q", got, legit)
+	}
+
+	// Single backticks should be preserved.
+	single := "use `kubectl get pods` to check\n"
+	if got := sanitizeFenceContent(single); got != single {
+		t.Fatalf("single-backtick log changed: got %q want %q", got, single)
+	}
+
+	// Double backticks should be preserved.
+	double := "use ``inline code`` here\n"
+	if got := sanitizeFenceContent(double); got != double {
+		t.Fatalf("double-backtick log changed: got %q want %q", got, double)
+	}
+
+	// Triple backticks should be reduced to double.
+	triple := "```\n"
+	if got := sanitizeFenceContent(triple); got != "``\n" {
+		t.Fatalf("triple backtick not reduced: got %q", got)
+	}
+
+	// Four backticks should also be reduced to double.
+	quad := "````\n"
+	if got := sanitizeFenceContent(quad); got != "``\n" {
+		t.Fatalf("quad backtick not reduced: got %q", got)
 	}
 }

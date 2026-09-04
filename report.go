@@ -383,6 +383,33 @@ func untrusted(s string) string {
 	return strings.ReplaceAll(s, "---", "- - -")
 }
 
+// sanitizeFenceContent prevents log content from breaking out of a
+// triple-backtick Discord code fence. Any run of three or more backticks
+// is shortened to two, the minimum change that keeps the content readable
+// while making fence breakout impossible.
+func sanitizeFenceContent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '`' {
+			j := i
+			for j < len(s) && s[j] == '`' {
+				j++
+			}
+			if j-i >= 3 {
+				b.WriteString("``")
+			} else {
+				b.WriteString(s[i:j])
+			}
+			i = j
+		} else {
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return b.String()
+}
+
 // writeFinding renders a section, stating the negative explicitly when empty so
 // the model can rule causes out instead of treating silence as missing data.
 func writeFinding(b *strings.Builder, title string, items []string, whenEmpty string) {
@@ -520,7 +547,7 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	if len(r.Enrichment.PodLogs) > 0 {
 		desc.WriteString("**Pod logs (previous container tail)**\n")
 		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, strings.TrimSpace(log))
+			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, sanitizeFenceContent(strings.TrimSpace(log)))
 		}
 	}
 	switch r.Enrichment.BackendState {
