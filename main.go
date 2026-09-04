@@ -527,7 +527,13 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 		if prom != nil {
 			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
 		}
-		r.PriorSeen = hist.Record(g.Signature(), g.Title(), time.Now())
+		// Count prior sightings (for the "seen N time(s) recently" footer)
+		// but do NOT record this fire yet: history is only written after
+		// Deliver returns nil, so a delivery failure does not leave the
+		// on-disk history claiming the operator saw something they did
+		// not. See issue #102 — a record here would lie about PriorSeen
+		// on the next fire of the same signature.
+		r.PriorSeen = hist.PriorSeen(g.Signature(), g.Title())
 		reports[i] = r
 		if cfg.MaxGroups <= 0 || i < cfg.MaxGroups {
 			narrateIdx = append(narrateIdx, i)
@@ -596,6 +602,11 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 		} else {
 			rec.Delivered = true
 			metrics.observeDelivery(true)
+			// Commit the sighting to on-disk history only after the operator
+			// actually received this fire. A failure above leaves
+			// history.jsonl untouched so the next fire's PriorSeen is
+			// honest. See issue #102.
+			hist.Record(g.Signature(), g.Title(), rec.At)
 		}
 		seen.add(rec)
 		log.Printf("digest %s [%s] fix=%s %s | %s", g.Key, g.Severity(),
