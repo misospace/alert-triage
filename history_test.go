@@ -233,3 +233,149 @@ func TestHistoryNewHistorySurvivesUnreadableFile(t *testing.T) {
 		t.Errorf("expected empty history when load cannot read the file, got %d entries", len(h.entries))
 	}
 }
+
+// TestHistoryPriorSeenDoesNotRecord asserts that PriorSeen is a pure
+// read: calling it must not append a sighting to history.jsonl. This
+// is the contract process() relies on to avoid "seen N time(s) recently"
+// claims for fires the operator never received (see issue #102).
+func TestHistoryPriorSeenDoesNotRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if got := h.PriorSeen("sig_a", "title_a"); got != 0 {
+			t.Errorf("PriorSeen iter %d = %d, want 0 (must not mutate state)", i, got)
+		}
+	}
+
+	// The on-disk file must not exist; PriorSeen never opens it for write.
+	if _, err := os.Stat(path); err == nil {
+		t.Errorf("PriorSeen should not create %s, but it exists", path)
+	}
+}
+
+// TestProcessHistoryRollbackOnDeliveryFailure is the acceptance test for
+// issue #102. It reproduces the process() flow without HTTP: the first
+// pass reads PriorSeen (no record), the third pass only calls Record if
+// the simulated Deliver succeeded.
+//
+// Scenario from the issue:
+//  1. Fire 1: Deliver fails -> no history.jsonl entry, PriorSeen=0.
+//  2. Fire 2: Deliver succeeds -> PriorSeen=0 (fire 1 must not count),
+//     and the on-disk file gets exactly one entry. Fire 2's footer
+//     reads "first time seen".
+//  3. Fire 3 (after reload): PriorSeen must be 1 (only the successful
+//     fire counts), so the footer reads "seen 1 time(s) recently".
+//
+// And separately, if the *third* fire's Deliver fails, history.jsonl
+// must remain at exactly one entry — no stray sighting for the failed
+// fire 3.
+func TestProcessHistoryRollbackOnDeliveryFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const sig = "node_not_ready"
+	const title = "node-not-ready"
+
+	deliver := func() bool { return false } // every Deliver() returns an error
+
+	fire := func(label string, ok bool, wantPrior int) {
+		deliver = func() bool { return ok }
+
+		// Pass 1: count only, do not record.
+		prior := h.PriorSeen(sig, title)
+		if prior != wantPrior {
+			t.Errorf("%s: prior before record = %d, want %d", label, prior, wantPrior)
+		}
+
+		// Pass 3: only record if Deliver succeeded.
+		if deliver() {
+			h.Record(sig, title, time.Now())
+		}
+	}
+
+	// Fire 1: fails. The operator never saw anything; PriorSeen must be 0
+	// and no line may be appended to history.jsonl.
+	fire("fire-1 fails", false, 0)
+
+	// Fire 2: succeeds. PriorSeen must still be 0 (failed fire 1 is not
+	// counted) so the footer reads "first time seen", and exactly one
+	// line lands on disk after this fire.
+	fire("fire-2 succeeds", true, 0)
+
+	// Fire 3: fails. Now prior is 1 (the successful fire 2), and no
+	// additional line may be appended because this delivery failed.
+	fire("fire-3 fails", false, 1)
+
+	// Reload from disk to confirm only the successful fire was persisted.
+	reloaded, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reloaded.entries); got != 1 {
+		t.Fatalf("after fail/succeed/fail sequence, history.jsonl should hold 1 sighting, got %d", got)
+	}
+	if got := reloaded.PriorSeen(sig, title); got != 1 {
+		t.Errorf("after the three fires, PriorSeen = %d, want 1 (only the successful fire counts)", got)
+	}
+}
+
+// TestProcessHistoryNoLeakOnFirstFire verifies that an entirely failing
+// alert (Deliver returns an error on every fire) never leaves a sighting
+// behind, so a later successful fire claims "first time seen" rather
+// than "seen N time(s) recently" with N from failed deliveries.
+func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const sig = "disk_pressure"
+	const title = "disk-pressure"
+
+	// Fire 1: Deliver fails.
+	if got := h.PriorSeen(sig, title); got != 0 {
+		t.Fatalf("fire 1 prior = %d, want 0", got)
+	}
+	// Deliver fails -> no Record call.
+
+	// Reload and confirm the file is still empty / non-existent.
+	reloaded, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reloaded.entries); got != 0 {
+		t.Fatalf("fire 1 (failed) should leave no sightings, found %d", got)
+	}
+
+	// Fire 2: Deliver succeeds.
+	if got := h.PriorSeen(sig, title); got != 0 {
+		t.Fatalf("fire 2 prior = %d, want 0 (failed fire 1 must not count)", got)
+	}
+	h.Record(sig, title, time.Now())
+
+	// Re-read after the successful fire: this fire saw "first time".
+	reloaded, err = NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.PriorSeen(sig, title); got != 1 {
+		t.Errorf("after 1 fail + 1 success, PriorSeen = %d, want 1", got)
+	}
+}
