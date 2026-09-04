@@ -565,7 +565,7 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 				return
 			}
 			metrics.observeModelCall()
-			reports[i].Triage = Narrate(cfg, reports[i])
+			reports[i].Triage = Narrate(ctx, cfg, reports[i])
 			// A non-actionable triage without a narrative means the model
 			// call failed: the digest still ships with evidence, but the
 			// explanation was lost. This counter is the only signal that
