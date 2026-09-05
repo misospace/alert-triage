@@ -217,30 +217,13 @@ func (p *Prometheus) FetchRules(ctx context.Context) (map[string]string, error) 
 	return p.fetchRules(ctx)
 }
 
-// EnrichMetrics queries the Prometheus backend for evidence about the group's
-// alerts. Returns compact one-liner summaries. Nil is returned when no metrics
-// backend is configured; a non-nil slice with error lines distinguishes an
-// unreachable backend from "not configured".
-//
-// The supplied context is propagated to every underlying request so a stalled
-// backend cannot outlive the caller's deadline (the flush loop's tick or the
-// SIGTERM drain's 30s budget).
-//
-// EnrichMetrics fetches /api/v1/rules itself, so callers enriching several
-// groups in one flush should prefer FetchRules + EnrichMetricsWithRules to
-// share a single rules download (issue #66).
-func (p *Prometheus) EnrichMetrics(ctx context.Context, g Group, window time.Duration) []string {
-	if !p.isConfigured() {
-		return nil
-	}
-	rules, err := p.fetchRules(ctx)
-	return p.EnrichMetricsWithRules(ctx, g, window, rules, err)
-}
-
-// EnrichMetricsWithRules is EnrichMetrics with the rules map supplied by the
-// caller, so a flush that enriches several groups fetches /api/v1/rules once
-// and reuses it. A non-nil rulesErr (from a failed FetchRules) still yields
-// the single "metrics backend error" line, matching EnrichMetrics.
+// EnrichMetricsWithRules queries the Prometheus backend for evidence about the
+// group's alerts using a caller-supplied rules map, so a flush that enriches
+// several groups fetches /api/v1/rules once and reuses it. Returns compact
+// one-liner summaries. Nil is returned when no metrics backend is configured;
+// a non-nil slice with error lines distinguishes an unreachable backend from
+// "not configured". A non-nil rulesErr (from a failed FetchRules) yields the
+// single "metrics backend error" line.
 func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) []string {
 	if !p.isConfigured() {
 		return nil
