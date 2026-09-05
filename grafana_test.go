@@ -27,6 +27,34 @@ func TestGrafanaExploreURLShape(t *testing.T) {
 	}
 }
 
+func TestGrafanaExploreZeroWindowSuppressed(t *testing.T) {
+	if got := grafanaExplore("https://g", "ds", "up", time.Time{}, time.Time{}, "prometheus"); got != "" {
+		t.Fatalf("expected zero window to produce no URL, got %q", got)
+	}
+}
+
+func TestGrafanaLinksZeroWindowGroupSuppressed(t *testing.T) {
+	cfg := &Config{
+		GrafanaURL:       "https://grafana.example.com",
+		GrafanaMetricsDS: "prom",
+		GrafanaLogsDS:    "loki",
+	}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}} // StartsAt and EndsAt both zero
+	m, l := grafanaLinks(cfg, "up", "kube-system", groupWindow(g))
+	if m != "" || l != "" {
+		t.Fatalf("expected no links for zero-window group, got metrics=%q logs=%q", m, l)
+	}
+}
+
+func TestGroupWindowActiveAlertFallsBackToStartsAt(t *testing.T) {
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "Up"}, StartsAt: start}}} // EndsAt zero: still active
+	w := groupWindow(g)
+	if !w[0].Equal(start) || !w[1].Equal(start) {
+		t.Fatalf("expected [start, start] for active alert, got [%s, %s]", w[0], w[1])
+	}
+}
+
 func TestGrafanaLinksOmittedWhenConfigMissing(t *testing.T) {
 	cfg := &Config{} // GRAFANA_URL unset
 	m, l := grafanaLinks(cfg, "up", "kube-system", [2]time.Time{time.Now(), time.Now()})

@@ -26,7 +26,12 @@ func envGrafanaURL(key string) string {
 
 // groupWindow returns [from, to] covering every alert in the group. An
 // empty group returns the zero pair, which makes grafanaExplore emit "" -
-// so a malformed group never produces a half-open URL either.
+// so a malformed group never produces a half-open URL either. A zero
+// EndsAt is the normal shape of an active alert (it has not resolved), so
+// it falls back to the alert's StartsAt; the reverse holds for a zero
+// StartsAt. Only when no alert in the group carries any usable timestamp
+// does the zero pair survive, and grafanaExplore suppresses it rather than
+// emitting a URL whose range is the unix epoch.
 func groupWindow(g Group) [2]time.Time {
 	if len(g.Alerts) == 0 {
 		return [2]time.Time{}
@@ -40,6 +45,12 @@ func groupWindow(g Group) [2]time.Time {
 			to = a.EndsAt
 		}
 	}
+	if to.IsZero() {
+		to = from
+	}
+	if from.IsZero() {
+		from = to
+	}
 	return [2]time.Time{from, to}
 }
 
@@ -49,8 +60,12 @@ func groupWindow(g Group) [2]time.Time {
 // lands already scoped. Returns "" when base or ds is empty - the digest
 // must remain complete without links, so a half-configured Grafana is
 // simply silent on the missing side rather than emitting a broken URL.
+// It also returns "" when from or to is the zero time: a group whose alerts
+// carry no StartsAt/EndsAt at all (the timestamp dropped at webhook-emission
+// time) would otherwise format as 0001-01-01T00:00:00Z, a valid RFC3339
+// string that sends the operator to the unix epoch instead of the incident.
 func grafanaExplore(base, ds, expr string, from, to time.Time, datasourceType string) string {
-	if base == "" || ds == "" || expr == "" {
+	if base == "" || ds == "" || expr == "" || from.IsZero() || to.IsZero() {
 		return ""
 	}
 	left := map[string]any{
