@@ -455,8 +455,13 @@ func runFlushLoop(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *
 	}
 }
 
+// compactInterval is the cadence of runCompactLoop's ticker. It is a
+// variable, not a constant, so a test can shorten it and drive a
+// compaction tick deterministically instead of waiting six hours.
+var compactInterval = 6 * time.Hour
+
 func runCompactLoop(ctx context.Context, hist *History) {
-	tick := time.NewTicker(6 * time.Hour)
+	tick := time.NewTicker(compactInterval)
 	defer tick.Stop()
 	for {
 		select {
