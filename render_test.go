@@ -112,7 +112,10 @@ func TestParseTriageTolerance(t *testing.T) {
 		"suffixed":   want + "\n\nHope that helps.",
 		"whitespace": "\n\n  " + want + "  \n",
 	} {
-		got := parseTriage(raw)
+		got, ok := parseTriage(raw)
+		if !ok {
+			t.Errorf("%s: expected a successful parse, got ok=false", name)
+		}
 		if got.FixLocation != "git" || got.Narrative != "n" {
 			t.Errorf("%s: parsed as %+v", name, got)
 		}
@@ -120,7 +123,7 @@ func TestParseTriageTolerance(t *testing.T) {
 }
 
 func TestParseTriageRejectsUnknownLocation(t *testing.T) {
-	got := parseTriage(`{"narrative":"n","fix_location":"somewhere-else"}`)
+	got, _ := parseTriage(`{"narrative":"n","fix_location":"somewhere-else"}`)
 	if got.FixLocation != "unknown" {
 		t.Errorf("unrecognised location must fall back to unknown, got %q", got.FixLocation)
 	}
@@ -128,7 +131,10 @@ func TestParseTriageRejectsUnknownLocation(t *testing.T) {
 
 // A model that ignores the format must still yield a readable digest.
 func TestParseTriageKeepsProseOnFailure(t *testing.T) {
-	got := parseTriage("The job is stuck because the volume never mounted.")
+	got, ok := parseTriage("The job is stuck because the volume never mounted.")
+	if ok {
+		t.Errorf("prose reply must not parse as structured, got ok=true")
+	}
 	if got.Narrative == "" || got.FixLocation != "unknown" {
 		t.Errorf("prose reply should survive as the narrative, got %+v", got)
 	}
