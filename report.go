@@ -44,7 +44,10 @@ var fixLocations = map[string]bool{
 // parseTriage tolerates the shapes models actually emit: a bare object, one
 // wrapped in a fence, or one preceded by commentary. Anything unparseable is
 // kept as the narrative so a malformed reply still ships a readable digest.
-func parseTriage(raw string) Triage {
+// The second return value reports whether the reply parsed to a structured
+// Triage with a non-empty narrative; it is false on the fallback path so the
+// caller can tell a parse failure apart from a successful parse.
+func parseTriage(raw string) (Triage, bool) {
 	raw = strings.TrimSpace(raw)
 	start, end := strings.Index(raw, "{"), strings.LastIndex(raw, "}")
 	if start >= 0 && end > start {
@@ -54,11 +57,11 @@ func parseTriage(raw string) Triage {
 			if !fixLocations[t.FixLocation] {
 				t.FixLocation = "unknown"
 			}
-			return t
+			return t, true
 		}
 	}
 	logf("triage: reply was not JSON, keeping it as the narrative")
-	return Triage{Narrative: raw, FixLocation: "unknown", Confidence: "low"}
+	return Triage{Narrative: raw, FixLocation: "unknown", Confidence: "low"}, false
 }
 
 const narratePrompt = `You are triaging Kubernetes alerts for a homelab cluster.
@@ -165,9 +168,9 @@ type anthropicResp struct {
 // A failure here is not fatal: the digest still ships with its evidence, just
 // without the summary. The caller's context bounds the in-flight model call, so
 // a SIGTERM drain or flush-tick budget can cancel it.
-func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
+func Narrate(ctx context.Context, cfg *Config, r Report) (Triage, bool) {
 	if cfg.LiteLLMURL == "" {
-		return Triage{}
+		return Triage{}, false
 	}
 	var body []byte
 	var err error
@@ -191,7 +194,7 @@ func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
 	}
 	if err != nil {
 		logf("narrate: marshal: %v", err)
-		return Triage{}
+		return Triage{}, false
 	}
 
 	path := "/chat/completions"
@@ -201,7 +204,7 @@ func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.LiteLLMURL, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		logf("narrate: request: %v", err)
-		return Triage{}
+		return Triage{}, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.LiteLLMKey != "" {
@@ -217,18 +220,18 @@ func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
 	resp, err := hc.Do(req)
 	if err != nil {
 		logf("narrate: %v", err)
-		return Triage{}
+		return Triage{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		logf("narrate: %s", resp.Status)
-		return Triage{}
+		return Triage{}, false
 	}
 	if strings.EqualFold(cfg.APIFormat, "anthropic") {
 		var out anthropicResp
 		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 			logf("narrate: decode: %v", err)
-			return Triage{}
+			return Triage{}, false
 		}
 		// Some reasoning models put the answer in thinking and leave text
 		// empty; others do the opposite. Try text first, fall back to
@@ -253,10 +256,10 @@ func Narrate(ctx context.Context, cfg *Config, r Report) Triage {
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		logf("narrate: decode: %v", err)
-		return Triage{}
+		return Triage{}, false
 	}
 	if len(out.Choices) == 0 {
-		return Triage{}
+		return Triage{}, false
 	}
 	// Some reasoning models put the answer in content and thinking in
 	// reasoning_content; others invert it when content comes back empty.

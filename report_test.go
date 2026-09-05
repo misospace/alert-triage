@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -283,6 +284,38 @@ func narrateCfg(url, apiFormat, model string) *Config {
 	}
 }
 
+// TestProcessCountsEmptyNarrationFailure is the acceptance test for issue #99:
+// a model reply that is empty (or unparseable) must increment the narration
+// failure counter even though parseTriage's fallback sets Confidence to
+// "low". The old AND-condition (Narrative=="" && Confidence=="") never fired
+// on this path, so a silent narration regression was invisible on /metrics.
+func TestProcessCountsEmptyNarrationFailure(t *testing.T) {
+	// The model returns an empty string: the worst regression. parseTriage("")
+	// falls back to Triage{Narrative:"", Confidence:"low"}, so only the
+	// parse-failure flag (or a bare Narrative=="" check) can catch it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	cfg.NarrateTimeout = 5 * time.Second
+	cfg.MaxWindow = time.Second
+
+	k, _ := stubKube(t)
+	hist, err := NewHistory(filepath.Join(t.TempDir(), "h.json"), time.Hour)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+
+	before := metrics.narrationFailures.Load()
+	process(context.Background(), cfg, []Alert{{Fingerprint: "fp-empty", StartsAt: time.Now().Add(-time.Hour)}}, k, hist, &recent{}, nil)
+	if got := metrics.narrationFailures.Load(); got != before+1 {
+		t.Fatalf("empty model reply must increment narration failures by 1, got %d -> %d", before, got)
+	}
+}
+
 func TestNarrateMalformedJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -291,7 +324,7 @@ func TestNarrateMalformedJSON(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(context.Background(), cfg, r)
+	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "" {
 		t.Fatalf("expected empty narrative on malformed JSON, got %q", tri.Narrative)
 	}
@@ -304,7 +337,7 @@ func TestNarrateNon200HTTP(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(context.Background(), cfg, r)
+	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "" {
 		t.Fatalf("expected empty narrative on non-200 reply, got %q", tri.Narrative)
 	}
@@ -320,7 +353,7 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "anthropic", "claude")
 	r := Report{Group: Group{}}
-	tri := Narrate(context.Background(), cfg, r)
+	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "thinking block fallback narrative" {
 		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
 	}
@@ -334,7 +367,7 @@ func TestNarrateOpenAIEmptyContentFallsBackToReasoning(t *testing.T) {
 	defer srv.Close()
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	r := Report{Group: Group{}}
-	tri := Narrate(context.Background(), cfg, r)
+	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "reasoning_content fallback narrative" {
 		t.Fatalf("expected fallback to reasoning_content, got %q", tri.Narrative)
 	}
@@ -353,8 +386,15 @@ func TestNarrateContextCancelledInFlight(t *testing.T) {
 	cfg := narrateCfg(srv.URL, "openai", "m")
 	cfg.NarrateTimeout = 30 * time.Second // longer than the test's cancel, so only ctx can end the call
 
-	done := make(chan Triage, 1)
-	go func() { done <- Narrate(ctx, cfg, Report{Group: Group{}}) }()
+	type narrateResult struct {
+		tri Triage
+		ok  bool
+	}
+	done := make(chan narrateResult, 1)
+	go func() {
+		tri, ok := Narrate(ctx, cfg, Report{Group: Group{}})
+		done <- narrateResult{tri, ok}
+	}()
 
 	select {
 	case <-done:
@@ -364,9 +404,12 @@ func TestNarrateContextCancelledInFlight(t *testing.T) {
 	cancel()
 
 	select {
-	case tri := <-done:
-		if tri != (Triage{}) {
-			t.Fatalf("expected zero-value Triage on context cancellation, got %+v", tri)
+	case res := <-done:
+		if res.tri != (Triage{}) {
+			t.Fatalf("expected zero-value Triage on context cancellation, got %+v", res.tri)
+		}
+		if res.ok {
+			t.Fatalf("expected ok=false on context cancellation, got ok=true")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Narrate did not return promptly after context cancellation")

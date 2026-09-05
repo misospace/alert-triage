@@ -574,13 +574,16 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 				return
 			}
 			metrics.observeModelCall()
-			reports[i].Triage = Narrate(ctx, cfg, reports[i])
-			// A non-actionable triage without a narrative means the model
-			// call failed: the digest still ships with evidence, but the
-			// explanation was lost. This counter is the only signal that
-			// a silent narration regression has happened.
-			metrics.observeNarration(reports[i].Triage.Narrative == "" && reports[i].Triage.Confidence == "")
-			reports[i].Narrative = reports[i].Triage.Narrative
+			tri, ok := Narrate(ctx, cfg, reports[i])
+			reports[i].Triage = tri
+			// ok is false whenever Narrate could not produce a structured
+			// triage: a network or status error, or a model reply that was
+			// empty or unparseable. The digest still ships with evidence,
+			// but the explanation was lost. This counter is the only signal
+			// that a silent narration regression has happened, so it must
+			// fire on every empty narrative regardless of Confidence.
+			metrics.observeNarration(!ok || tri.Narrative == "")
+			reports[i].Narrative = tri.Narrative
 		}()
 	}
 	wg.Wait()
