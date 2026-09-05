@@ -49,24 +49,19 @@ func newGitHub(cfg *Config) *gitHubClient {
 }
 
 type ghIssue struct {
-	Number      int              `json:"number"`
-	Title       string           `json:"title"`
-	State       string           `json:"state"`
-	HTMLURL     string           `json:"html_url"`
-	Body        string           `json:"body"`
-	Labels      []ghLabel        `json:"labels"`
-	CreatedAt   time.Time        `json:"created_at"`
-	UpdatedAt   time.Time        `json:"updated_at"`
-	Comments    int              `json:"comments"`
-	CommentList []ghIssueComment `json:"-"`
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	State     string    `json:"state"`
+	HTMLURL   string    `json:"html_url"`
+	Body      string    `json:"body"`
+	Labels    []ghLabel `json:"labels"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Comments  int       `json:"comments"`
 }
 
 type ghLabel struct {
 	Name string `json:"name"`
-}
-
-type ghIssueComment struct {
-	CreatedAt time.Time `json:"created_at"`
 }
 
 // issueAction tells main.go what happened: "created", "commented" or "none"
@@ -152,7 +147,7 @@ func shouldComment(existing *ghIssue, r Report, interval time.Duration) bool {
 	// If we've never commented on this issue yet, the first re-fire is
 	// always worth a note — the initial body captured the first firing, but
 	// operators want to see "still happening" written down somewhere.
-	if len(existing.CommentList) == 0 && existing.Comments == 0 {
+	if existing.Comments == 0 {
 		return true
 	}
 	return time.Since(existing.UpdatedAt) >= interval
