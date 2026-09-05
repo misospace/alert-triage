@@ -10,9 +10,11 @@ package main
 // inline closure to a method for this exact reason.
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -144,40 +146,67 @@ func TestDrainBufferShutdownEmpty(t *testing.T) {
 }
 
 // TestRunCompactLoopCompactsOnTick exercises the tick-firing branch of
-// runCompactLoop: a History with a stale entry must compact and rewrite
-// the file before the next tick. We hijack Compact via a short
-// retain/interval to drive the path deterministically.
+// runCompactLoop: a History holding both a stale and a live entry must
+// compact on a tick, dropping the stale entry from the on-disk file while
+// the live one survives.
+//
+// The assertion reads the file, not PriorSeen: with a short retain window
+// PriorSeen filters out stale entries by its own cutoff, so it would report
+// the stale entry as gone even if Compact never ran — the vacuous pass this
+// test used to make. The file is the only thing Compact rewrites.
 func TestRunCompactLoopCompactsOnTick(t *testing.T) {
 	dir := t.TempDir()
-	hist, err := NewHistory(filepath.Join(dir, "h.json"), 10*time.Millisecond)
+	path := filepath.Join(dir, "h.json")
+	hist, err := NewHistory(path, time.Hour)
 	if err != nil {
 		t.Fatalf("NewHistory: %v", err)
 	}
-	// Seed a stale entry so Compact has something to do.
-	hist.Record("stale-sig", "stale-title", time.Now().Add(-time.Hour))
+	// Seed one stale entry (outside the 1h retain) and one live entry
+	// (inside it). Compact must drop the former and keep the latter.
+	hist.Record("stale-sig", "stale-title", time.Now().Add(-2*time.Hour))
+	hist.Record("live-sig", "live-title", time.Now().Add(-time.Minute))
+
+	// Shorten the ticker so a tick fires within the test's deadline.
+	oldInterval := compactInterval
+	compactInterval = 10 * time.Millisecond
+	t.Cleanup(func() { compactInterval = oldInterval })
+
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runCompactLoop(context.Background(), hist)
+		runCompactLoop(ctx, hist)
 		close(done)
 	}()
-	// Wait for at least one tick: Compact is on a 5s timer in production,
-	// but runCompactLoop reads hist.retain to schedule. With a 10ms retain
-	// the loop schedules compaction immediately and rewrites the file.
+
 	deadline := time.Now().Add(2 * time.Second)
-	var compacted bool
 	for time.Now().Before(deadline) {
-		hist.mu.Lock()
-		_ = hist.entries // touch the struct to prove it is alive
-		hist.mu.Unlock()
-		// After the first compaction, the stale entry must be gone.
-		if hist.PriorSeen("stale-sig", "stale-title") == 0 {
-			compacted = true
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading history file: %v", err)
+		}
+		if !bytes.Contains(data, []byte("stale-sig")) && bytes.Contains(data, []byte("live-sig")) {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !compacted {
-		t.Fatalf("runCompactLoop did not compact a stale entry within 2s")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading history file: %v", err)
+	}
+	if bytes.Contains(data, []byte("stale-sig")) {
+		t.Fatalf("stale entry survived a compaction tick: %s", data)
+	}
+	if !bytes.Contains(data, []byte("live-sig")) {
+		t.Fatalf("live entry was dropped by compaction: %s", data)
+	}
+
+	// The loop must exit on cancel so the goroutine does not leak past
+	// the test.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runCompactLoop did not return within 2s of context cancel")
 	}
 }
 
