@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.3.0](https://github.com/misospace/alert-triage/compare/v0.2.0...v0.3.0) (2026-09-05)
+
+
+### Features
+
+* **narrate:** support Anthropic messages API ([4e9b0ff](https://github.com/misospace/alert-triage/commit/4e9b0ffbfd894afd1240cf0bf8b7b96072aca21d))
+* **narrate:** support Anthropic messages API ([7078989](https://github.com/misospace/alert-triage/commit/70789890a70274a8dbf5ba333b09f5f25e2592ad)), closes [#79](https://github.com/misospace/alert-triage/issues/79)
+
+
+### Bug Fixes
+
+* **compact:** exit compact loop on context cancel ([54f9c47](https://github.com/misospace/alert-triage/commit/54f9c47b121a8bbeb817611131da59f81f1018a9))
+* **compact:** exit compact loop on context cancel ([2a5bcda](https://github.com/misospace/alert-triage/commit/2a5bcda427e253c039953bc3d73b3a3ca640d015)), closes [#95](https://github.com/misospace/alert-triage/issues/95)
+* **deliver:** thread caller context through Deliver so the Discord POST honours the SIGTERM drain ([a9714d9](https://github.com/misospace/alert-triage/commit/a9714d9cb299faf18d79b059d808115459b71fd8))
+* **deliver:** thread caller context through Deliver so the Discord POST honours the SIGTERM drain ([30093de](https://github.com/misospace/alert-triage/commit/30093de5484fddf09ebad34e22870db75df641d2)), closes [#104](https://github.com/misospace/alert-triage/issues/104)
+* **enrich:** initialise logsBackend HTTP client in newLogsBackend ([e145796](https://github.com/misospace/alert-triage/commit/e1457961f405b02a88b98f5025c9bf774e3688d8))
+* **enrich:** initialise logsBackend HTTP client in newLogsBackend ([116fe2a](https://github.com/misospace/alert-triage/commit/116fe2a9d3452485daeb7776ab48125c6fd70924)), closes [#82](https://github.com/misospace/alert-triage/issues/82)
+* **enrich:** propagate context.Context through kube.get and enrich helpers ([955a5ff](https://github.com/misospace/alert-triage/commit/955a5ffaa9f33cfdb956c80a2c956a6b09665892))
+* **enrich:** propagate context.Context through kube.get and enrich helpers ([7af7f55](https://github.com/misospace/alert-triage/commit/7af7f55127568737428d152066821be43952ec00)), closes [#91](https://github.com/misospace/alert-triage/issues/91)
+* **enrich:** remove dead fluxHelmPath rescue branch ([627e7f5](https://github.com/misospace/alert-triage/commit/627e7f5e7b6b575defaa451318c7bb6144567174))
+* **enrich:** remove dead fluxHelmPath rescue branch ([9764840](https://github.com/misospace/alert-triage/commit/976484092a41f0faba825fe10765c10a3eb77ce4)), closes [#92](https://github.com/misospace/alert-triage/issues/92)
+* **grafana:** suppress Explore links when the group has no usable window ([adfa5a6](https://github.com/misospace/alert-triage/commit/adfa5a6669d00f18b6a60a7e219d564581f4a4e3))
+* **grafana:** suppress Explore links when the group has no usable window ([6aa134b](https://github.com/misospace/alert-triage/commit/6aa134bd4d48260c6b0c29460226d5fa76cb6c4a)), closes [#106](https://github.com/misospace/alert-triage/issues/106)
+* **history:** only record sightings after Deliver succeeds ([ba25adc](https://github.com/misospace/alert-triage/commit/ba25adc5ed28e1cce3091f5003cba394051d8922))
+* **history:** only record sightings after Deliver succeeds ([70b85a7](https://github.com/misospace/alert-triage/commit/70b85a7d3565557bef529ed5e7cbb1c187df179b)), closes [#102](https://github.com/misospace/alert-triage/issues/102)
+* **metrics:** fire narration-failure counter on empty or unparseable replies ([37ec472](https://github.com/misospace/alert-triage/commit/37ec4729c859626a54d010ad17c563ed966f9012))
+* **metrics:** fire narration-failure counter on empty or unparseable replies ([ade7cc9](https://github.com/misospace/alert-triage/commit/ade7cc931e013bd29b165782bf4e51a1cb9fdf49)), closes [#99](https://github.com/misospace/alert-triage/issues/99)
+* **narrate:** align anthropicReq struct fields and add reasoning-model fallback ([7515231](https://github.com/misospace/alert-triage/commit/75152313de7080759852b76179aed8f442676383))
+* **report:** propagate caller context into Narrate's model call ([8f3dcfb](https://github.com/misospace/alert-triage/commit/8f3dcfbb52c1ee6590dcf6e33d6616a7945ef2ab))
+* **report:** propagate caller context into Narrate's model call ([d5dbb80](https://github.com/misospace/alert-triage/commit/d5dbb808a0e11e06b33968760df362c5ecefb2d9)), closes [#101](https://github.com/misospace/alert-triage/issues/101)
+* **report:** sanitise pod logs to prevent Discord fence breakout ([e921eea](https://github.com/misospace/alert-triage/commit/e921eeada25334593d1ebdb925bd0fe55677a4e9))
+* **report:** sanitise pod logs to prevent Discord fence breakout ([5263d01](https://github.com/misospace/alert-triage/commit/5263d0195345979233ebcabbdaea18b50064eae5)), closes [#103](https://github.com/misospace/alert-triage/issues/103)
+* **shutdown:** pass cancellable context to flush loop and Narrate ([11bcd58](https://github.com/misospace/alert-triage/commit/11bcd5805c95d52cbec8cf3a5931e1c0df5a412f))
+* **shutdown:** pass cancellable context to flush loop and Narrate ([9cfb5a7](https://github.com/misospace/alert-triage/commit/9cfb5a728b33c4457dbe069846caad40545bf67c)), closes [#100](https://github.com/misospace/alert-triage/issues/100)
+
+
+### Performance Improvements
+
+* **metrics:** fetch /api/v1/rules once per flush and share across groups ([3d3d103](https://github.com/misospace/alert-triage/commit/3d3d1034ce0833d1b45d4621e3a2635b47d3be45))
+* **metrics:** fetch /api/v1/rules once per flush and share across groups ([b310d49](https://github.com/misospace/alert-triage/commit/b310d497bb97f5945e629e4afc9d4b4bfd25da7e)), closes [#66](https://github.com/misospace/alert-triage/issues/66)
+
+
+### Chores
+
+* **deps:** add gopkg.in/check.v1 to go.sum for a complete module graph ([914f344](https://github.com/misospace/alert-triage/commit/914f344ce2d0de8c4f8c2087b873f1965c3226ed))
+* **deps:** add gopkg.in/check.v1 to go.sum for a complete module graph ([c058467](https://github.com/misospace/alert-triage/commit/c058467149156999afb879de9fb9b24089fb75ff)), closes [#105](https://github.com/misospace/alert-triage/issues/105)
+
+
+### Documentation
+
+* **metrics:** correct metricsHandler comment to reflect requireAuth wrapping ([e0b89c4](https://github.com/misospace/alert-triage/commit/e0b89c40287c077cbfce587a9497bfb0a835143d))
+* **metrics:** correct metricsHandler comment to reflect requireAuth wrapping ([93eed29](https://github.com/misospace/alert-triage/commit/93eed290c0e884e88b36afafb89178e7e06f6918)), closes [#84](https://github.com/misospace/alert-triage/issues/84)
+
+
+### Refactors
+
+* **github:** drop dead CommentList field from ghIssue ([1deb222](https://github.com/misospace/alert-triage/commit/1deb222633fd1695f061028ae0450f9344457f01))
+* **github:** drop dead CommentList field from ghIssue ([332e633](https://github.com/misospace/alert-triage/commit/332e63315e38ada8267b0b40330fbd8541c0c9ca)), closes [#98](https://github.com/misospace/alert-triage/issues/98)
+* **grafana:** inline osGetenv indirection in envGrafanaURL ([56515ad](https://github.com/misospace/alert-triage/commit/56515ad8e8d4d46fc3b2c55ff0907df80fdb487e))
+* **grafana:** inline osGetenv indirection in envGrafanaURL ([3b66bbf](https://github.com/misospace/alert-triage/commit/3b66bbf3f8a5ff1fbb7fd16f4b7286ee151626ec)), closes [#94](https://github.com/misospace/alert-triage/issues/94)
+
 ## [0.2.0](https://github.com/misospace/alert-triage/compare/v0.1.9...v0.2.0) (2026-08-22)
 
 
