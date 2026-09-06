@@ -1,6 +1,6 @@
 module github.com/misospace/alert-triage
 
-go 1.27
+go 1.27.1
 
 // yaml.v3 is the sole non-stdlib dependency (see AGENTS.md). It is pinned at
 // v3.0.1; go.sum also carries its transitive test dep gopkg.in/check.v1 so the
