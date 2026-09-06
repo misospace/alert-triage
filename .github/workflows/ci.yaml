@@ -18,8 +18,8 @@ jobs:
       - run: go test -race ./...
       - name: Check Go version consistency
         run: |
-          mod_version="$(sed -nE 's/^go[[:space:]]+([0-9]+[.][0-9]+)([.][0-9]+)?([[:space:]]|$).*/\1/p' go.mod)"
-          docker_version="$(sed -nE 's|^FROM[[:space:]]+docker[.]io/library/golang:([0-9]+[.][0-9]+)([.][0-9]+)?-.*|\1|p' Dockerfile)"
+          mod_version="$(sed -nE 's/^go[[:space:]]+([0-9]+[.][0-9]+)([.][0-9]+)?([[:space:]]|$).*/\1\2/p' go.mod)"
+          docker_version="$(sed -nE 's|^FROM[[:space:]]+docker[.]io/library/golang:([0-9]+[.][0-9]+)([.][0-9]+)?-.*|\1\2|p' Dockerfile)"
           if [ -z "$mod_version" ]; then
             echo "::error::go.mod has no go directive"
             exit 1
