@@ -930,3 +930,373 @@ func TestEnrichmentFluxActivityNotChanges(t *testing.T) {
 		}
 	}
 }
+
+// jobAPIHarness is an httptest server that stands in for the apiserver
+// endpoints Enrich touches: node health, the per-namespace pod list, warning
+// events, Flux state, and the batch/v1 Job read. jobs is keyed by job name; a
+// spec with missing=true makes the Job read 404. The pods list is served
+// verbatim for any namespace.
+func jobAPIHarness(t *testing.T, podsJSON string, jobs map[string]jobSpec) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(path, "/pods") || strings.Contains(path, "/pods/"):
+			// The per-namespace pod list and the (fetched) pod log both land
+			// here; the list is the one that ends in "/pods".
+			if strings.HasSuffix(path, "/pods") {
+				_, _ = io.WriteString(w, podsJSON)
+			} else {
+				// previous=true log tail; serve an empty body so no content
+				// is attached to the test's assertions.
+			}
+		case strings.Contains(path, "/events"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(path, "/helmreleases") || strings.Contains(path, "/kustomizations"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(path, "/jobs/"):
+			name := path[strings.LastIndex(path, "/")+1:]
+			if j, ok := jobs[name]; ok {
+				if j.missing {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = io.WriteString(w, j.json)
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+}
+
+type jobSpec struct {
+	missing bool
+	json    string
+}
+
+// TestEnrichJobFailedResolvesOwnedPod is the core case: a KubeJobFailed alert
+// names a job via job_name (and its own namespace) but carries no pod label.
+// The job's one owned pod failed, and there is an unrelated healthy pod in the
+// same namespace. Enrich must resolve the job, promote the owned failed pod
+// into the direct-target set (so it is reported), and record the job in
+// Enrichment.InspectedJobs / Scope so the narrative can say the failed job was
+// inspected rather than merely the namespace.
+func TestEnrichJobFailedResolvesOwnedPod(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}},
+			{"metadata":{"name":"unrelated","namespace":"ns1",
+				"ownerReferences":[{"kind":"ReplicaSet","name":"svc-0","uid":"rs-1"}]},
+				"status":{"phase":"Running",
+					"containerStatuses":[{"name":"c","ready":true,"restartCount":0,
+						"state":{"running":{"reason":""}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	// The job is represented in enrichment scope.
+	if len(en.InspectedJobs) != 1 || en.InspectedJobs[0] != "ns1/backup" {
+		t.Fatalf("InspectedJobs = %v, want [ns1/backup]", en.InspectedJobs)
+	}
+	if !strings.Contains(en.Scope, "jobs ns1/backup were inspected") {
+		t.Errorf("scope %q does not record that the job was inspected", en.Scope)
+	}
+	// The owned failed pod is a direct target and is reported.
+	if !podInList(t, en.UnhealthyPods, "ns1/backup-0") {
+		t.Fatalf("owned failed pod ns1/backup-0 not in UnhealthyPods: %v", en.UnhealthyPods)
+	}
+	// The unrelated healthy pod is not reported.
+	if podInList(t, en.UnhealthyPods, "ns1/unrelated") {
+		t.Errorf("unrelated healthy pod should not be unhealthy: %v", en.UnhealthyPods)
+	}
+}
+
+// TestEnrichJobFailedMultipleOwnedPods covers a job that created more than one
+// pod (retries / parallelism): every owned failed pod is promoted, not just the
+// first one the listing happens to return.
+func TestEnrichJobFailedMultipleOwnedPods(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}},
+			{"metadata":{"name":"backup-1","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":3,
+						"state":{"error":{"reason":"CrashLoopBackOff"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if !podInList(t, en.UnhealthyPods, "ns1/backup-0") {
+		t.Errorf("owned pod ns1/backup-0 missing: %v", en.UnhealthyPods)
+	}
+	if !podInList(t, en.UnhealthyPods, "ns1/backup-1") {
+		t.Errorf("owned pod ns1/backup-1 missing: %v", en.UnhealthyPods)
+	}
+}
+
+// TestEnrichJobFailedUnrelatedPod verifies that an unrelated pod in the same
+// namespace (owned by something else) is not confused with the job's pod: the
+// job-owned pod is promoted to the front of the unhealthy list ahead of a
+// higher-scoring unrelated pod, so it survives truncation.
+func TestEnrichJobFailedUnrelatedPod(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}},
+			{"metadata":{"name":"noisy","namespace":"ns1",
+				"ownerReferences":[{"kind":"DaemonSet","name":"ds-0","uid":"ds-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":5,
+						"state":{"error":{"reason":"OOMKilled"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	iOwned, iNoisy := -1, -1
+	for i, p := range en.UnhealthyPods {
+		if strings.Contains(p, "ns1/backup-0") {
+			iOwned = i
+		}
+		if strings.Contains(p, "ns1/noisy") {
+			iNoisy = i
+		}
+	}
+	if iOwned < 0 || iNoisy < 0 {
+		t.Fatalf("expected both owned and unrelated pods, got %v", en.UnhealthyPods)
+	}
+	if iOwned > iNoisy {
+		t.Errorf("job-owned pod must come before the unrelated pod (iOwned=%d, iNoisy=%d): %v", iOwned, iNoisy, en.UnhealthyPods)
+	}
+}
+
+// TestEnrichJobFailedMissingJob covers a job that is gone (404): enrichment
+// must degrade gracefully — no job in InspectedJobs, no job in the scope
+// string — and must still ship the namespace listing it gathered.
+func TestEnrichJobFailedMissingJob(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"stray","namespace":"ns1",
+				"ownerReferences":[{"kind":"ReplicaSet","name":"svc-0","uid":"rs-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{"backup": {missing: true}}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.InspectedJobs) != 0 {
+		t.Fatalf("missing job should not be recorded as inspected, got %v", en.InspectedJobs)
+	}
+	if strings.Contains(en.Scope, "jobs ") {
+		t.Errorf("scope should not name a job when the job is missing: %q", en.Scope)
+	}
+	// The namespace listing still runs, so a genuinely unhealthy pod is still
+	// reported even though the job could not be resolved.
+	if !podInList(t, en.UnhealthyPods, "ns1/stray") {
+		t.Fatalf("expected the namespace listing to still surface the unhealthy pod, got %v", en.UnhealthyPods)
+	}
+}
+
+// TestEnrichPodLabelUnchanged is a regression guard: an alert that names its
+// subject with a `pod` label (no `job_name`) must behave exactly as before —
+// no job is fetched, nothing is recorded in InspectedJobs — and the pod it
+// names is a direct target.
+func TestEnrichPodLabelUnchanged(t *testing.T) {
+	var jobHits int
+	pods := `{
+		"items":[
+			{"metadata":{"name":"web-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"ReplicaSet","name":"web-0","uid":"rs-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+		]}`
+	counting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/jobs/"):
+			jobHits++
+			http.NotFound(w, r)
+		case strings.HasSuffix(path, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(path, "/pods"):
+			_, _ = io.WriteString(w, pods)
+		case strings.Contains(path, "/events") || strings.Contains(path, "/helmreleases") || strings.Contains(path, "/kustomizations"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+	defer counting.Close()
+
+	k := &kube{base: counting.URL, hc: counting.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "web-0",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if jobHits != 0 {
+		t.Fatalf("a pod-labelled alert with no job_name must not fetch any job, got %d job hit(s)", jobHits)
+	}
+	if len(en.InspectedJobs) != 0 {
+		t.Fatalf("no job was named, so InspectedJobs must be empty, got %v", en.InspectedJobs)
+	}
+	// The pod the alert names is still a direct target and is reported.
+	if !podInList(t, en.UnhealthyPods, "ns1/web-0") {
+		t.Fatalf("pod-labelled alert's own pod should be a direct target, got %v", en.UnhealthyPods)
+	}
+}
+
+// podInList reports whether any entry of got names the given "ns/name" pod
+// (the enriched list is a slice of "ns/name <phase> ..." strings).
+func podInList(t *testing.T, got []string, key string) bool {
+	t.Helper()
+	for _, s := range got {
+		if strings.Contains(s, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEnrichJobFailedMultipleJobs pins the scope statement for a group whose
+// alerts name more than one job: the resolved jobs are recorded in
+// InspectedJobs in a stable (sorted) order and the scope names all of them, so
+// "jobs ns1/b, ns1/a were inspected" is the same string on every run.
+func TestEnrichJobFailedMultipleJobs(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"a-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"a","uid":"ua"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}},
+			{"metadata":{"name":"b-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"b","uid":"ub"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"a": {json: `{"metadata":{"name":"a","namespace":"ns1","uid":"ua"},"spec":{"template":{"metadata":{"labels":{"job-name":"a"}}}}}`},
+		"b": {json: `{"metadata":{"name":"b","namespace":"ns1","uid":"ub"},"spec":{"template":{"metadata":{"labels":{"job-name":"b"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "a"}},
+			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.InspectedJobs) != 2 || en.InspectedJobs[0] != "ns1/a" || en.InspectedJobs[1] != "ns1/b" {
+		t.Fatalf("InspectedJobs not sorted, got %v", en.InspectedJobs)
+	}
+	if !strings.Contains(en.Scope, "jobs ns1/a, ns1/b were inspected") {
+		t.Errorf("scope should name both jobs in sorted order: %q", en.Scope)
+	}
+	// Both jobs' owned failed pods are promoted into the direct-target set.
+	if !podInList(t, en.UnhealthyPods, "ns1/a-0") || !podInList(t, en.UnhealthyPods, "ns1/b-0") {
+		t.Fatalf("both owned failed pods should be reported, got %v", en.UnhealthyPods)
+	}
+}
+
+// TestJobOwnedByFallback covers the ownership rule: a pod with a Job owner
+// reference is attributed by that reference (name + uid), and the
+// job-name=<name> label fallback is used only when no Job owner reference is
+// present at all. A pod owned by a different job must never be claimed.
+func TestJobOwnedByFallback(t *testing.T) {
+	job := jobRef{Namespace: "ns1", Name: "backup", UID: "job-uid-1", ControllerKey: "job-name", LabelValue: "backup"}
+
+	cases := []struct {
+		name string
+		pod  podOwner
+		want bool
+	}{
+		{"owned by uid and name", podOwner{OwnerReferences: []ownerRef{{Kind: "Job", Name: "backup", UID: "job-uid-1"}}}, true},
+		{"owned by name, uid missing", podOwner{OwnerReferences: []ownerRef{{Kind: "Job", Name: "backup"}}}, true},
+		{"owned by a different job", podOwner{OwnerReferences: []ownerRef{{Kind: "Job", Name: "other", UID: "x"}}, Labels: map[string]string{"job-name": "backup"}}, false},
+		{"no owner ref, label fallback matches", podOwner{Labels: map[string]string{"job-name": "backup"}}, true},
+		{"no owner ref, label fallback misses", podOwner{Labels: map[string]string{"job-name": "other"}}, false},
+	}
+	for _, tc := range cases {
+		if got := jobOwnedBy(job, tc.pod); got != tc.want {
+			t.Errorf("jobOwnedBy(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

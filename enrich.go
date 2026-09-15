@@ -85,9 +85,11 @@ func (k *kube) get(ctx context.Context, path string, out any) error {
 type podList struct {
 	Items []struct {
 		Metadata struct {
-			Name        string            `json:"name"`
-			Namespace   string            `json:"namespace"`
-			Annotations map[string]string `json:"annotations"`
+			Name            string            `json:"name"`
+			Namespace       string            `json:"namespace"`
+			Labels          map[string]string `json:"labels"`
+			Annotations     map[string]string `json:"annotations"`
+			OwnerReferences []ownerRef        `json:"ownerReferences"`
 		} `json:"metadata"`
 		Spec struct {
 			NodeName string `json:"nodeName"`
@@ -162,6 +164,50 @@ type nodeList struct {
 	} `json:"items"`
 }
 
+// ownerRef is one entry of a Kubernetes object's metadata.ownerReferences. It
+// identifies the owner of this object; a pod created by a Job carries a
+// reference with Kind "Job" whose UID and Name match the job's metadata, which
+// is how the service confirms a pod is owned by a job it resolved.
+type ownerRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	UID  string `json:"uid"`
+}
+
+// jobObj is the subset of the batch/v1 Job shape this service reads for a
+// single GET /apis/batch/v1/namespaces/<ns>/jobs/<name>. The job's UID
+// identifies the pods it created (their ownerReferences point at it), and the
+// controller label the controller manager copies from the job's pod template
+// onto each pod (job-name=<name>) is what a listing fallback keys on when
+// ownership cannot otherwise be established.
+type jobObj struct {
+	Metadata struct {
+		Name            string     `json:"name"`
+		Namespace       string     `json:"namespace"`
+		UID             string     `json:"uid"`
+		OwnerReferences []ownerRef `json:"ownerReferences"`
+	} `json:"metadata"`
+	Spec struct {
+		Template struct {
+			ObjectMeta struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"template"`
+	} `json:"spec"`
+}
+
+// jobRef is a job named by an alert in a group that was resolved (read) from
+// this client's cluster. The controller label it stamps on its pods
+// (ControllerKey/LabelValue) is the listing fallback used to attribute pods
+// when ownership cannot otherwise be established.
+type jobRef struct {
+	Namespace     string
+	Name          string
+	UID           string
+	ControllerKey string // the controller label key the job stamps on its pods
+	LabelValue    string // its value, usually the job name
+}
+
 // Enrichment is the evidence gathered for one group.
 type Enrichment struct {
 	Nodes         []string
@@ -187,6 +233,12 @@ type Enrichment struct {
 	// to scope to. It is NOT known to concern the alert, and is kept apart so a
 	// coincidence is not read as a cause.
 	Ambient []string
+	// InspectedJobs names the Jobs whose existence and state were read directly
+	// because an alert in the group named them (e.g. a kube-state-metrics
+	// KubeJobFailed carrying job_name). It is the "the failed Job was inspected"
+	// half of the scope statement, kept apart from the namespace listing a
+	// failed backup job's own pod can only be reached through.
+	InspectedJobs []string
 	// Scope records what was actually inspected, so the narrative can
 	// distinguish "nothing is wrong" from "nothing was looked at".
 	Scope string
@@ -200,7 +252,7 @@ type Enrichment struct {
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
 		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
-		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0
+		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 && len(e.InspectedJobs) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -305,6 +357,28 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 	}
 
+	// A KubeJobFailed alert names the failed Job, not a pod, so the pod-label
+	// pass above finds nothing. Resolve each namespaced job the group's alerts
+	// name; the job's uid identifies the pods it created (their ownerReferences
+	// point at it), and those become direct targets too. Without this the
+	// enrichment would only ever list the whole namespace and could truthfully
+	// report "no unhealthy pods in scope" while never inspecting the job's own
+	// pod as the subject. The owned-pod promotion is done inside the namespace
+	// listing loop below, because the pods to attribute come from that listing.
+	jobTargets := k.resolveJobs(ctx, g)
+	for _, j := range jobTargets {
+		e.InspectedJobs = append(e.InspectedJobs, j.Namespace+"/"+j.Name)
+	}
+	// Sort so the scope statement is stable across runs (jobTargets is a map).
+	sort.Strings(e.InspectedJobs)
+	if len(e.InspectedJobs) > 0 {
+		// The "jobs ns/j1, ns/j2 were inspected" half of the scope statement
+		// is appended (and only when a job actually resolved), so a reader can
+		// distinguish a failed job that was inspected from a namespace that
+		// merely was.
+		e.Scope += "; jobs " + strings.Join(e.InspectedJobs, ", ") + " were inspected"
+	}
+
 	var seenPods []podRef
 	for _, ns := range g.Namespaces {
 		esc := url.PathEscape(ns)
@@ -360,6 +434,19 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				break
 			}
 		}
+		// Promote the pods owned by a job the group's alerts named into the
+		// direct-target set, so they survive namespace noise and list
+		// truncation exactly as a pod-labelled alert's own pod does.
+		for _, j := range jobTargets {
+			if j.Namespace != ns {
+				continue
+			}
+			for _, p := range pods.Items {
+				if jobOwnedBy(*j, podOwner{Labels: p.Metadata.Labels, OwnerReferences: p.Metadata.OwnerReferences}) {
+					targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
+				}
+			}
+		}
 		// Pull the pods the alert actually names to the front, so they survive
 		// truncation ahead of unrelated noise in the same namespace.
 		sort.SliceStable(unhealthy, func(i, j int) bool {
@@ -402,6 +489,83 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.Ambient = capList(dedupe(e.Ambient), 5)
 	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
 	return e
+}
+
+// resolveJobs fetches, from this client's cluster, every distinct job that an
+// alert in the group names, keyed by "namespace/job". KubeJobFailed alerts from
+// kube-state-metrics identify the failed workload with a `job_name` label (and
+// the alert's own namespace labels), so they do not carry a `pod` label and
+// would otherwise leave the enrichment to list the whole namespace and report
+// "no unhealthy pods in scope" without ever inspecting the failed job's own
+// pod as the subject. A job that is missing or whose read fails is simply not
+// returned; the digest still ships on the namespace listing.
+func (k *kube) resolveJobs(ctx context.Context, g Group) map[string]*jobRef {
+	out := map[string]*jobRef{}
+	for _, a := range g.Alerts {
+		ns, name := a.namespace(), a.Labels["job_name"]
+		if ns == "" || name == "" {
+			continue
+		}
+		if _, ok := out[ns+"/"+name]; ok {
+			continue
+		}
+		var job jobObj
+		if err := k.get(ctx, "/apis/batch/v1/namespaces/"+url.PathEscape(ns)+"/jobs/"+url.PathEscape(name), &job); err != nil {
+			// A missing or unreadable job degrades to the namespace listing
+			// rather than blocking the digest: this is the same fail-open
+			// rule the rest of enrichment follows.
+			logf("enrich: job %s/%s: %v", ns, name, err)
+			continue
+		}
+		out[ns+"/"+name] = &jobRef{
+			Namespace:     ns,
+			Name:          name,
+			UID:           job.Metadata.UID,
+			ControllerKey: "job-name",
+			LabelValue:    job.Spec.Template.ObjectMeta.Labels["job-name"],
+		}
+	}
+	return out
+}
+
+// podOwner is the subset of a pod's metadata the job-ownership check reads:
+// the ownerReferences (primary signal) and labels (listing fallback).
+type podOwner struct {
+	Labels          map[string]string
+	OwnerReferences []ownerRef
+}
+
+// jobOwnedBy reports whether pod p is owned by job j. Primary signal is
+// ownership: a Job owner reference naming this job (by name, and by uid where
+// both are present) is proof of ownership. The label-selector fallback
+// (job-name=<name>) is used only when ownership cannot be established — the
+// pod carries no Job owner reference at all — because a bare label match can
+// collide across jobs that share a controller-label value, and a pod owned by
+// another job must never be claimed on that basis.
+func jobOwnedBy(j jobRef, p podOwner) bool {
+	hasJobOwner := false
+	for _, o := range p.OwnerReferences {
+		if o.Kind != "Job" {
+			continue
+		}
+		hasJobOwner = true
+		if o.Name != j.Name {
+			continue
+		}
+		if j.UID != "" && o.UID != "" && o.UID != j.UID {
+			continue
+		}
+		return true
+	}
+	if hasJobOwner {
+		// Ownership was determinable but no reference pointed at this job.
+		return false
+	}
+	// No Job owner reference at all, so ownership cannot be established.
+	if j.ControllerKey != "" && j.LabelValue != "" {
+		return p.Labels[j.ControllerKey] == j.LabelValue
+	}
+	return false
 }
 
 // unhealthyNodes reports nodes that are not Ready, are under pressure, or have
