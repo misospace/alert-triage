@@ -343,7 +343,11 @@ func renderEvidence(r Report) string {
 	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
-	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
+	negative := "no warning events in the window"
+	if r.Enrichment.EventsScoped {
+		negative = "no warning events on the resolved subject in the window"
+	}
+	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, negative)
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are

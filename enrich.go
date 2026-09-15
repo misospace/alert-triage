@@ -113,17 +113,20 @@ type podList struct {
 	} `json:"items"`
 }
 
+type eventItem struct {
+	Type           string    `json:"type"`
+	Reason         string    `json:"reason"`
+	Message        string    `json:"message"`
+	LastTimestamp  time.Time `json:"lastTimestamp"`
+	InvolvedObject struct {
+		Kind      string `json:"kind"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"involvedObject"`
+}
+
 type eventList struct {
-	Items []struct {
-		Type           string    `json:"type"`
-		Reason         string    `json:"reason"`
-		Message        string    `json:"message"`
-		LastTimestamp  time.Time `json:"lastTimestamp"`
-		InvolvedObject struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		} `json:"involvedObject"`
-	} `json:"items"`
+	Items []eventItem `json:"items"`
 }
 
 type fluxList struct {
@@ -218,7 +221,10 @@ type Enrichment struct {
 	// a successful query that returned no lines.
 	BackendLogs  []string
 	BackendState string
+	// Events contains warning events attached to the resolved alert subject graph.
+	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
+	EventsScoped bool
 	// FluxActivity lists recent transitions of Flux resources in the alert's
 	// namespace. A Ready transition only proves the resource synced its source
 	// to a revision; it does not show what changed in that revision, so the
@@ -229,9 +235,9 @@ type Enrichment struct {
 	// evidence the alert is about, so it is surfaced as its own finding rather
 	// than only mentioned inside UnhealthyPods.
 	RecentRestarts []string
-	// Ambient is cluster-wide context gathered when the alert names no subject
-	// to scope to. It is NOT known to concern the alert, and is kept apart so a
-	// coincidence is not read as a cause.
+	// Ambient is context not known to concern the alert: cluster-wide findings
+	// when no namespace is named, and namespace events outside a resolved subject
+	// graph. It is kept apart so a coincidence is not read as a cause.
 	Ambient []string
 	// InspectedJobs names the Jobs whose existence and state were read directly
 	// because an alert in the group named them (e.g. a kube-state-metrics
@@ -359,25 +365,33 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 
 	// A KubeJobFailed alert names the failed Job, not a pod, so the pod-label
 	// pass above finds nothing. Resolve each namespaced job the group's alerts
-	// name; the job's uid identifies the pods it created (their ownerReferences
-	// point at it), and those become direct targets too. Without this the
-	// enrichment would only ever list the whole namespace and could truthfully
-	// report "no unhealthy pods in scope" while never inspecting the job's own
-	// pod as the subject. The owned-pod promotion is done inside the namespace
-	// listing loop below, because the pods to attribute come from that listing.
+	// name; the job's UID identifies the pods it created (their ownerReferences
+	// point at it), and those become direct targets too.
 	jobTargets := k.resolveJobs(ctx, g)
 	for _, j := range jobTargets {
 		e.InspectedJobs = append(e.InspectedJobs, j.Namespace+"/"+j.Name)
 	}
-	// Sort so the scope statement is stable across runs (jobTargets is a map).
+	// jobTargets is a map, so preserve a stable scope statement across runs.
 	sort.Strings(e.InspectedJobs)
 	if len(e.InspectedJobs) > 0 {
-		// The "jobs ns/j1, ns/j2 were inspected" half of the scope statement
-		// is appended (and only when a job actually resolved), so a reader can
-		// distinguish a failed job that was inspected from a namespace that
-		// merely was.
+		// Name only Jobs read directly, distinguishing them from a namespace listing.
 		e.Scope += "; jobs " + strings.Join(e.InspectedJobs, ", ") + " were inspected"
 	}
+
+	resolvedSubjects := map[subjectKey]bool{}
+	for _, a := range g.Alerts {
+		ns := a.namespace()
+		if ns == "" {
+			continue
+		}
+		if pod := a.Labels["pod"]; pod != "" {
+			resolvedSubjects[subjectKey{kind: "Pod", name: pod, namespace: ns}] = true
+		}
+	}
+	for _, j := range jobTargets {
+		resolvedSubjects[subjectKey{kind: "Job", name: j.Name, namespace: j.Namespace}] = true
+	}
+	e.EventsScoped = len(resolvedSubjects) > 0
 
 	var seenPods []podRef
 	for _, ns := range g.Namespaces {
@@ -442,8 +456,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				continue
 			}
 			for _, p := range pods.Items {
-				if jobOwnedBy(*j, podOwner{Labels: p.Metadata.Labels, OwnerReferences: p.Metadata.OwnerReferences}) {
+				owner := podOwner{Labels: p.Metadata.Labels, OwnerReferences: p.Metadata.OwnerReferences}
+				if jobOwnedBy(*j, owner) {
 					targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
+					resolvedSubjects[subjectKey{kind: "Pod", name: p.Metadata.Name, namespace: p.Metadata.Namespace}] = true
 				}
 			}
 		}
@@ -461,7 +477,14 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
 		}
 
-		e.Events = append(e.Events, k.warningEvents(ctx, esc, since)...)
+		if items, err := k.fetchEvents(ctx, ns); err == nil {
+			e.Events = append(e.Events, aggregateEvents(items, since, func(subject subjectKey) bool {
+				return resolvedSubjects[subject]
+			})...)
+			e.Ambient = append(e.Ambient, aggregateEvents(items, since, func(subject subjectKey) bool {
+				return !resolvedSubjects[subject]
+			})...)
+		}
 		e.FluxActivity = append(e.FluxActivity, k.fluxActivity(ctx, esc, since)...)
 	}
 
@@ -558,10 +581,10 @@ func jobOwnedBy(j jobRef, p podOwner) bool {
 		return true
 	}
 	if hasJobOwner {
-		// Ownership was determinable but no reference pointed at this job.
+		// Ownership is known but points at another Job, so labels cannot override it.
 		return false
 	}
-	// No Job owner reference at all, so ownership cannot be established.
+	// Without a Job owner reference, the controller label is the best fallback.
 	if j.ControllerKey != "" && j.LabelValue != "" {
 		return p.Labels[j.ControllerKey] == j.LabelValue
 	}
@@ -597,20 +620,29 @@ func (k *kube) unhealthyNodes(ctx context.Context) []string {
 	return out
 }
 
-// warningEvents returns recent non-Normal events. An empty namespace widens the
-// query to the whole cluster.
-func (k *kube) warningEvents(ctx context.Context, namespace string, since time.Time) []string {
+type subjectKey struct {
+	kind      string
+	name      string
+	namespace string
+}
+
+func (k *kube) fetchEvents(ctx context.Context, namespace string) ([]eventItem, error) {
 	path := "/api/v1/events?fieldSelector=type!=Normal"
 	if namespace != "" {
-		path = "/api/v1/namespaces/" + namespace + "/events?fieldSelector=type!=Normal"
+		path = "/api/v1/namespaces/" + url.PathEscape(namespace) + "/events?fieldSelector=type!=Normal"
 	}
 	var events eventList
 	if err := k.get(ctx, path, &events); err != nil {
 		logf("enrich: events (%s): %v", orAll(namespace), err)
-		return nil
+		return nil, err
 	}
-	// One stuck condition emits the same event against dozens of objects. Listing
-	// each is noise, so collapse by reason and object kind and report the count.
+	return events.Items, nil
+}
+
+// aggregateEvents collapses repeated warning events by reason and object kind.
+// keep filters event subjects so callers can split direct evidence from ambient context.
+func aggregateEvents(items []eventItem, since time.Time, keep func(subjectKey) bool) []string {
+	// One stuck condition emits the same event against many objects; report its count.
 	type agg struct {
 		count   int
 		kind    string
@@ -619,8 +651,15 @@ func (k *kube) warningEvents(ctx context.Context, namespace string, since time.T
 	}
 	seen := map[string]*agg{}
 	var order []string
-	for _, ev := range events.Items {
+	for _, ev := range items {
 		if ev.LastTimestamp.Before(since) {
+			continue
+		}
+		if keep != nil && !keep(subjectKey{
+			kind:      ev.InvolvedObject.Kind,
+			name:      ev.InvolvedObject.Name,
+			namespace: ev.InvolvedObject.Namespace,
+		}) {
 			continue
 		}
 		key := ev.Reason + "/" + ev.InvolvedObject.Kind
@@ -642,6 +681,16 @@ func (k *kube) warningEvents(ctx context.Context, namespace string, since time.T
 			strings.SplitN(key, "/", 2)[0], a.count, a.kind, a.example, a.sample))
 	}
 	return out
+}
+
+// warningEvents returns all recent non-Normal events in scope. An empty
+// namespace widens the query to the whole cluster.
+func (k *kube) warningEvents(ctx context.Context, namespace string, since time.Time) []string {
+	items, err := k.fetchEvents(ctx, namespace)
+	if err != nil {
+		return nil
+	}
+	return aggregateEvents(items, since, nil)
 }
 
 // podLogTail is the maximum number of lines to fetch per unhealthy pod.

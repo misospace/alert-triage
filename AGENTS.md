@@ -92,9 +92,10 @@ dropped because a routine sync transitions everything at once — that is noise,
 not signal, which is different from useful data being inconvenient.
 
 **Ambient context is fenced off.** Cluster-wide findings gathered when an alert
-names no namespace go in `Enrichment.Ambient`, render under `BACKGROUND`, and
-never reach Discord. They exist so the model can rule things out. Without the
-fence it offers coincidences as causes.
+names no namespace, and namespace warning events outside the resolved alert
+subject graph, go in `Enrichment.Ambient`, render under `BACKGROUND`, and never
+reach Discord. They exist so the model can rule things out. Without the fence it
+offers coincidences as causes.
 
 **Absence is a finding.** Empty sections render as explicit negatives ("all nodes
 Ready"), never as silence. Silence reads to a model as missing data and produces
