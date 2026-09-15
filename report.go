@@ -106,8 +106,11 @@ Rules:
   "if X also runs there, it may be worth checking". Mention it only when it
   names the same resource, node or namespace as the alert - and then say plainly
   that it does. Otherwise leave it out entirely.
-- If a Flux resource reconciled or went NotReady near the alert, say so - a
-  recent deploy is the first thing worth ruling out.
+- If a Flux resource was NotReady near the alert, say so - a failed sync is
+  primary evidence. If a healthy Flux resource merely "reconciled at revision"
+  near the alert, that is only a neutral note that its source was applied at
+  that revision - it is not evidence the workload was deployed or its
+  configuration changed, so never call it a deploy, a change, or a trigger.
 
 Also decide where a fix would have to be made. The cluster is managed by GitOps:
 a commit to the repository is reconciled onto it automatically.
@@ -341,7 +344,7 @@ func renderEvidence(r Report) string {
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, "no warning events in the window")
-	writeFinding(&b, "Recent Flux activity", r.Enrichment.RecentChanges, "no reconciles or failures in the window, so a recent deploy is unlikely")
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
@@ -569,7 +572,7 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 		}
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
-	writeDiscordSection(&desc, "Recent changes", r.Enrichment.RecentChanges)
+	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
 
 	// Grafana Explore links: own construction, so it lives outside the
 	// untrusted fence; emitted only when GRAFANA_URL and the relevant
