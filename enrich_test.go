@@ -1300,3 +1300,97 @@ func TestJobOwnedByFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestEnrichScopesResolvedJobAndOwnedPodEvents(t *testing.T) {
+	eventTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	var eventHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[
+				{"metadata":{"name":"backup-0","namespace":"ns1","labels":{"job-name":"backup"}},"status":{"phase":"Failed","containerStatuses":[{"name":"job","ready":false,"state":{"terminated":{"reason":"Error"}}}]}},
+				{"metadata":{"name":"notifier-0","namespace":"ns1"},"status":{"phase":"Running","containerStatuses":[{"name":"notifier","ready":true,"state":{"running":{}}}]}}
+			]}`)
+		case strings.Contains(r.URL.Path, "/jobs/"):
+			_, _ = io.WriteString(w, `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`)
+		case strings.Contains(r.URL.Path, "/events"):
+			eventHits++
+			_, _ = io.WriteString(w, `{"items":[
+				{"reason":"BackoffLimitExceeded","message":"job failed","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"Job","name":"backup","namespace":"ns1"}},
+				{"reason":"BackoffLimitExceeded","message":"job failed","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"Job","name":"backup","namespace":"ns1"}},
+				{"reason":"Failed","message":"pod failed","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"Pod","name":"backup-0","namespace":"ns1"}},
+				{"reason":"FailedMount","message":"unrelated pvc","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"PersistentVolumeClaim","name":"data","namespace":"ns1"}},
+				{"reason":"Failed","message":"unrelated pod","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"Pod","name":"notifier-0","namespace":"ns1"}},
+				{"reason":"AlertFiring","message":"unrelated alert","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"Alert","name":"other","namespace":"ns1"}}
+			]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}},
+			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	if !en.EventsScoped {
+		t.Fatal("resolved job should scope events")
+	}
+	if eventHits != 1 {
+		t.Fatalf("expected one event fetch for the namespace, got %d", eventHits)
+	}
+	if len(en.Events) != 2 || !strings.Contains(en.Events[0], "BackoffLimitExceeded x2") || !strings.Contains(en.Events[1], "backup-0") {
+		t.Fatalf("expected aggregated Job and owned Pod evidence, got %v", en.Events)
+	}
+	if len(en.Ambient) != 3 {
+		t.Fatalf("expected unrelated PVC, Pod, and Alert events in ambient, got %v", en.Ambient)
+	}
+	for _, item := range en.Events {
+		if strings.Contains(item, "data") || strings.Contains(item, "notifier-0") || strings.Contains(item, "other") {
+			t.Errorf("unrelated event became primary evidence: %q", item)
+		}
+	}
+}
+
+func TestRenderScopedEventNegative(t *testing.T) {
+	got := renderEvidence(Report{Enrichment: Enrichment{EventsScoped: true}})
+	if !strings.Contains(got, "no warning events on the resolved subject in the window") {
+		t.Fatalf("missing scoped event negative: %s", got)
+	}
+}
+
+func TestEnrichNoSubjectEventsAreAmbient(t *testing.T) {
+	eventTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/events") {
+			_, _ = io.WriteString(w, `{"items":[{"reason":"FailedMount","message":"background pvc","lastTimestamp":"`+eventTime+`","involvedObject":{"kind":"PersistentVolumeClaim","name":"data","namespace":"ns1"}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}}}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	if en.EventsScoped || len(en.Events) != 0 {
+		t.Fatalf("no resolved subject must not have primary events: scoped=%v events=%v", en.EventsScoped, en.Events)
+	}
+	if len(en.Ambient) != 1 || !strings.Contains(en.Ambient[0], "PersistentVolumeClaim") {
+		t.Fatalf("namespace event should be ambient background, got %v", en.Ambient)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "BACKGROUND") || strings.Contains(got, "no warning events on the resolved subject in the window") {
+		t.Fatalf("fallback evidence should be broad/background, got %s", got)
+	}
+}
