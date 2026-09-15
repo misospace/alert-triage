@@ -108,12 +108,28 @@ Rules:
   that it does. Otherwise leave it out entirely.
 - If a Flux resource reconciled or went NotReady near the alert, say so - a
   recent deploy is the first thing worth ruling out.
+- "Declared identity" is the pod/container securityContext the spec declares:
+  the container's value overrides the pod's field by field, and a field that
+  neither sets is "unset". Never fill an unset field in - the image is not
+  evidence. The declared identity does not state on-disk file ownership or
+  mode, and the Kubernetes API does not expose those; you may combine a
+  declared non-root identity with PermissionDenied log lines, but you must
+  not report a stat result as if you had read the filesystem.
+- Same-claim siblings are other pods in the namespace that mount a Persistent
+  VolumeClaim the alert's target pod also mounts. They are comparison
+  context, not the alert's subject: do not call one the application. A
+  healthy same-claim sibling says the fault is specific to the target (a
+  permission or storage-mover problem), not a storage-wide outage; a
+  failing sibling says the serving workload is also unhealthy.
 
 Also decide where a fix would have to be made. The cluster is managed by GitOps:
 a commit to the repository is reconciled onto it automatically.
 
   git      - fixable by editing the repository alone: image tags, chart values,
-             resource limits, replicas, affinity, scheduling, config.
+             resource limits, replicas, affinity, scheduling, config, and the
+             securityContext (runAsUser/runAsGroup/fsGroup) the workload
+             declares - a mover that should write as root but declares a
+             non-root identity is fixed here.
   partial  - a repository change helps but does not finish the job; some manual
              action against the cluster or hardware is still required.
   cluster  - needs an action against the cluster or hardware and no repository
@@ -312,6 +328,10 @@ func renderEvidence(r Report) string {
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
 	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
+	writeFinding(&b, "Pod execution identity and PVC mounts", podIDLines(r.Enrichment.PodID),
+		"the alert named no pod, or none carried a declared securityContext or PVC mount")
+	writeFinding(&b, "Same-claim siblings (comparison context only)", r.Enrichment.PVCSiblings,
+		"no other pod in scope mounts a claim the alert's pod mounts")
 	if len(r.Enrichment.PodLogs) > 0 {
 		b.WriteString("\nPod logs (previous container tail):\n")
 		b.WriteString(untrustedBegin + "\n")
@@ -448,6 +468,24 @@ func orUnknown(s string) string {
 	return s
 }
 
+// podIDLines returns the pod-identity lines in sorted key order so the
+// rendered evidence is deterministic across runs.
+func podIDLines(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, m[k])
+	}
+	return out
+}
+
 // boilerplateLabels carry no meaning for a reader; everything else is shown,
 // because the label that disambiguates an alert is often domain-specific
 // (litellm_model_name, device, mountpoint) and cannot be enumerated up front.
@@ -547,6 +585,8 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	}
 	writeDiscordSection(&desc, "Unhealthy nodes", r.Enrichment.Nodes)
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
+	writeDiscordSection(&desc, "Pod identity & PVC mounts", podIDLines(r.Enrichment.PodID))
+	writeDiscordSection(&desc, "Same-claim siblings", r.Enrichment.PVCSiblings)
 	if len(r.Enrichment.PodLogs) > 0 {
 		desc.WriteString("**Pod logs (previous container tail)**\n")
 		for podKey, log := range r.Enrichment.PodLogs {
