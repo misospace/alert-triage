@@ -526,7 +526,7 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	gh := newGitHub(cfg)
 	var ghAction issueAction
 	if gh != nil && r.Triage.Actionable() {
-		ghCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ghCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		act, err := deliverGitHub(ghCtx, gh, cfg, r)
 		cancel()
 		if err != nil {
@@ -656,8 +656,8 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	// proposal-only; the error is swallowed so it can never fail a delivery
 	// that already succeeded.
 	if cfg.GitHubPR != nil && cfg.GitHubPR.OptIn && gh != nil && prEligible(r.Triage) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if _, err := deliverPull(ctx, gh, cfg.GitHubPR, r); err != nil {
+		prCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if _, err := deliverPull(prCtx, gh, cfg.GitHubPR, r); err != nil {
 			logf("github-pr: %v", err)
 		}
 		cancel()

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -435,5 +436,45 @@ func TestCreateIssueBodyShape(t *testing.T) {
 	}
 	if payload["title"] != "title-x" || payload["body"] != "body-y" {
 		t.Fatalf("payload mismatch: %#v", payload)
+	}
+}
+
+// A stalled GitHub API must not hold the delivery loop for the full 30s
+// budget: cancelling the caller's context — as a SIGTERM drain does — must
+// abort the in-flight request promptly. The GitHub client Deliver builds is
+// fixed to api.github.com, so this drives the arm directly against a blocked
+// server with the same 100ms-cancel / <200ms shape as the Discord arm's
+// TestDeliverContextCancelledInFlight (issue #145).
+func TestDeliverGitHubContextCancelledInFlight(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hold the connection open without responding so the request is
+		// in flight; releasing it lets the handler finish and srv.Close()
+		// does not wait on the connection.
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfg := &Config{GitHubRepo: "owner/repo", GitHubToken: "tok"}
+	g := newGitHub(cfg)
+	g.apiURL = srv.URL
+	r := Report{Group: Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")}, Triage: Triage{FixLocation: "git"}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := deliverGitHub(ctx, g, cfg, r)
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("deliverGitHub took %v after context cancellation, want < 200ms", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected error on context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context cancellation error, got %v", err)
 	}
 }

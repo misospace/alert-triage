@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1077,5 +1078,43 @@ func TestDeliverPullRefusesSymlinkTarget(t *testing.T) {
 	f.mu.Unlock()
 	if n != 0 {
 		t.Errorf("a symlink target must not create a branch, got %d", n)
+	}
+}
+
+// A stalled GitHub PR API must not hold the delivery loop for the full 30s
+// budget: cancelling the caller's context — as a SIGTERM drain does — must
+// abort the in-flight request promptly. This mirrors the issue arm's
+// TestDeliverGitHubContextCancelledInFlight and the Discord arm's
+// TestDeliverContextCancelledInFlight (issue #145); the PR arm's first call
+// is the /pulls list, so a blocked server there is enough to hold it.
+func TestDeliverPullContextCancelledInFlight(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hold the connection open without responding so the /pulls list
+		// request is in flight; releasing it lets srv.Close() not wait.
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: &http.Client{}, apiURL: srv.URL}
+
+	r := triageReport()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := deliverPull(ctx, g, prCfg(), r)
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("deliverPull took %v after context cancellation, want < 200ms", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected error on context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context cancellation error, got %v", err)
 	}
 }
