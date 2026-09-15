@@ -564,3 +564,80 @@ func TestSanitizeFenceContentLegitLogs(t *testing.T) {
 		t.Fatalf("quad backtick not reduced: got %q", got)
 	}
 }
+
+// A Ready=True Flux transition inside the window must be rendered with neutral
+// wording: it proves the source was applied at a revision, not that this
+// workload changed. A healthy reconcile is not a deploy.
+func TestHealthyFluxReconcileIsNotASignaledDeploy(t *testing.T) {
+	rpt := Report{
+		Group: Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "DiskPressure", "severity": "warning"}}}},
+		Enrichment: Enrichment{
+			FluxActivity: []string{"llm/kustomization-llm reconciled at revision main@0982756"},
+		},
+	}
+	out := renderEvidence(rpt)
+	if !strings.Contains(out, "reconciled at revision") {
+		t.Errorf("healthy reconcile should still surface, neutrally worded:\n%s", out)
+	}
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(strings.ToLower(out), word) {
+			t.Errorf("healthy-reconcile evidence must not claim a %q:\n%s", word, out)
+		}
+	}
+}
+
+// A healthy Flux reconcile plus an otherwise unrelated alert must not produce
+// evidence text calling it a recent deploy or configuration change. The
+// untrusted alert text carries the deploy wording; the findings section must
+// not echo it.
+func TestHealthyFluxReconcileCannotClaimWorkloadChange(t *testing.T) {
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "PodCrashLooping", "severity": "warning"},
+		Annotations: map[string]string{"summary": "pod crashed - likely a recent deploy"},
+	}
+	g := Correlate([]Alert{alert}, nil, DefaultSignatures(), time.Minute)[0]
+	rpt := Report{
+		Group: g,
+		Enrichment: Enrichment{
+			FluxActivity: []string{"llm/kustomization-llm reconciled at revision main@0982756"},
+		},
+	}
+	out := renderEvidence(rpt)
+
+	// The alert's own deploy claim must stay present (it is the alert's text,
+	// quoted), so the test actually exercises the case.
+	if !strings.Contains(out, "recent deploy") {
+		t.Fatalf("the alert's own deploy claim should be present:\n%s", out)
+	}
+	// The alert text is fenced as untrusted, so its "deploy" wording is not a
+	// finding.
+	if !strings.Contains(out, untrustedBegin) {
+		t.Fatalf("alert text should be fenced as untrusted:\n%s", out)
+	}
+	// Evidence text outside the alert fence must not carry deploy wording.
+	after := out[strings.Index(out, "EVIDENCE"):]
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(strings.ToLower(after), word) {
+			t.Errorf("evidence outside the alert fence must not call a healthy reconcile a %q:\n%s", word, after)
+		}
+	}
+}
+
+// A NotReady Flux resource must remain a strong primary failure signal, with
+// its own reason and revision preserved verbatim.
+func TestNotReadyFluxResourceStaysFailureSignal(t *testing.T) {
+	rpt := Report{
+		Group: Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "PodCrashLooping", "severity": "warning"}}}},
+		Enrichment: Enrichment{
+			FluxActivity: []string{"llm/kustomization-llm NOT READY: ReconciliationFailed rev=main@0982756"},
+		},
+	}
+	out := renderEvidence(rpt)
+	if !strings.Contains(out, "NOT READY: ReconciliationFailed") {
+		t.Errorf("NotReady Flux resource must keep its failure reason:\n%s", out)
+	}
+	if !strings.Contains(out, "rev=main@0982756") {
+		t.Errorf("NotReady Flux resource must keep its revision:\n%s", out)
+	}
+}

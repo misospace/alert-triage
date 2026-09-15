@@ -54,7 +54,7 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})
 
 	// Absence must read as a ruled-out cause, never as missing data.
-	for _, want := range []string{"all nodes Ready", "no warning events", "recent deploy is unlikely"} {
+	for _, want := range []string{"all nodes Ready", "no warning events", "no Flux reconciles or failures in the window"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, out)
 		}

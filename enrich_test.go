@@ -786,3 +786,147 @@ func TestFetchPodLogsContextCancelled(t *testing.T) {
 		t.Fatal("fetchPodLogs did not return promptly after context cancellation")
 	}
 }
+
+// fluxItem is one Flux object in a test apiserver. kind routes it to the
+// helmreleases or kustomizations endpoint; status is the Ready condition's
+// status value.
+func fluxItem(t *testing.T, ns, name, kind, rev, transition, status string) map[string]any {
+	t.Helper()
+	return map[string]any{
+		"kind":     kind,
+		"metadata": map[string]any{"name": name, "namespace": ns},
+		"status": map[string]any{
+			"lastAppliedRevision": rev,
+			"conditions": []map[string]any{{
+				"type":               "Ready",
+				"status":             status,
+				"reason":             "Succeeded",
+				"lastTransitionTime": transition,
+			}},
+		},
+	}
+}
+
+// fluxServer builds a test apiserver that serves one Flux list for each of
+// the helmreleases and kustomizations endpoints, routing each item to the
+// endpoint named by its "kind" (as the real apiserver would).
+func fluxServer(t *testing.T, items ...map[string]any) *httptest.Server {
+	t.Helper()
+	helm, kust := []map[string]any{}, []map[string]any{}
+	for _, it := range items {
+		if it["kind"] == "helmreleases" {
+			helm = append(helm, it)
+		} else {
+			kust = append(kust, it)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		items := kust
+		if strings.Contains(r.URL.Path, "helmreleases") {
+			items = helm
+		} else if !strings.Contains(r.URL.Path, "kustomizations") {
+			http.NotFound(w, r)
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{"items": items})
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A healthy (Ready=True) Flux transition inside the window must be surfaced
+// with neutral wording - "reconciled at revision ..." - never as a deploy,
+// change or trigger. A new repo SHA does not prove the workload changed.
+func TestFluxActivityHealthyReconcileIsNeutral(t *testing.T) {
+	rev := "main@0982756e1a2b3c4d5e6f"
+	srv := fluxServer(t,
+		fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), "True"),
+	)
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if len(got) != 1 {
+		t.Fatalf("expected one healthy-reconcile line, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "reconciled at revision") {
+		t.Errorf("healthy reconcile should be neutrally worded, got %q", got[0])
+	}
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(strings.ToLower(got[0]), word) {
+			t.Errorf("healthy reconcile must not claim a %q, got %q", word, got[0])
+		}
+	}
+}
+
+// A healthy reconcile that happened outside the window must not be surfaced
+// at all, even when the alert names a namespace.
+func TestFluxActivityHealthyReconcileOutsideWindowIsDropped(t *testing.T) {
+	rev := "main@0982756e1a2b3c4d5e6f"
+	old := time.Now().Add(-10 * time.Hour).UTC().Format(time.RFC3339)
+	srv := fluxServer(t, fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, old, "True"))
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if len(got) != 0 {
+		t.Fatalf("a healthy reconcile outside the window must not surface, got %v", got)
+	}
+}
+
+// A NotReady Flux resource is strong primary evidence: the reason and the
+// revision must be kept verbatim, and the failure must survive even in the
+// cluster-wide (ambient) scope.
+func TestFluxActivityNotReadyIsFailureSignal(t *testing.T) {
+	rev := "main@0982756e1a2b3c4d5e6f"
+	now := time.Now().UTC().Format(time.RFC3339)
+	srv := fluxServer(t, fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, now, "False"))
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if len(got) != 1 {
+		t.Fatalf("expected one NotReady line, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "NOT READY: Succeeded") {
+		t.Errorf("NotReady must keep its reason, got %q", got[0])
+	}
+	if !strings.Contains(got[0], "rev="+shortRev(rev)) {
+		t.Errorf("NotReady must keep its revision, got %q", got[0])
+	}
+
+	// NotReady must also survive in the cluster-wide (ambient) scope: a
+	// healthy sync is noise there, a failure is not.
+	srv2 := fluxServer(t,
+		fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, now, "False"),
+		fluxItem(t, "llm", "kustomization-healthy", "kustomizations", "main@11112222333344445555", now, "True"),
+	)
+	k2 := &kube{base: srv2.URL, token: "tok", hc: srv2.Client()}
+	ambient := k2.fluxActivity(context.Background(), "", time.Now().Add(-time.Hour))
+	if len(ambient) != 1 {
+		t.Fatalf("cluster-wide scope must keep only the NotReady line, got %v", ambient)
+	}
+	if !strings.Contains(ambient[0], "NOT READY") {
+		t.Errorf("cluster-wide scope must keep the failure, got %q", ambient[0])
+	}
+}
+
+// A healthy reconcile at a new revision must not be labelled a "change": the
+// Enrichment field carrying these findings must not use change-encoding names
+// in its rendered form either.
+func TestEnrichmentFluxActivityNotChanges(t *testing.T) {
+	rev := "main@0982756e1a2b3c4d5e6f"
+	srv := fluxServer(t, fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, time.Now().UTC().Format(time.RFC3339), "True"))
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	g := Group{
+		Key:        "single/A",
+		Namespaces: []string{"llm"},
+		Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "llm"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	if len(en.FluxActivity) == 0 {
+		t.Fatalf("expected a FluxActivity entry, got %+v", en)
+	}
+	joined := strings.ToLower(strings.Join(en.FluxActivity, " "))
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(joined, word) {
+			t.Errorf("FluxActivity must not claim a %q, got %q", word, joined)
+		}
+	}
+}

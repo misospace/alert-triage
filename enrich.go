@@ -170,10 +170,14 @@ type Enrichment struct {
 	// BackendLogs are workload-authored and untrusted. BackendState is
 	// "off", "empty", or "error" so missing configuration is not confused with
 	// a successful query that returned no lines.
-	BackendLogs   []string
-	BackendState  string
-	Events        []string
-	RecentChanges []string
+	BackendLogs  []string
+	BackendState string
+	Events       []string
+	// FluxActivity lists recent transitions of Flux resources in the alert's
+	// namespace. A Ready transition only proves the resource synced its source
+	// to a revision; it does not show what changed in that revision, so the
+	// entries must never be phrased as a deploy or a change.
+	FluxActivity []string
 	// RecentRestarts flags pods whose containers restarted inside the alert
 	// window. A restart that left the current container healthy is still
 	// evidence the alert is about, so it is surfaced as its own finding rather
@@ -196,7 +200,7 @@ type Enrichment struct {
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
 		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
-		len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
+		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -248,8 +252,8 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 	return out
 }
 
-// Enrich gathers cluster state and recent GitOps changes for a group. Failures
-// degrade the digest rather than block it: a partial story beats none.
+// Enrich gathers cluster state and recent Flux transitions for a group.
+// Failures degrade the digest rather than block it: a partial story beats none.
 //
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
@@ -285,7 +289,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		// findings about this alert, and is kept separate so it cannot be
 		// mistaken for one.
 		e.Ambient = append(e.Ambient, k.warningEvents(ctx, "", since)...)
-		e.Ambient = append(e.Ambient, k.fluxNotReady(ctx, "", since)...)
+		e.Ambient = append(e.Ambient, k.fluxActivity(ctx, "", since)...)
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
 	} else {
 		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
@@ -371,7 +375,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 
 		e.Events = append(e.Events, k.warningEvents(ctx, esc, since)...)
-		e.RecentChanges = append(e.RecentChanges, k.fluxNotReady(ctx, esc, since)...)
+		e.FluxActivity = append(e.FluxActivity, k.fluxActivity(ctx, esc, since)...)
 	}
 
 	e.Nodes = capList(e.Nodes, 6)
@@ -393,7 +397,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.BackendState = "off"
 	}
 	e.Events = capList(dedupe(e.Events), 8)
-	e.RecentChanges = capList(dedupe(e.RecentChanges), 6)
+	e.FluxActivity = capList(dedupe(e.FluxActivity), 6)
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
 	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
@@ -537,14 +541,22 @@ func (k *kube) fetchPodLogs(ctx context.Context, pods []string) map[string]strin
 	return logs
 }
 
-// fluxNotReady reports Flux resources that are failing, and - only when scoped
-// to a namespace - ones that reconciled inside the window.
+// fluxActivity reports Flux resources that are failing, and - only when
+// scoped to a namespace - ones whose Ready condition transitioned inside the
+// window.
 //
 // Cluster-wide reconciles are worthless: a routine sync of the whole repo
-// transitions every resource at once, so "did a deploy cause this?" turns into
-// a listing of 150 healthy Kustomizations. A reconcile is a signal only when it
-// happened in the namespace the alert is about.
-func (k *kube) fluxNotReady(ctx context.Context, namespace string, since time.Time) []string {
+// transitions every resource at once, so a healthy-reconcile listing turns
+// into 150 lines of noise. A transition is a signal only when it happened in
+// the namespace the alert is about.
+//
+// The wording of a healthy transition must stay neutral. "reconciled at
+// revision X" says only that Flux applied a sync at revision X; whether any
+// file affecting the workload changed in that revision is not known from the
+// revision number alone, so this function must not call a sync a deploy or a
+// change. A NotReady transition is a failure, and it keeps the resource's own
+// reason and revision verbatim.
+func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Time) []string {
 	scoped := namespace != ""
 	apis := []string{
 		"/apis/helm.toolkit.fluxcd.io/v2/helmreleases",
@@ -570,12 +582,19 @@ func (k *kube) fluxNotReady(ctx context.Context, namespace string, since time.Ti
 				if c.Status == "True" && (!scoped || !c.LastTransitionTime.After(since)) {
 					continue
 				}
-				state := "reconciled recently"
+				rev := shortRev(item.Status.LastAppliedRevision)
 				if c.Status != "True" {
-					state = "NOT READY: " + c.Reason
+					// NotReady: a failed sync. Keep the resource's own reason
+					// and revision verbatim - strong primary evidence.
+					out = append(out, fmt.Sprintf("%s/%s NOT READY: %s rev=%s",
+						item.Metadata.Namespace, item.Metadata.Name, c.Reason, rev))
+					continue
 				}
-				out = append(out, fmt.Sprintf("%s/%s %s rev=%s",
-					item.Metadata.Namespace, item.Metadata.Name, state, shortRev(item.Status.LastAppliedRevision)))
+				// Ready: a healthy sync of the latest revision. Neutral
+				// wording - it proves the source was applied, not that this
+				// workload changed.
+				out = append(out, fmt.Sprintf("%s/%s reconciled at revision %s",
+					item.Metadata.Namespace, item.Metadata.Name, rev))
 			}
 		}
 	}
