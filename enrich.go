@@ -82,33 +82,221 @@ func (k *kube) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// podList is the pod collection for a namespace, carrying everything a
+// permission or storage hypothesis can be grounded in: the declared execution
+// identity (pod- and container-level securityContext) and which PersistentVolumeClaims
+// each container mounts. Only read access to pod metadata is used; this is
+// spec/status as the API served it — the API does not expose on-disk file
+// ownership or mode, and nothing here claims to.
 type podList struct {
-	Items []struct {
-		Metadata struct {
-			Name        string            `json:"name"`
-			Namespace   string            `json:"namespace"`
-			Annotations map[string]string `json:"annotations"`
-		} `json:"metadata"`
-		Spec struct {
-			NodeName string `json:"nodeName"`
-		} `json:"spec"`
-		Status struct {
-			Phase             string `json:"phase"`
-			ContainerStatuses []struct {
-				Name         string `json:"name"`
-				RestartCount int    `json:"restartCount"`
-				Ready        bool   `json:"ready"`
-				State        map[string]struct {
-					Reason string `json:"reason"`
-				} `json:"state"`
-				LastTerminationState struct {
-					Terminated struct {
-						FinishedAt time.Time `json:"finishedAt"`
-					} `json:"terminated"`
-				} `json:"lastState"`
-			} `json:"containerStatuses"`
-		} `json:"status"`
-	} `json:"items"`
+	Items []podItem `json:"items"`
+}
+
+type podItem struct {
+	Metadata struct {
+		Name        string            `json:"name"`
+		Namespace   string            `json:"namespace"`
+		Annotations map[string]string `json:"annotations"`
+	} `json:"metadata"`
+	Spec struct {
+		NodeName string          `json:"nodeName"`
+		Security *containerID    `json:"securityContext"`
+		Volumes  []podVolumeItem `json:"volumes"`
+	} `json:"spec"`
+	Status struct {
+		Phase             string            `json:"phase"`
+		ContainerStatuses []containerStatus `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+// podVolumeItem maps a volume name to its PVC claim, the only volume kind
+// that matters for permission hypotheses. Non-PVC volumes carry no claim and
+// are dropped, so a pod with only emptyDir mounts has an empty map, not a
+// claim that was guessed.
+type podVolumeItem struct {
+	Name string `json:"name"`
+	PVC  *struct {
+		ClaimName string `json:"claimName"`
+	} `json:"persistentVolumeClaim"`
+}
+
+// containerID holds the declared execution identity fields relevant to file
+// access. Fields are pointer-typed so an absent value reads as "unset" rather
+// than 0 (root) — a pod that never declared runAsUser must not be reported as
+// running as root.
+type containerID struct {
+	RunAsUser    *int64 `json:"runAsUser"`
+	RunAsGroup   *int64 `json:"runAsGroup"`
+	FSGroup      *int64 `json:"fsGroup"`
+	RunAsNonRoot *bool  `json:"runAsNonRoot"`
+}
+
+func idInt(v *int64) string {
+	if v == nil {
+		return "unset"
+	}
+	return itoa(int(*v))
+}
+
+func (c *containerID) format() (runAsUser, runAsGroup, fsGroup string, runAsNonRoot bool) {
+	if c == nil {
+		return "unset", "unset", "unset", false
+	}
+	runAsUser = idInt(c.RunAsUser)
+	runAsGroup = idInt(c.RunAsGroup)
+	fsGroup = idInt(c.FSGroup)
+	if c.RunAsNonRoot != nil {
+		runAsNonRoot = *c.RunAsNonRoot
+	}
+	return
+}
+
+// effective returns the identity a container actually declares, following the
+// Kubernetes precedence: the container's securityContext overrides the pod's
+// field by field, and a field neither sets stays unset. It is the declared
+// identity only — the API says nothing about what the image runs as when no
+// value is set, so nothing is guessed.
+func (c *containerStatus) effective(pod *containerID) containerID {
+	e := containerID{}
+	if c.Security != nil && c.Security.RunAsUser != nil {
+		e.RunAsUser = c.Security.RunAsUser
+	} else if pod != nil {
+		e.RunAsUser = pod.RunAsUser
+	}
+	if c.Security != nil && c.Security.RunAsGroup != nil {
+		e.RunAsGroup = c.Security.RunAsGroup
+	} else if pod != nil {
+		e.RunAsGroup = pod.RunAsGroup
+	}
+	if pod != nil {
+		e.FSGroup = pod.FSGroup
+	}
+	if c.Security != nil && c.Security.RunAsNonRoot != nil {
+		e.RunAsNonRoot = c.Security.RunAsNonRoot
+	} else if pod != nil {
+		e.RunAsNonRoot = pod.RunAsNonRoot
+	}
+	return e
+}
+
+// podMount is one container's mount of a claim: the path and whether the
+// mount is read-only. The claim name is the map key on containerMounts' and
+// mount's results.
+type podMount struct {
+	Container string
+	Path      string
+	ReadOnly  bool
+}
+
+// pvcVolumes maps the pod's volume names to their PVC claim. Only PVC
+// volumes carry a claim; every other volume kind (emptyDir, hostPath, ...)
+// is dropped, so a pod with only emptyDir mounts has no claim, not one that
+// was guessed.
+func (p podItem) pvcVolumes() map[string]string {
+	out := map[string]string{}
+	for _, v := range p.Spec.Volumes {
+		if v.PVC != nil && v.PVC.ClaimName != "" {
+			out[v.Name] = v.PVC.ClaimName
+		}
+	}
+	return out
+}
+
+// containerMounts maps one container's volumeMounts to the PVC claims it
+// references, keyed by claim name. Unknown volume names yield no entry.
+func (p podItem) containerMounts(name string) map[string]podMount {
+	vols := p.pvcVolumes()
+	out := map[string]podMount{}
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Name != name {
+			continue
+		}
+		for _, m := range cs.Mounts {
+			if claim, ok := vols[m.VolumeName]; ok {
+				out[claim] = podMount{Container: cs.Name, Path: m.MountPath, ReadOnly: m.ReadOnly}
+			}
+		}
+	}
+	return out
+}
+
+// mount is the union of all containers' claim mounts, keyed by claim name;
+// the first container that mounts a claim wins. It backs claims, which is
+// what sibling discovery matches on.
+func (p podItem) mount() map[string]podMount {
+	out := map[string]podMount{}
+	for _, cs := range p.Status.ContainerStatuses {
+		for claim, m := range p.containerMounts(cs.Name) {
+			if _, ok := out[claim]; !ok {
+				out[claim] = m
+			}
+		}
+	}
+	return out
+}
+
+type containerStatus struct {
+	Name         string `json:"name"`
+	RestartCount int    `json:"restartCount"`
+	Ready        bool   `json:"ready"`
+	State        map[string]struct {
+		Reason string `json:"reason"`
+	} `json:"state"`
+	LastTerminationState struct {
+		Terminated struct {
+			FinishedAt time.Time `json:"finishedAt"`
+		} `json:"terminated"`
+	} `json:"lastState"`
+	Security *containerID      `json:"securityContext"`
+	Mounts   []volumeMountItem `json:"volumeMounts"`
+}
+
+type volumeMountItem struct {
+	VolumeName string `json:"name"`
+	MountPath  string `json:"mountPath"`
+	ReadOnly   bool   `json:"readOnly"`
+}
+
+// claims returns the set of PVC claims the pod's containers mount.
+func (p podItem) claims() map[string]bool {
+	out := map[string]bool{}
+	for claim := range p.mount() {
+		out[claim] = true
+	}
+	return out
+}
+
+// failing reports the containers that are not currently in the running state.
+// For a non-Succeeded pod every non-running container state (CrashLoopBackOff,
+// OOMKilled, ImagePullBackOff, a terminated crash, ...) is a failing container;
+// a healthy container in a Running pod is in the running state and is not
+// reported. Succeeded pods are never failing.
+func (p podItem) failing() map[string]bool {
+	if p.Status.Phase == "Succeeded" {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, cs := range p.Status.ContainerStatuses {
+		if _, running := cs.State["running"]; !running {
+			out[cs.Name] = true
+		}
+	}
+	return out
+}
+
+// ready summarizes the pod's container readiness in one string.
+func (p podItem) ready() string {
+	var running, ready, total int
+	for _, cs := range p.Status.ContainerStatuses {
+		total++
+		if _, ok := cs.State["running"]; ok {
+			running++
+		}
+		if cs.Ready {
+			ready++
+		}
+	}
+	return fmt.Sprintf("%d/%d ready, %d running", ready, total, running)
 }
 
 type eventList struct {
@@ -166,7 +354,20 @@ type nodeList struct {
 type Enrichment struct {
 	Nodes         []string
 	UnhealthyPods []string
-	PodLogs       map[string]string // pod key -> tail of previous container log
+	// PodID carries the declared execution identity and PVC mount
+	// relationships of the pods the alerts name, so permission hypotheses can
+	// be grounded in live spec data. The identity is what the pod declared —
+	// the API does not expose on-disk file ownership or mode, and nothing here
+	// claims to. Entries are "ns/pod" so the digest names the subject.
+	PodID map[string]string
+	// PVCSiblings is comparison context: other pods in the alert's namespaces
+	// that mount a claim one of the alert's target pods mounts, with their
+	// phase/readiness. It lets a healthy same-claim sibling distinguish
+	// "the mover failed" from "the serving workload is also unhealthy",
+	// without claiming the sibling is the application — a same-claim mount is
+	// a relationship, not proof of what the claim serves.
+	PVCSiblings []string
+	PodLogs     map[string]string // pod key -> tail of previous container log
 	// BackendLogs are workload-authored and untrusted. BackendState is
 	// "off", "empty", or "error" so missing configuration is not confused with
 	// a successful query that returned no lines.
@@ -193,8 +394,91 @@ type Enrichment struct {
 	RepoPaths []string
 }
 
+// sameClaimSibMax bounds the same-claim sibling list. A healthy sibling on the
+// same claim is the comparison that tells the operator whose failure it is,
+// but listing the whole namespace is exactly the namespace dump this evidence
+// is meant to avoid.
+const sameClaimSibMax = 3
+
+// podIdentities assembles the Enrichment.PodID lines. It works from the pods
+// already gathered for the group, so it adds no requests and no permissions:
+// the same read-only GETs as the rest of Enrich. For each pod the alerts name,
+// one line per failing container: the container, its effective declared
+// securityContext (Kubernetes precedence: the container's securityContext
+// overrides the pod's field by field, unset stays unset), and the PVC claims
+// its containers mount with the mount paths. The identity is the declared
+// identity only — the Kubernetes API does not expose on-disk file ownership
+// or mode, and no line claims to know it.
+func (k *kube) podIdentities(targetPods map[string]*podItem) map[string]string {
+	out := map[string]string{}
+	for _, key := range targetPodsSorted(targetPods) {
+		p := targetPods[key]
+		if p == nil {
+			continue // the alert named a pod the namespace list never returned
+		}
+		names := make([]string, 0, len(p.failing()))
+		for n := range p.failing() {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		if len(names) == 0 {
+			continue
+		}
+		var b strings.Builder
+		b.WriteString(key)
+		for i, n := range names {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			cs := p.containerStatus(n)
+			id := cs.effective(p.Spec.Security)
+			u, gr, fg, nr := id.format()
+			fmt.Fprintf(&b, "container %s (declared: runAsUser=%s runAsGroup=%s fsGroup=%s runAsNonRoot=%v)", n, u, gr, fg, nr)
+			claims := p.containerMounts(n)
+			claimNames := make([]string, 0, len(claims))
+			for c := range claims {
+				claimNames = append(claimNames, c)
+			}
+			sort.Strings(claimNames)
+			var mounts []string
+			for _, c := range claimNames {
+				m := claims[c]
+				mode := "read-write"
+				if m.ReadOnly {
+					mode = "read-only"
+				}
+				mounts = append(mounts, c+" at "+m.Path+" ("+mode+")")
+			}
+			if len(mounts) > 0 {
+				b.WriteString(", mounts " + strings.Join(mounts, ", "))
+			}
+		}
+		out[key] = b.String()
+	}
+	return out
+}
+
+func (p podItem) containerStatus(name string) *containerStatus {
+	for i := range p.Status.ContainerStatuses {
+		if p.Status.ContainerStatuses[i].Name == name {
+			return &p.Status.ContainerStatuses[i]
+		}
+	}
+	return nil
+}
+
+func targetPodsSorted(m map[string]*podItem) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
+		len(e.PodID) == 0 && len(e.PVCSiblings) == 0 &&
 		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
 		len(e.Events) == 0 && len(e.RecentChanges) == 0 && len(e.Ambient) == 0
 }
@@ -294,10 +578,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// Collect the pods the alerts actually name, so we can still fetch their
 	// previous-container logs when the current container has already recovered
 	// (e.g. an OOMKilled container that has been replaced by a healthy one).
-	targetPods := map[string]bool{}
+	targetPods := map[string]*podItem{}
 	for _, a := range g.Alerts {
 		if a.Labels["pod"] != "" && a.namespace() != "" {
-			targetPods[a.namespace()+"/"+a.Labels["pod"]] = true
+			targetPods[a.namespace()+"/"+a.Labels["pod"]] = new(podItem)
 		}
 	}
 
@@ -316,13 +600,17 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			key     string
 		}
 		var unhealthy []scoredPod
-		for _, p := range pods.Items {
+		for i := range pods.Items {
+			p := &pods.Items[i]
 			seenPods = append(seenPods, podRef{
 				Name:        p.Metadata.Name,
 				Namespace:   p.Metadata.Namespace,
 				Annotations: p.Metadata.Annotations,
 			})
 			key := p.Metadata.Namespace + "/" + p.Metadata.Name
+			if t, ok := targetPods[key]; ok {
+				*t = *p
+			}
 			for _, cs := range p.Status.ContainerStatuses {
 				reason := ""
 				for state, s := range cs.State {
@@ -335,7 +623,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				if p.Status.Phase == "Running" && cs.Ready && reason == "" {
 					// A recovered pod that the alert named still matters: its
 					// previous container's log is the evidence we want.
-					if !targetPods[key] && !restartedRecently {
+					if targetPods[key] == nil && !restartedRecently {
 						continue
 					}
 				}
@@ -359,8 +647,8 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		// Pull the pods the alert actually names to the front, so they survive
 		// truncation ahead of unrelated noise in the same namespace.
 		sort.SliceStable(unhealthy, func(i, j int) bool {
-			iTarget := targetPods[unhealthy[i].key]
-			jTarget := targetPods[unhealthy[j].key]
+			iTarget := targetPods[unhealthy[i].key] != nil
+			jTarget := targetPods[unhealthy[j].key] != nil
 			if iTarget != jTarget {
 				return iTarget
 			}
@@ -372,8 +660,47 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 
 		e.Events = append(e.Events, k.warningEvents(ctx, esc, since)...)
 		e.RecentChanges = append(e.RecentChanges, k.fluxNotReady(ctx, esc, since)...)
+
+		// Same-claim siblings: other pods in this namespace that mount a claim
+		// one of the alert's target pods mounts. The comparison is the diagnostic
+		// for permission failures: a mover that ran as a non-root UID against a
+		// claim whose data an application wrote as root is a hypothesis the spec
+		// alone supports, and a healthy sibling on the same claim tells the
+		// operator the failure is the mover, not the storage.
+		//
+		// Siblings are never labelled as the application. They mount the same
+		// claim; what workloads live on it is a relationship only the operator
+		// knows, and the prompt says so.
+		targetClaims := map[string]bool{}
+		for _, t := range targetPods {
+			if t == nil {
+				continue
+			}
+			for claim := range t.claims() {
+				targetClaims[claim] = true
+			}
+		}
+		sibSeen := map[string]bool{}
+		for _, p := range pods.Items {
+			if _, isTarget := targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name]; isTarget {
+				continue
+			}
+			for claim := range p.claims() {
+				if !targetClaims[claim] {
+					continue
+				}
+				k2 := claim + "\x00" + p.Metadata.Namespace + "/" + p.Metadata.Name
+				if sibSeen[k2] || len(e.PVCSiblings) >= sameClaimSibMax {
+					continue
+				}
+				sibSeen[k2] = true
+				e.PVCSiblings = append(e.PVCSiblings, fmt.Sprintf("same-claim %s: %s %s (%s)", claim, p.Metadata.Namespace+"/"+p.Metadata.Name, p.Status.Phase, p.ready()))
+			}
+		}
 	}
 
+	e.PodID = k.podIdentities(targetPods)
+	e.PVCSiblings = dedupe(e.PVCSiblings)
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)

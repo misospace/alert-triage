@@ -13,6 +13,64 @@ import (
 	"time"
 )
 
+// A group whose target pod carries a declared identity and a same-claim
+// sibling must render both as its own evidence section, so the model can
+// distinguish a mover failure from a storage-wide failure and a serving
+// workload that is also unhealthy.
+func TestRenderEvidencePodIDAndSiblings(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "namespace/ns1",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "JobFailed", "namespace": "ns1", "pod": "mover-abc"}}},
+		},
+		Enrichment: Enrichment{
+			PodID: map[string]string{
+				"ns1/mover-abc": "ns1/mover-abc container mover (declared: runAsUser=4000 runAsGroup=2000 fsGroup=3000 runAsNonRoot=false), mounts data-claim at /data (read-write)",
+			},
+			PVCSiblings: []string{
+				"same-claim data-claim: ns1/app-xyz Running (1/1 ready, 1 running)",
+			},
+		},
+	}
+	got := renderEvidence(rpt)
+	for _, want := range []string{
+		"Pod execution identity and PVC mounts",
+		"ns1/mover-abc container mover",
+		"runAsUser=4000",
+		"data-claim at /data (read-write)",
+		"Same-claim siblings (comparison context only)",
+		"same-claim data-claim: ns1/app-xyz Running (1/1 ready, 1 running)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("evidence missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// When nothing carries a declared identity or same-claim sibling, the
+// sections render as explicit negatives (a finding, not silence), matching
+// the other evidence sections.
+func TestRenderEvidencePodIDNegatives(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "single/A",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
+		},
+		Enrichment: Enrichment{},
+	}
+	got := renderEvidence(rpt)
+	for _, want := range []string{
+		"the alert named no pod, or none carried a declared securityContext or PVC mount",
+		"no other pod in scope mounts a claim the alert's pod mounts",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected explicit negative %q in:\n%s", want, got)
+		}
+	}
+}
+
 func TestSeverityColor(t *testing.T) {
 	tests := []struct {
 		sev  string
