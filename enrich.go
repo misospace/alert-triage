@@ -253,12 +253,22 @@ type Enrichment struct {
 	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
 	// nothing resolves; the prose must degrade gracefully in that case.
 	RepoPaths []string
+	// KustomizationTopology is the composition evidence for the Flux
+	// Kustomizations those pods resolved to: one compact record per
+	// Kustomization carrying its name, source, spec.path, the
+	// spec.components paths as declared, and spec.dependsOn. The record is
+	// evidence of the composition, not of its contents: component file
+	// contents are not read, a missing section renders as an explicit
+	// "none", and a record is attached only to the Kustomization the pod
+	// resolved to, never to every Kustomization in the namespace.
+	KustomizationTopology []string
 }
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
 		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
-		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 && len(e.InspectedJobs) == 0
+		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 && len(e.InspectedJobs) == 0 &&
+		len(e.KustomizationTopology) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -511,6 +521,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
 	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
+	e.KustomizationTopology = k.resolveKustomizationTopology(ctx, seenPods)
 	return e
 }
 
@@ -983,6 +994,92 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 	return out
 }
 
+// resolveKustomizationTopology reads the Flux Kustomization each pod resolved
+// to and renders its composition as one compact record: the Kustomization
+// name, its source and spec.path, the spec.components paths exactly as
+// declared, and the spec.dependsOn names. It is the half of the GitOps
+// evidence resolveRepoPaths leaves out: which composition the workload gets
+// its behaviour from, not just where its manifests live.
+//
+// Boundaries this keeps:
+//   - The record is attached only to the Kustomization the pod's annotations
+//     resolved to, never to the other Kustomizations in the namespace.
+//   - A record is emitted only for a Kustomization that actually exists: a
+//     failed lookup degrades to no record, so a missing object never reads
+//     as an empty composition (a bare "none" would claim the spec was read
+//     and found nothing).
+//   - Component paths are quoted from the object and travel verbatim; the
+//     contents of the files they name are not read, so the record never
+//     claims to have. A component that is not a relative path (an
+//     OCI-style reference) is rendered as-is under its own label.
+//   - dependsOn entries are read verbatim. The object is cluster-state read
+//     by this service, not text emitted by the workload, so the values
+//     normally carry this service's trust. The render still passes each
+//     value through untrusted() — the same treatment as RepoPaths — so a
+//     compromised object cannot forge a fence or a new section out of them.
+func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range pods {
+		kustom := p.Annotations["kustomize.toolkit.fluxcd.io/name"]
+		if kustom == "" {
+			continue
+		}
+		ns := p.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+		if ns == "" {
+			ns = p.Namespace
+		}
+		key := ns + "/" + kustom
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		spec, ok := k.fluxKustomization(ctx, ns, kustom)
+		if !ok {
+			continue
+		}
+		var src string
+		if spec.SourceRef.Name != "" {
+			src = spec.SourceRef.Name
+			if spec.SourceRef.Kind != "" {
+				src = spec.SourceRef.Kind + "/" + src
+			}
+			if spec.SourceRef.Namespace != "" {
+				src += " (" + spec.SourceRef.Namespace + ")"
+			}
+		}
+		var rec []string
+		head := "kustomization " + ns + "/" + kustom
+		if spec.Path != "" {
+			head += " (path: " + spec.Path + ")"
+		}
+		if src != "" {
+			head += ", source: " + src
+		}
+		rec = append(rec, head)
+		if len(spec.Components) > 0 {
+			rec = append(rec, "components: "+strings.Join(spec.Components, ", "))
+		} else {
+			rec = append(rec, "components: none declared")
+		}
+		if len(spec.DependsOn) > 0 {
+			var deps []string
+			for _, d := range spec.DependsOn {
+				if d.Namespace != "" && d.Namespace != ns {
+					deps = append(deps, d.Namespace+"/"+d.Name)
+				} else {
+					deps = append(deps, d.Name)
+				}
+			}
+			rec = append(rec, "dependsOn: "+strings.Join(deps, ", "))
+		} else {
+			rec = append(rec, "dependsOn: none declared")
+		}
+		out = append(out, strings.Join(rec, "; "))
+	}
+	return out
+}
+
 // podRef is the minimal pod shape resolveRepoPaths needs; the project does
 // not depend on client-go, so we carry only name, namespace, and the
 // annotations the GitOps tools use to identify their owner.
@@ -992,20 +1089,50 @@ type podRef struct {
 	Annotations map[string]string
 }
 
-func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
+// kustomizationSpec is the subset of a Flux Kustomization read for the
+// resolved workload: where it lives (spec.path, spec.sourceRef) and how it is
+// composed (spec.components, spec.dependsOn). The composition fields are the
+// behaviour source the issue cares about; the path fields are what
+// fluxPath has always needed.
+type kustomizationSpec struct {
+	SourceRef struct {
+		Name      string `json:"name"`
+		Kind      string `json:"kind"`
+		Group     string `json:"group"`
+		Namespace string `json:"namespace"`
+	} `json:"sourceRef"`
+	Path string `json:"path"`
+	// Components are paths relative to the source (or absolute repo paths);
+	// they are quoted from the object, so they travel as declared.
+	Components []string `json:"components"`
+	// DependsOn names the Kustomizations this one composes from, with the
+	// namespace of each (empty = the Kustomization's own namespace).
+	DependsOn []struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"dependsOn"`
+}
+
+// fluxKustomization reads one Flux Kustomization and reports it with a
+// success flag. Callers that only want the repo+path should go through
+// fluxPath, so a failed lookup is never re-issued as a second identical
+// kustomization GET.
+func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, bool) {
 	var kuz struct {
-		Spec struct {
-			Path      string `json:"path"`
-			SourceRef struct {
-				Name string `json:"name"`
-				Kind string `json:"kind"`
-			} `json:"sourceRef"`
-		} `json:"spec"`
+		Spec kustomizationSpec `json:"spec"`
 	}
-	if err := k.get(ctx, "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil || kuz.Spec.Path == "" {
+	if err := k.get(ctx, "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil {
+		return kustomizationSpec{}, false
+	}
+	return kuz.Spec, true
+}
+
+func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
+	kuz, ok := k.fluxKustomization(ctx, ns, name)
+	if !ok || kuz.Path == "" {
 		return "", "", false
 	}
-	srcKind := kuz.Spec.SourceRef.Kind
+	srcKind := kuz.SourceRef.Kind
 	if srcKind == "" {
 		srcKind = "GitRepository"
 	}
@@ -1014,11 +1141,11 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 			URL string `json:"url"`
 		} `json:"spec"`
 	}
-	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
+	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.SourceRef.Name
 	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
 		return "", "", false
 	}
-	return src.Spec.URL, kuz.Spec.Path, true
+	return src.Spec.URL, kuz.Path, true
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {

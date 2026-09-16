@@ -292,6 +292,17 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
 		}
 	}
+	// The topology records are read from cluster objects, so they are this
+	// service's own findings and normally sit outside the untrusted fence.
+	// Their values (paths, component names, source names) are quoted from the
+	// object, though, so each value gets the same treatment as RepoPaths:
+	// flattened and dash-run-broken as quoted data.
+	if len(r.Enrichment.KustomizationTopology) > 0 {
+		b.WriteString("KustomizationTopology:\n")
+		for _, rec := range r.Enrichment.KustomizationTopology {
+			fmt.Fprintf(&b, "- %s\n", untrusted(rec))
+		}
+	}
 	if r.PriorSeen > 0 {
 		fmt.Fprintf(&b, "History: this shape has fired %d time(s) recently.\n", r.PriorSeen)
 	} else {
@@ -577,6 +588,7 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
+	writeDiscordSection(&desc, "Kustomization topology", r.Enrichment.KustomizationTopology)
 
 	// Grafana Explore links: own construction, so it lives outside the
 	// untrusted fence; emitted only when GRAFANA_URL and the relevant
