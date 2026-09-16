@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,14 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 // kube is a minimal read-only Kubernetes client. client-go would pull in a very
 // large dependency tree for what amounts to four GETs, so this talks to the
 // apiserver directly with the in-cluster ServiceAccount credentials.
+//
+// logConcurrency used to live on this struct and was rewritten by every
+// Enrich call. The shared-write/read pattern races when shutdown's
+// drainBuffer runs while a canceled runFlushLoop process is still
+// unwinding — both paths invoke Enrich on the same *kube and the
+// goroutines spawned by fetchPodLogs read k.logConcurrency under no
+// synchronisation. The value now lives only on the per-call path so it
+// never needs to be written here.
 type kube struct {
 	base    string
 	token   string
@@ -516,7 +525,14 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
-	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods)
+	// The per-pod concurrency lives on the stack, not on *kube: the SIGTERM
+	// shutdown path calls drainBuffer while runFlushLoop's canceled process
+	// may still be unwinding, and both paths run Enrich on the same *kube.
+	// Writing the value into k would race with fetchPodLogs's goroutines
+	// reading it. Passing the normalised value keeps the shared struct
+	// immutable across concurrent callers (issue #146).
+	logConcurrency := normalizePodLogConcurrency(cfg.PodLogConcurrency)
+	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods, logConcurrency)
 	if k.logs != nil {
 		var err error
 		e.BackendLogs, err = k.logs.fetchBackendLogsResult(ctx, g, window)
@@ -830,6 +846,29 @@ func (k *kube) warningEvents(ctx context.Context, namespace string, since time.T
 // podLogTail is the maximum number of lines to fetch per unhealthy pod.
 const podLogTail = 20
 
+// DefaultPodLogConcurrency caps how many per-pod log GETs run at once inside
+// a single fetchPodLogs call. The reads run in parallel so one stalled
+// apiserver cannot serialise the remaining reads of a flush (issue #146);
+// the cap keeps the blast radius bounded to what the API server should
+// absorb during one Enrich. Exported so main.go can derive its envInt
+// default from the same constant — bumping one without the other would
+// drift silently.
+const DefaultPodLogConcurrency = 4
+
+// normalizePodLogConcurrency normalises the configured value: unset or
+// non-positive falls back to the default, and it is clamped to the 8-pod cap
+// so a misconfiguration can never open more concurrent log reads than a group
+// can name.
+func normalizePodLogConcurrency(n int) int {
+	if n <= 0 {
+		n = DefaultPodLogConcurrency
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n
+}
+
 // secretPatterns are common patterns that likely contain secrets in logs.
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+`),
@@ -849,42 +888,92 @@ func stripSecrets(s string) string {
 
 // fetchPodLogs retrieves the tail of the previous container log for each
 // unhealthy pod. Returns a map keyed by "namespace/name".
-func (k *kube) fetchPodLogs(ctx context.Context, pods []string) map[string]string {
+//
+// The per-pod GETs run under a bounded semaphore rather than strictly in
+// series: one stalled apiserver on pod 1 must not serialise the remaining
+// reads of a flush and hold the flush loop — and any SIGTERM drain —
+// behind the worst pod times up-to-8. Bounded parallelism keeps the
+// API-server-pressure trade-off the serial per-group Enrich ordering makes;
+// it is a within-group cap, not a reason to fetch one log at a time
+// (issue #146).
+//
+// The semaphore caps the number of reads in flight; one goroutine per pod
+// is still spawned, and any excess sit parked inside the semaphore's
+// acquire until an in-flight read releases. Acquiring the slot inside the
+// goroutine (rather than on the dispatcher's stack) means a goroutine that
+// never reaches its release cannot deadlock the dispatcher — the worst
+// case is that goroutine leaks until ctx fires, and the others proceed
+// once the cap frees up. The cap is clamped here, not just in Enrich:
+// direct callers (tests, future paths) must not be able to opt out of the
+// 8-pod upper bound the file-level invariant promises.
+//
+// concurrency is taken by value so the caller can normalise the configured
+// cap once and pass it in — keeping *kube immutable across concurrent
+// Enrich calls. The SIGTERM drain path runs while a canceled runFlushLoop
+// process may still be unwinding; both paths share the same *kube and the
+// goroutines spawned here read concurrency, so any writeable field would
+// race with itself.
+func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int) map[string]string {
 	if len(pods) == 0 || k.hc == nil {
 		return nil
 	}
 
+	concurrency = normalizePodLogConcurrency(concurrency)
+
 	logs := make(map[string]string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
 	for _, podKey := range pods {
 		parts := strings.SplitN(podKey, "/", 2)
 		if len(parts) != 2 {
 			continue
 		}
 		ns, name := parts[0], parts[1]
+		path := "/api/v1/namespaces/" + ns + "/pods/" + name +
+			fmt.Sprintf("/log?previous=true&tailLines=%d", podLogTail)
 
-		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?previous=true&tailLines=%d", ns, name, podLogTail)
-		req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Authorization", "Bearer "+k.token)
-		resp, err := k.hc.Do(req)
-		if err != nil {
-			logf("enrich: pod logs (%s): %v", podKey, err)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
+		wg.Add(1)
+		go func(podKey, path string) {
+			defer wg.Done()
+			// Acquire inside the goroutine: a leaked slot here can't
+			// stall the dispatcher, and the wait error path returns
+			// without writing to logs so the bounded count still holds.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+k.token)
+			resp, err := k.hc.Do(req)
+			if err != nil {
+				logf("enrich: pod logs (%s): %v", podKey, err)
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return
+			}
+			data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			continue
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		logs[podKey] = stripSecrets(strings.TrimSpace(string(data)))
+			if err != nil {
+				return
+			}
+			// Write to the shared map under the lock: only the dispatch is
+			// concurrent, the 4096-byte cap and secret stripping are
+			// unchanged from the serial walk.
+			mu.Lock()
+			logs[podKey] = stripSecrets(strings.TrimSpace(string(data)))
+			mu.Unlock()
+		}(podKey, path)
 	}
-
+	wg.Wait()
 	return logs
 }
 
