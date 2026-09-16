@@ -89,6 +89,11 @@ Rules:
 - Alerts from an application concern that application's internal state, not the
   health of the pods running it. Do not infer that a workload is down because it
   reported a fault in something it manages.
+- Ownership chains under UNTRUSTED are read from the objects' live
+  ownerReferences and identity labels, not from their names: a Job that is
+  owned by a backup or controller is a generated maintenance task, not the
+  application it may share a name with; if no chain is shown, the object is
+  not known to be owned by anything and its name alone is not identity.
 - "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
   Use them to rule causes out.
 - Some alerts are self-describing. Restate what it means operationally and stop;
@@ -349,6 +354,12 @@ func renderEvidence(r Report) string {
 	}
 	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, negative)
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
+	// The chain's names and identity tags come from the objects' own
+	// metadata (ownerReferences and labels are workload-authored), so they
+	// render inside the fence: a forged controller name must read as a
+	// claim about the object, not as a fact this service established.
+	writeUntrustedFinding(&b, "Ownership chains", r.Enrichment.Ownership,
+		"no ownership chains recorded (no ownerReferences on the inspected objects)")
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
