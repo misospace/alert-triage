@@ -115,7 +115,7 @@ func loadConfig() Config {
 		MaxAlerts:            envInt("MAX_ALERTS", 500),
 		MaxGroups:            envInt("MAX_GROUPS", 12),
 		NarrateConcurrency:   envInt("NARRATE_CONCURRENCY", 2),
-		PodLogConcurrency:    envInt("POD_LOG_CONCURRENCY", 4),
+		PodLogConcurrency:    envInt("POD_LOG_CONCURRENCY", DefaultPodLogConcurrency),
 		LiteLLMURL:           envDefault("LITELLM_URL", ""),
 		LiteLLMKey:           os.Getenv("LITELLM_API_KEY"),
 		Model:                envDefault("MODEL", "dsv4f"),

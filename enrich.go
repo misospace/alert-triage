@@ -846,12 +846,14 @@ func (k *kube) warningEvents(ctx context.Context, namespace string, since time.T
 // podLogTail is the maximum number of lines to fetch per unhealthy pod.
 const podLogTail = 20
 
-// defaultPodLogConcurrency caps how many per-pod log GETs run at once inside
+// DefaultPodLogConcurrency caps how many per-pod log GETs run at once inside
 // a single fetchPodLogs call. The reads run in parallel so one stalled
 // apiserver cannot serialise the remaining reads of a flush (issue #146);
 // the cap keeps the blast radius bounded to what the API server should
-// absorb during one Enrich.
-const defaultPodLogConcurrency = 4
+// absorb during one Enrich. Exported so main.go can derive its envInt
+// default from the same constant — bumping one without the other would
+// drift silently.
+const DefaultPodLogConcurrency = 4
 
 // normalizePodLogConcurrency normalises the configured value: unset or
 // non-positive falls back to the default, and it is clamped to the 8-pod cap
@@ -859,7 +861,7 @@ const defaultPodLogConcurrency = 4
 // can name.
 func normalizePodLogConcurrency(n int) int {
 	if n <= 0 {
-		n = defaultPodLogConcurrency
+		n = DefaultPodLogConcurrency
 	}
 	if n > 8 {
 		n = 8
@@ -895,6 +897,16 @@ func stripSecrets(s string) string {
 // it is a within-group cap, not a reason to fetch one log at a time
 // (issue #146).
 //
+// The semaphore caps the number of reads in flight; one goroutine per pod
+// is still spawned, and any excess sit parked inside the semaphore's
+// acquire until an in-flight read releases. Acquiring the slot inside the
+// goroutine (rather than on the dispatcher's stack) means a goroutine that
+// never reaches its release cannot deadlock the dispatcher — the worst
+// case is that goroutine leaks until ctx fires, and the others proceed
+// once the cap frees up. The cap is clamped here, not just in Enrich:
+// direct callers (tests, future paths) must not be able to opt out of the
+// 8-pod upper bound the file-level invariant promises.
+//
 // concurrency is taken by value so the caller can normalise the configured
 // cap once and pass it in — keeping *kube immutable across concurrent
 // Enrich calls. The SIGTERM drain path runs while a canceled runFlushLoop
@@ -906,9 +918,7 @@ func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int)
 		return nil
 	}
 
-	if concurrency <= 0 {
-		concurrency = defaultPodLogConcurrency
-	}
+	concurrency = normalizePodLogConcurrency(concurrency)
 
 	logs := make(map[string]string)
 	var mu sync.Mutex
@@ -923,10 +933,17 @@ func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int)
 		path := "/api/v1/namespaces/" + ns + "/pods/" + name +
 			fmt.Sprintf("/log?previous=true&tailLines=%d", podLogTail)
 
-		sem <- struct{}{}
 		wg.Add(1)
 		go func(podKey, path string) {
 			defer wg.Done()
+			// Acquire inside the goroutine: a leaked slot here can't
+			// stall the dispatcher, and the wait error path returns
+			// without writing to logs so the bounded count still holds.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
 
 			req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
