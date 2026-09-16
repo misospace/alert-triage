@@ -1276,6 +1276,52 @@ func TestEnrichJobFailedMultipleJobs(t *testing.T) {
 	}
 }
 
+// TestEnrichJobFailedMultipleJobsOwnership keeps ownership evidence complete
+// when a correlated group resolves several Jobs. Each pod must be chained to
+// its own Job and controller, never another resolved Job.
+func TestEnrichJobFailedMultipleJobsOwnership(t *testing.T) {
+	pods := `{"items":[
+		{"metadata":{"name":"a-0","namespace":"ns1","ownerReferences":[{"kind":"Job","name":"a","uid":"ua"}]},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"error":{"reason":"Error"}}}]}},
+		{"metadata":{"name":"b-0","namespace":"ns1","ownerReferences":[{"kind":"Job","name":"b","uid":"ub"}]},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"error":{"reason":"Error"}}}]}}
+	]}`
+	jobs := map[string]jobSpec{
+		"a": {json: `{"metadata":{"name":"a","namespace":"ns1","uid":"ua","ownerReferences":[{"kind":"Backup","name":"nightly-a","controller":true}]},"spec":{"template":{"metadata":{"labels":{"job-name":"a"}}}}}`},
+		"b": {json: `{"metadata":{"name":"b","namespace":"ns1","uid":"ub","ownerReferences":[{"kind":"Migration","name":"nightly-b","controller":true}]},"spec":{"template":{"metadata":{"labels":{"job-name":"b"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{Namespaces: []string{"ns1"}, Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "a"}},
+		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
+	}}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	for _, want := range []string{
+		"Job/ns1/a -> Backup/nightly-a",
+		"Pod/ns1/a-0 -> Job/ns1/a -> Backup/nightly-a",
+		"Job/ns1/b -> Migration/nightly-b",
+		"Pod/ns1/b-0 -> Job/ns1/b -> Migration/nightly-b",
+	} {
+		found := false
+		for _, got := range en.Ownership {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Ownership missing %q: %v", want, en.Ownership)
+		}
+	}
+	for _, got := range en.Ownership {
+		if strings.Contains(got, "Pod/ns1/a-0 -> Job/ns1/b") || strings.Contains(got, "Pod/ns1/b-0 -> Job/ns1/a") {
+			t.Errorf("pod was cross-associated with another job: %q", got)
+		}
+	}
+}
+
 // TestJobOwnedByFallback covers the ownership rule: a pod with a Job owner
 // reference is attributed by that reference (name + uid), and the
 // job-name=<name> label fallback is used only when no Job owner reference is
@@ -1298,6 +1344,237 @@ func TestJobOwnedByFallback(t *testing.T) {
 		if got := jobOwnedBy(job, tc.pod); got != tc.want {
 			t.Errorf("jobOwnedBy(%s) = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestEnrichJobFailedControllerOwnedJob is the motivating incident of #131:
+// the failed Job is a generated backup task owned by a custom-resource
+// controller even though its name is derived from the application. The
+// enrichment must carry the ownership chain so the model can tell the
+// generated job apart from the application, and must not infer the
+// relationship from the job's name.
+func TestEnrichJobFailedControllerOwnedJob(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1","uid":"pod-uid-1",
+				"labels":{"job-name":"backup","controller":"backup"},
+				"ownerReferences":[{"kind":"Job","apiVersion":"batch/v1","name":"backup","uid":"job-uid-1","controller":true}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{
+			"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1",
+				"labels":{"app.kubernetes.io/managed-by":"velero","app.kubernetes.io/component":"backup"},
+				"ownerReferences":[{"kind":"Backup","apiVersion":"velero.io/v1","name":"nightly","uid":"cr-uid-1","controller":true}]},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.Ownership) != 2 {
+		t.Fatalf("Ownership = %v, want 2 entries (job and its pod)", en.Ownership)
+	}
+	if !strings.Contains(en.Ownership[0], "Job/ns1/backup -> Backup/nightly") {
+		t.Errorf("job chain %q must continue to its controller owner", en.Ownership[0])
+	}
+	if !strings.Contains(en.Ownership[0], "app.kubernetes.io/managed-by=velero") {
+		t.Errorf("job chain %q must carry the curated identity label", en.Ownership[0])
+	}
+	if !strings.Contains(en.Ownership[1], "Pod/ns1/backup-0") ||
+		!strings.Contains(en.Ownership[1], "-> Job/ns1/backup -> Backup/nightly") {
+		t.Errorf("pod chain %q must read end to end as pod -> job -> controller", en.Ownership[1])
+	}
+}
+
+// TestEnrichJobFailedOwnerlessJob: a job with no ownerReferences must not
+// acquire a fabricated parent from its name, and enrichment must not fail.
+func TestEnrichJobFailedOwnerlessJob(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1","uid":"pod-uid-1",
+				"labels":{"job-name":"backup"},
+				"ownerReferences":[{"kind":"Job","apiVersion":"batch/v1","name":"backup","uid":"job-uid-1","controller":true}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{
+			"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1",
+				"labels":{"app.kubernetes.io/name":"myapp"}},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.Ownership) != 2 {
+		t.Fatalf("Ownership = %v, want 2 entries", en.Ownership)
+	}
+	// No controller: the job entry is just the name plus its identity label.
+	if en.Ownership[0] != "Job/ns1/backup [app.kubernetes.io/name=myapp]" {
+		t.Errorf("ownerless job chain = %q, want no parent hop", en.Ownership[0])
+	}
+	// No controller: the chain stops at the job; exactly one hop.
+	if en.Ownership[1] != "Pod/ns1/backup-0 -> Job/ns1/backup" {
+		t.Errorf("pod chain of an ownerless job = %q, want a single hop", en.Ownership[1])
+	}
+}
+
+// TestEnrichJobFailedPodOwnedByResolvedJob: a pod the listing shows is owned
+// by the resolved job (uid match) gets a chain entry, and a pod owned by
+// something else does not.
+func TestEnrichJobFailedPodOwnedByResolvedJob(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1","uid":"pod-uid-1",
+				"labels":{"job-name":"backup"},
+				"ownerReferences":[{"kind":"Job","apiVersion":"batch/v1","name":"backup","uid":"job-uid-1","controller":true}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"error":{"reason":"Error"}}}]}}
+			,{"metadata":{"name":"other-0","namespace":"ns1","uid":"pod-uid-2",
+				"labels":{},
+				"ownerReferences":[{"kind":"ReplicaSet","apiVersion":"apps/v1","name":"other-0","uid":"rs-1","controller":true}]},
+				"status":{"phase":"Running",
+					"containerStatuses":[{"name":"c","ready":true,"restartCount":0,
+						"state":{"running":{"reason":""}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{
+			"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1",
+				"ownerReferences":[{"kind":"Backup","apiVersion":"velero.io/v1","name":"nightly","uid":"cr-uid-1","controller":true}]},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	for _, s := range en.Ownership {
+		if strings.Contains(s, "Pod/ns1/other-0") {
+			t.Errorf("pod owned by a different controller must not get a chain: %v", en.Ownership)
+		}
+	}
+	found := false
+	for _, s := range en.Ownership {
+		if strings.Contains(s, "Pod/ns1/backup-0 -> Job/ns1/backup") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("pod owned by the resolved job is missing its chain: %v", en.Ownership)
+	}
+}
+
+// TestControllerOwnerRefPrefer checks the controller-preference rule when an
+// object carries both a controller and a non-controller reference: the
+// non-controller one is a secondary association and must not be chained.
+func TestControllerOwnerRefPrefer(t *testing.T) {
+	tt := true
+	ff := false
+	cases := []struct {
+		name      string
+		refs      []ownerRef
+		want      ownerRef
+		wantFound bool
+	}{
+		{"empty", nil, ownerRef{}, false},
+		{"only empty", []ownerRef{{}}, ownerRef{}, false},
+		{
+			"mixed: the controller-flagged ref is chosen",
+			[]ownerRef{
+				{Kind: "Job", Name: "backup", UID: "u1", Controller: &tt},
+				{Kind: "Backup", Name: "nightly", UID: "u2", Controller: &ff},
+			},
+			ownerRef{Kind: "Job", Name: "backup", UID: "u1", Controller: &tt},
+			true,
+		},
+		{
+			"controller second",
+			[]ownerRef{
+				{Kind: "Backup", Name: "nightly", UID: "u2", Controller: &ff},
+				{Kind: "Job", Name: "backup", UID: "u1", Controller: &tt},
+			},
+			ownerRef{Kind: "Job", Name: "backup", UID: "u1", Controller: &tt},
+			true,
+		},
+		{
+			"no controller flag: first non-empty wins",
+			[]ownerRef{
+				{Kind: "DaemonSet", Name: "ds-0", UID: "u1"},
+				{Kind: "Job", Name: "backup", UID: "u2"},
+			},
+			ownerRef{Kind: "DaemonSet", Name: "ds-0", UID: "u1"},
+			true,
+		},
+	}
+	for _, tc := range cases {
+		got, ok := controllerOwnerRef(tc.refs)
+		if ok != tc.wantFound || got != tc.want {
+			t.Errorf("controllerOwnerRef(%s) = %+v, %v; want %+v, %v", tc.name, got, ok, tc.want, tc.wantFound)
+		}
+	}
+}
+
+// TestIdentityTagsWhitelist: only curated identity keys are surfaced, with
+// their values, in a stable preference order; high-cardinality and unknown
+// keys are never shown.
+func TestIdentityTagsWhitelist(t *testing.T) {
+	got := identityTags(
+		map[string]string{
+			"app.kubernetes.io/managed-by": "velero",
+			"app.kubernetes.io/name":       "myapp",
+			"pod-template-hash":            "abc123",
+			"controller-uid":               "uid-999",
+			"job-name":                     "backup",
+		},
+		map[string]string{
+			"kustomize.toolkit.fluxcd.io/name": "myapp-kustomization",
+		},
+	)
+	for _, want := range []string{
+		"app.kubernetes.io/managed-by=velero",
+		"app.kubernetes.io/name=myapp",
+		"kustomize.toolkit.fluxcd.io/name=myapp-kustomization",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("identityTags missing %q in %q", want, got)
+		}
+	}
+	for _, banned := range []string{"pod-template-hash", "controller-uid", "job-name="} {
+		if strings.Contains(got, banned) {
+			t.Errorf("identityTags leaked non-identity key %q in %q", banned, got)
+		}
+	}
+	if got != "app.kubernetes.io/managed-by=velero,app.kubernetes.io/name=myapp,kustomize.toolkit.fluxcd.io/name=myapp-kustomization" {
+		t.Errorf("unexpected identity order: %q", got)
 	}
 }
 
