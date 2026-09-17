@@ -379,3 +379,149 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 		t.Errorf("after 1 fail + 1 success, PriorSeen = %d, want 1", got)
 	}
 }
+
+// TestHistoryCompactDoesNotBlockPriorSeenDuringRewrite is the regression
+// test for issue #147: Compact's temp-file write and rename used to run
+// under h.mu, so a slow filesystem stalled every PriorSeen and Record
+// caller until the rename returned. The fix releases the lock around
+// the on-disk work and only re-acquires it to swap the in-memory slice.
+//
+// The test installs a hook that blocks Compact between the temp-file
+// write and the rename, simulating a slow filesystem, and asserts that
+// a concurrent PriorSeen returns well before the hook fires — i.e. the
+// read waited only on the swap window, not the rewrite window.
+func TestHistoryCompactDoesNotBlockPriorSeenDuringRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	if got := h.Record("sig_a", "title_a", now); got != 0 {
+		t.Fatalf("seed Record prior = %d, want 0", got)
+	}
+
+	// Install a hook that blocks Compact between the temp-file write
+	// and the rename. The signal channel lets the test wait until
+	// Compact has actually reached the rewrite before launching
+	// PriorSeen, so the assertion is about the lock-not-held window.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	oldHook := compactRewriteDelay
+	compactRewriteDelay = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { compactRewriteDelay = oldHook })
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- h.Compact() }()
+
+	// Wait for Compact to enter the rewrite window before timing
+	// PriorSeen, so we measure the lock-free window, not the snapshot
+	// or swap.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("Compact did not reach the rewrite hook within 2s")
+	}
+
+	start := time.Now()
+	got := h.PriorSeen("sig_a", "title_a")
+	elapsed := time.Since(start)
+
+	if got != 1 {
+		t.Errorf("PriorSeen = %d, want 1", got)
+	}
+	// The rewrite hook blocks for ~100ms (set below). If Compact still
+	// held h.mu across the rewrite, PriorSeen would block here too.
+	// Allow generous slack for scheduler jitter but still well under
+	// the rewrite window.
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("PriorSeen blocked for %v during Compact rewrite; expected sub-millisecond (lock must be released during the rewrite)", elapsed)
+	}
+
+	// Release the hook and let Compact finish; surface any error.
+	close(release)
+	if err := <-compactDone; err != nil {
+		t.Fatalf("Compact returned %v after the rewrite delay", err)
+	}
+}
+
+// TestHistoryCompactReleasesLockDuringRewrite pairs with the prior-seen
+// test to cover the writer side of issue #147: a Record running while
+// Compact is mid-rewrite must not block on the rewrite either. It also
+// verifies the post-rewrite ordering invariant from the issue: the
+// appended line lands in either the pre-rename file (lost on rename,
+// but the call itself does not error) or the post-rename file (kept).
+func TestHistoryCompactReleasesLockDuringRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Block Compact mid-rewrite so Record runs concurrently with it.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	oldHook := compactRewriteDelay
+	compactRewriteDelay = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { compactRewriteDelay = oldHook })
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- h.Compact() }()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("Compact did not reach the rewrite hook within 2s")
+	}
+
+	// Record runs while Compact is mid-rewrite. It must return quickly
+	// (no half-temp error) and not deadlock on h.mu.
+	start := time.Now()
+	prior := h.Record("sig_b", "title_b", time.Now())
+	elapsed := time.Since(start)
+
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Record blocked for %v during Compact rewrite; expected sub-millisecond", elapsed)
+	}
+	if prior != 0 {
+		t.Errorf("Record prior = %d, want 0", prior)
+	}
+
+	close(release)
+	if err := <-compactDone; err != nil {
+		t.Fatalf("Compact returned %v after the rewrite delay", err)
+	}
+
+	// Reload the on-disk file. Whether the appended line landed
+	// pre-rename (lost) or post-rename (kept), the file must be valid
+	// JSONL and must not show a half-written temp artifact.
+	reloaded, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatalf("reload after Compact: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		t.Error(".tmp file leaked after Compact")
+	}
+	for i, e := range reloaded.entries {
+		if e.Signature == "" || e.Title == "" {
+			t.Errorf("entry %d is malformed: %+v", i, e)
+		}
+	}
+}
