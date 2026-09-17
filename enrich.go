@@ -534,15 +534,23 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	logConcurrency := normalizePodLogConcurrency(cfg.PodLogConcurrency)
 	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods, logConcurrency)
 	if k.logs != nil {
+		var res backendLogResult
 		var err error
-		e.BackendLogs, err = k.logs.fetchBackendLogsResult(ctx, g, window)
+		res, err = k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
 		if err != nil {
 			e.BackendState = "error"
 			logf("enrich: backend logs: %v", err)
-		} else if len(e.BackendLogs) == 0 {
-			e.BackendState = "empty"
 		} else {
-			e.BackendState = "ok"
+			e.BackendLogs = res.Primary
+			// Namespace-wide lines (present only when no concrete subject was
+			// resolved) are ambient context for ruling things out, never evidence
+			// about the failing resource, so they go to Ambient, not BackendLogs.
+			e.Ambient = append(e.Ambient, res.Ambient...)
+			if len(res.Primary) == 0 {
+				e.BackendState = "empty"
+			} else {
+				e.BackendState = "ok"
+			}
 		}
 	} else {
 		e.BackendState = "off"
