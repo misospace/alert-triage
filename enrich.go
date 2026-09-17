@@ -240,8 +240,11 @@ type Enrichment struct {
 	UnhealthyPods []string
 	PodLogs       map[string]string // pod key -> tail of previous container log
 	// BackendLogs are workload-authored and untrusted. BackendState is
-	// "off", "empty", or "error" so missing configuration is not confused with
-	// a successful query that returned no lines.
+	// "off", "empty", "ambient", or "error" so missing configuration is not
+	// confused with a successful query that returned no lines. "empty" means
+	// the queries issued returned no lines; "ambient" means no concrete subject
+	// could be resolved, the namespace-wide fallback did return lines, and those
+	// lines were routed to Ambient — the source is configured and answered.
 	BackendLogs  []string
 	BackendState string
 	// Events contains warning events attached to the resolved alert subject graph.
@@ -288,7 +291,8 @@ type Enrichment struct {
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
+		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 &&
+		(e.BackendState == "" || e.BackendState == "off" || e.BackendState == "ambient") &&
 		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 &&
 		len(e.InspectedJobs) == 0 && len(e.Ownership) == 0
 }
@@ -546,10 +550,17 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			// resolved) are ambient context for ruling things out, never evidence
 			// about the failing resource, so they go to Ambient, not BackendLogs.
 			e.Ambient = append(e.Ambient, res.Ambient...)
-			if len(res.Primary) == 0 {
-				e.BackendState = "empty"
-			} else {
+			switch {
+			case len(res.Primary) > 0:
 				e.BackendState = "ok"
+			case len(res.Ambient) > 0:
+				// The backend did return lines — it is the no-subject
+				// fallback. Rendering this as "empty" would put a false
+				// negative in the prompt next to the very lines we just
+				// routed to BACKGROUND.
+				e.BackendState = "ambient"
+			default:
+				e.BackendState = "empty"
 			}
 		}
 	} else {

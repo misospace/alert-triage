@@ -1974,8 +1974,10 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	if len(en.BackendLogs) != 0 {
 		t.Fatalf("namespace-wide logs must not enter primary evidence without a subject, got %v", en.BackendLogs)
 	}
-	if en.BackendState != "empty" {
-		t.Fatalf("expected state \"empty\" (no primary lines), got %q", en.BackendState)
+	// "empty" here would be false: the backend answered and its namespace-wide
+	// lines are the Ambient entries below. The state must say so.
+	if en.BackendState != "ambient" {
+		t.Fatalf("expected state \"ambient\" (no subject resolved, namespace-wide lines returned), got %q", en.BackendState)
 	}
 	foundAmbient := false
 	for _, a := range en.Ambient {

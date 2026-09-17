@@ -336,6 +336,9 @@ func renderEvidence(r Report) string {
 		b.WriteString("\nBackend log source: not configured (no LOGS_URL).\n")
 	case "empty":
 		b.WriteString("\nBackend log source: configured, but returned no lines for this window.\n")
+	case "ambient":
+		b.WriteString("\nBackend log source: configured; no concrete subject was resolved, so the\n")
+		b.WriteString("namespace-wide lines shown under BACKGROUND are the only backend logs in the window.\n")
 	case "error":
 		b.WriteString("\nBackend log source: query failed; no lines were available.\n")
 	case "ok":
@@ -528,28 +531,9 @@ func severityColor(s string) int {
 	}
 }
 
-// Deliver posts one incident to the digest webhook. When GitHub is configured
-// and the triage is actionable it is also mirrored to a GitHub issue keyed on
-// the group signature; see issue #14. Unset env keeps the original chat-only
-// behaviour. The caller's context bounds the in-flight POST so a SIGTERM
-// drain can cancel it instead of waiting out the 20s client timeout.
-func Deliver(ctx context.Context, cfg *Config, r Report) error {
-	if cfg.DiscordURL == "" {
-		return fmt.Errorf("no discord webhook configured")
-	}
-
-	gh := newGitHub(cfg)
-	var ghAction issueAction
-	if gh != nil && r.Triage.Actionable() {
-		ghCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		act, err := deliverGitHub(ghCtx, gh, cfg, r)
-		cancel()
-		if err != nil {
-			logf("github: %v", err)
-		}
-		ghAction = act
-	}
-
+// discordDescription builds the chat's digest text, kept apart from Deliver
+// so the rendering can be tested without a webhook round trip.
+func discordDescription(cfg *Config, r Report) string {
 	var desc strings.Builder
 	if r.Narrative != "" {
 		desc.WriteString(r.Narrative)
@@ -576,6 +560,8 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 		desc.WriteString("\n**Backend log source:** not configured (no LOGS_URL).")
 	case "empty":
 		desc.WriteString("\n**Backend log source:** configured, but returned no lines for this window.")
+	case "ambient":
+		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are the only backend logs in the window and are shown as ambient context, not evidence of the failing resource.")
 	case "error":
 		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
 	case "ok":
@@ -614,10 +600,36 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 		}
 		desc.WriteString("\n")
 	}
+	return desc.String()
+}
+
+// Deliver posts one incident to the digest webhook. When GitHub is configured
+// and the triage is actionable it is also mirrored to a GitHub issue keyed on
+// the group signature; see issue #14. Unset env keeps the original chat-only
+// behaviour. The caller's context bounds the in-flight POST so a SIGTERM
+// drain can cancel it instead of waiting out the 20s client timeout.
+func Deliver(ctx context.Context, cfg *Config, r Report) error {
+	if cfg.DiscordURL == "" {
+		return fmt.Errorf("no discord webhook configured")
+	}
+
+	gh := newGitHub(cfg)
+	var ghAction issueAction
+	if gh != nil && r.Triage.Actionable() {
+		ghCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		act, err := deliverGitHub(ghCtx, gh, cfg, r)
+		cancel()
+		if err != nil {
+			logf("github: %v", err)
+		}
+		ghAction = act
+	}
+
+	desc := discordDescription(cfg, r)
 
 	embed := discordEmbed{
 		Title:       r.Group.Title(),
-		Description: clamp(desc.String(), 3900),
+		Description: clamp(desc, 3900),
 		Color:       severityColor(r.Group.Severity()),
 	}
 	seen := "first time seen"
@@ -640,9 +652,11 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	// line summary; the full body lives in the issue so verbose evidence can
 	// be folded under <details>. Behaviour is unchanged when ghAction is
 	// empty (env unset) or Outcome=="none" (non-actionable), since both
-	// paths leave ghAction.URL unset.
+	// paths leave ghAction.URL unset. The link is appended after the embed
+	// description was captured, so it appears only in the raw body — the
+	// same placement it had before discordDescription was extracted.
 	if ghAction.URL != "" {
-		fmt.Fprintf(&desc, "\nTracked: <%s>", ghAction.URL)
+		desc += fmt.Sprintf("\nTracked: <%s>", ghAction.URL)
 	}
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
