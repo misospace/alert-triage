@@ -297,6 +297,45 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
 		}
 	}
+	// Commit relevance is this service's own finding (we fetched the
+	// commit), so the State, path, and revision sit outside the untrusted
+	// fence. The commit message and the file names — written by whoever
+	// pushed the commit — are quoted from an external source and pass
+	// through untrusted() so a malicious commit subject cannot forge a
+	// new section or break out of the fence.
+	if len(r.Enrichment.CommitRelevance) > 0 {
+		b.WriteString("\nRecent reconciled commit (GitHub):\n")
+		for _, rel := range r.Enrichment.CommitRelevance {
+			switch rel.State {
+			case commitRelevanceTouches:
+				fmt.Fprintf(&b, "- touches workload: %s\n", rel.WorkloadPath)
+				if len(rel.ComponentPaths) > 0 {
+					fmt.Fprintf(&b, "  components: %s\n", strings.Join(rel.ComponentPaths, ", "))
+				}
+				if len(rel.MatchingPaths) > 0 {
+					b.WriteString("  matching files:\n")
+					b.WriteString(untrustedBegin + "\n")
+					for _, p := range rel.MatchingPaths {
+						fmt.Fprintf(&b, "  - %s\n", untrusted(p))
+					}
+					b.WriteString(untrustedEnd + "\n")
+				}
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&b, "  message: %s\n", untrusted(rel.CommitMessage))
+				}
+			case commitRelevanceDoesNotTouch:
+				fmt.Fprintf(&b, "- does NOT touch workload (%s) at revision %s\n", rel.WorkloadPath, rel.Revision)
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&b, "  message: %s\n", untrusted(rel.CommitMessage))
+				}
+			default:
+				// Unknown: the lookup did not produce a yes/no answer. The
+				// model still needs to know we tried — silence would read
+				// as "we did not check".
+				fmt.Fprintf(&b, "- relevance unknown: %s\n", rel.Reason)
+			}
+		}
+	}
 	if r.PriorSeen > 0 {
 		fmt.Fprintf(&b, "History: this shape has fired %d time(s) recently.\n", r.PriorSeen)
 	} else {
@@ -574,6 +613,36 @@ func discordDescription(cfg *Config, r Report) string {
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
+	// Commit relevance for GitHub-backed workloads: an explicit "does not
+	// touch" is the most useful line here, since it tells the model the
+	// observed revision is not a deploy candidate. "touches" is also
+	// useful as the recent-change signal; "unknown" is rendered only when
+	// the lookup was attempted (some relevance evidence is always worth
+	// more than silence).
+	if len(r.Enrichment.CommitRelevance) > 0 {
+		desc.WriteString("\n**Recent reconciled commit (GitHub):**\n")
+		for _, rel := range r.Enrichment.CommitRelevance {
+			switch rel.State {
+			case commitRelevanceTouches:
+				fmt.Fprintf(&desc, "• touches `%s`", rel.WorkloadPath)
+				if len(rel.MatchingPaths) > 0 {
+					fmt.Fprintf(&desc, " — files: %s", strings.Join(rel.MatchingPaths, ", "))
+				}
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&desc, " — %s", rel.CommitMessage)
+				}
+				desc.WriteString("\n")
+			case commitRelevanceDoesNotTouch:
+				fmt.Fprintf(&desc, "• does NOT touch `%s` at revision %s", rel.WorkloadPath, rel.Revision)
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&desc, " — %s", rel.CommitMessage)
+				}
+				desc.WriteString("\n")
+			default:
+				fmt.Fprintf(&desc, "• relevance unknown: %s\n", rel.Reason)
+			}
+		}
+	}
 
 	// Grafana Explore links: own construction, so it lives outside the
 	// untrusted fence; emitted only when GRAFANA_URL and the relevant
