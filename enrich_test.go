@@ -340,7 +340,7 @@ func TestEnrichSkipsOnlyWhenBothClustersAreKnownAndDiffer(t *testing.T) {
 			g := Group{Key: "single/A", Cluster: tt.groupCluster, Alerts: []Alert{
 				{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
 			}}
-			got := k.Enrich(context.Background(), g, time.Minute, &Config{})
+			got := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 			skipped := strings.Contains(got.Scope, "cluster state unavailable")
 			if skipped != tt.wantSkipped {
@@ -390,7 +390,7 @@ func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, p := range en.UnhealthyPods {
 		if strings.Contains(p, "job-finished") {
@@ -1027,7 +1027,7 @@ func TestEnrichConcurrentCallersDoNotRace(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			_ = k.Enrich(context.Background(), mkGroup(), time.Minute, &Config{PodLogConcurrency: 4})
+			_ = k.Enrich(context.Background(), mkGroup(), time.Minute, &Config{PodLogConcurrency: 4}, nil)
 		}()
 	}
 	deadline := time.After(10 * time.Second)
@@ -1172,7 +1172,7 @@ func TestEnrichmentFluxActivityNotChanges(t *testing.T) {
 		Namespaces: []string{"llm"},
 		Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "llm"}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if len(en.FluxActivity) == 0 {
 		t.Fatalf("expected a FluxActivity entry, got %+v", en)
 	}
@@ -1267,7 +1267,7 @@ func TestEnrichJobFailedResolvesOwnedPod(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	// The job is represented in enrichment scope.
 	if len(en.InspectedJobs) != 1 || en.InspectedJobs[0] != "ns1/backup" {
@@ -1317,7 +1317,7 @@ func TestEnrichJobFailedMultipleOwnedPods(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if !podInList(t, en.UnhealthyPods, "ns1/backup-0") {
 		t.Errorf("owned pod ns1/backup-0 missing: %v", en.UnhealthyPods)
@@ -1359,7 +1359,7 @@ func TestEnrichJobFailedUnrelatedPod(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	iOwned, iNoisy := -1, -1
 	for i, p := range en.UnhealthyPods {
@@ -1401,7 +1401,7 @@ func TestEnrichJobFailedMissingJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.InspectedJobs) != 0 {
 		t.Fatalf("missing job should not be recorded as inspected, got %v", en.InspectedJobs)
@@ -1456,7 +1456,7 @@ func TestEnrichPodLabelUnchanged(t *testing.T) {
 			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "web-0",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if jobHits != 0 {
 		t.Fatalf("a pod-labelled alert with no job_name must not fetch any job, got %d job hit(s)", jobHits)
@@ -1515,7 +1515,7 @@ func TestEnrichJobFailedMultipleJobs(t *testing.T) {
 			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.InspectedJobs) != 2 || en.InspectedJobs[0] != "ns1/a" || en.InspectedJobs[1] != "ns1/b" {
 		t.Fatalf("InspectedJobs not sorted, got %v", en.InspectedJobs)
@@ -1549,7 +1549,7 @@ func TestEnrichJobFailedMultipleJobsOwnership(t *testing.T) {
 		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "a"}},
 		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
 	}}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, want := range []string{
 		"Job/ns1/a -> Backup/nightly-a",
@@ -1633,7 +1633,7 @@ func TestEnrichJobFailedControllerOwnedJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.Ownership) != 2 {
 		t.Fatalf("Ownership = %v, want 2 entries (job and its pod)", en.Ownership)
@@ -1678,7 +1678,7 @@ func TestEnrichJobFailedOwnerlessJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.Ownership) != 2 {
 		t.Fatalf("Ownership = %v, want 2 entries", en.Ownership)
@@ -1728,7 +1728,7 @@ func TestEnrichJobFailedPodOwnedByResolvedJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, s := range en.Ownership {
 		if strings.Contains(s, "Pod/ns1/other-0") {
@@ -1870,7 +1870,7 @@ func TestEnrichScopesResolvedJobAndOwnedPodEvents(t *testing.T) {
 			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	if !en.EventsScoped {
 		t.Fatal("resolved job should scope events")
@@ -1912,7 +1912,7 @@ func TestEnrichNoSubjectEventsAreAmbient(t *testing.T) {
 
 	k := &kube{base: srv.URL, hc: srv.Client()}
 	g := Group{Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}}}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if en.EventsScoped || len(en.Events) != 0 {
 		t.Fatalf("no resolved subject must not have primary events: scoped=%v events=%v", en.EventsScoped, en.Events)
 	}
@@ -1969,7 +1969,7 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.BackendLogs) != 0 {
 		t.Fatalf("namespace-wide logs must not enter primary evidence without a subject, got %v", en.BackendLogs)
@@ -2024,7 +2024,7 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "p1"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.BackendLogs) != 1 || !strings.Contains(en.BackendLogs[0], "target failure line") {
 		t.Fatalf("expected the target pod's line as the only primary line, got %v", en.BackendLogs)
@@ -2036,5 +2036,333 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 		if strings.Contains(a, "(ambient, namespace-wide)") {
 			t.Fatalf("no ambient backend logs expected when a subject is resolved, got %v", en.Ambient)
 		}
+	}
+}
+
+// TestResolveCommitRelevanceFluxAndGitHub is the end-to-end test for issue
+// #135: a pod with the Flux kustomize annotations, a Kustomization with a
+// github.com GitRepository, and a GitHub commit whose files DO touch the
+// workload path must produce a CommitRelevance with State == "touches".
+// The test wires up three servers — the kube API, the github.com API —
+// and asserts the renderer surfaces the matching files (inside the
+// untrusted fence) and the commit message.
+func TestResolveCommitRelevanceFluxAndGitHub(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	var kubeHits, ghHits atomic.Int32
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kubeHits.Add(1)
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ghHits.Add(1)
+		// Path: /repos/owner/repo/commits/<sha>
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump image tag"},"files":[{"filename":"apps/payments/kustomization.yaml"},{"filename":"apps/payments/deployment.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if rel.WorkloadPath != "apps/payments" {
+		t.Errorf("workload path = %q, want %q", rel.WorkloadPath, "apps/payments")
+	}
+	if rel.Revision != "refs/heads/main@sha1:"+validSHA {
+		t.Errorf("revision = %q", rel.Revision)
+	}
+	if len(rel.MatchingPaths) != 2 {
+		t.Errorf("matching paths = %v, want 2 entries", rel.MatchingPaths)
+	}
+	if rel.CommitMessage != "bump image tag" {
+		t.Errorf("commit message = %q, want %q", rel.CommitMessage, "bump image tag")
+	}
+	if kubeHits.Load() == 0 || ghHits.Load() == 0 {
+		t.Errorf("expected both kube and github hits, got kube=%d github=%d", kubeHits.Load(), ghHits.Load())
+	}
+
+	// And the renderer must fence the matching files (they are quoted from
+	// a third-party commit) while leaving the State line outside the fence.
+	en := Enrichment{CommitRelevance: got}
+	evidence := renderEvidence(Report{Enrichment: en})
+	if !strings.Contains(evidence, "Recent reconciled commit (GitHub):") {
+		t.Errorf("evidence missing header:\n%s", evidence)
+	}
+	if !strings.Contains(evidence, "touches workload: apps/payments") {
+		t.Errorf("evidence missing state line:\n%s", evidence)
+	}
+	if strings.Count(evidence, untrustedBegin) < 2 {
+		// one for alerts, one for matching files
+		t.Errorf("expected matching files inside untrusted fence:\n%s", evidence)
+	}
+}
+
+// TestResolveCommitRelevanceDoesNotTouch covers the motivating case for
+// #135 end-to-end: the commit the Kustomization is reconciled at only
+// touches an unrelated workload, so the digest must say so explicitly
+// rather than hinting at a deploy.
+func TestResolveCommitRelevanceDoesNotTouch(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		// A commit that touches an unrelated path.
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump orders image"},"files":[{"filename":"apps/orders/kustomization.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceDoesNotTouch {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceDoesNotTouch, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 0 {
+		t.Errorf("expected no matching paths, got %v", rel.MatchingPaths)
+	}
+	if rel.CommitMessage != "bump orders image" {
+		t.Errorf("commit message = %q, want %q", rel.CommitMessage, "bump orders image")
+	}
+
+	// The renderer must say "does NOT touch" — never phrase it as a
+	// likely trigger.
+	en := Enrichment{CommitRelevance: got}
+	evidence := renderEvidence(Report{Enrichment: en})
+	if !strings.Contains(evidence, "does NOT touch workload") {
+		t.Errorf("evidence should explicitly say 'does NOT touch', got:\n%s", evidence)
+	}
+	joined := strings.ToLower(evidence)
+	for _, w := range []string{"trigger", "deploy", "rolled out"} {
+		if strings.Contains(joined, w) {
+			t.Errorf("evidence must not call a non-touching commit a %q, got:\n%s", w, evidence)
+		}
+	}
+}
+
+// TestResolveCommitRelevanceComponentRelativeToPath is the integration
+// regression for the Flux Kustomization components contract: spec.components
+// are relative to the Kustomization's spec.path, not to the repo root. A
+// component "../shared" under path "apps/payments/prod" resolves to
+// "apps/payments/shared", and a commit touching that resolved path must be
+// classified as "touches" the workload.
+func TestResolveCommitRelevanceComponentRelativeToPath(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments/prod","sourceRef":{"name":"payments","kind":"GitRepository"},"components":["../shared"]},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		// The commit touches only the shared component's directory, which
+		// is a sibling of the workload path: resolved it is
+		// apps/payments/shared, not "shared" and not
+		// apps/payments/prod/shared.
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"tune shared config"},"files":[{"filename":"apps/payments/shared/tuning.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.ComponentPaths) != 1 || rel.ComponentPaths[0] != "apps/payments/shared" {
+		t.Fatalf("component paths = %v, want [apps/payments/shared]", rel.ComponentPaths)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/shared/tuning.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/payments/shared/tuning.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestResolveCommitRelevanceNonGitHubRepo: a workload whose GitRepository
+// is hosted outside GitHub must degrade to State == "unknown" so the
+// digest never claims a non-GitHub lookup produced a result.
+func TestResolveCommitRelevanceNonGitHubRepo(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://gitlab.example.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	if got[0].State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q (reason=%q)", got[0].State, commitRelevanceUnknown, got[0].Reason)
+	}
+	if !strings.Contains(strings.ToLower(got[0].Reason), "github") {
+		t.Errorf("unknown reason should mention the host check, got %q", got[0].Reason)
+	}
+}
+
+// TestEnrichWiringGitHubEndToEnd exercises the full Enrich path: pass
+// a gitHubClient in, get a CommitRelevance out, with the kube API and
+// the GitHub API both stubbed.
+func TestEnrichWiringGitHubEndToEnd(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"kustomize.toolkit.fluxcd.io/name":"payments","kustomize.toolkit.fluxcd.io/namespace":"flux-system"}},"spec":{"nodeName":"n1"},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump image"},"files":[{"filename":"apps/payments/kustomization.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	g := Group{
+		Key:        "KubePodCrashLooping",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubePodCrashLooping", "namespace": "ns-a", "pod": "p"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, gh)
+	if len(en.CommitRelevance) != 1 {
+		t.Fatalf("expected 1 CommitRelevance from Enrich, got %d (enrichment=%+v)", len(en.CommitRelevance), en)
+	}
+	if en.CommitRelevance[0].State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q", en.CommitRelevance[0].State, commitRelevanceTouches)
+	}
+}
+
+// TestEnrichNoGitHubClientLeavesRelevanceEmpty verifies that the common
+// case (GITHUB_REPO/GITHUB_TOKEN unset) leaves CommitRelevance empty so
+// the renderer does not pretend a check happened.
+func TestEnrichNoGitHubClientLeavesRelevanceEmpty(t *testing.T) {
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pod listing returns a pod with Flux annotations.
+		if strings.HasSuffix(r.URL.Path, "/pods") {
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"kustomize.toolkit.fluxcd.io/name":"payments","kustomize.toolkit.fluxcd.io/namespace":"flux-system"}},"spec":{"nodeName":"n1"},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	g := Group{
+		Key:        "KubePodCrashLooping",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubePodCrashLooping", "namespace": "ns-a", "pod": "p"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
+	if len(en.CommitRelevance) != 0 {
+		t.Fatalf("expected CommitRelevance to be empty without gh, got %d entries: %+v", len(en.CommitRelevance), en.CommitRelevance)
 	}
 }

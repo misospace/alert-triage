@@ -287,6 +287,20 @@ type Enrichment struct {
 	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
 	// nothing resolves; the prose must degrade gracefully in that case.
 	RepoPaths []string
+	// CommitRelevance classifies the most recent Flux Kustomization revision
+	// for the affected workload against the workload's Git surface: one entry
+	// per resolved Kustomization, populated only when the Git source is GitHub
+	// and the GITHUB_TOKEN client is configured. A healthy Flux reconcile is
+	// not by itself evidence of a change (see fluxActivity); checking the
+	// commit that produced the revision lets the renderer say whether the
+	// reconciled commit actually touched the workload or one of its component
+	// paths, without having to fetch the diff.
+	//
+	// Empty when no Kustomization resolved, when the source is not GitHub,
+	// when the GITHUB_TOKEN env is unset, or when the lookup itself failed;
+	// each non-empty State carries the matching paths or a Reason explaining
+	// the degradation. See CommitRelevance for the three-state contract.
+	CommitRelevance []CommitRelevance
 }
 
 func (e Enrichment) empty() bool {
@@ -352,7 +366,14 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
-func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *Config) Enrichment {
+//
+// gh is the optional GitHub client used to classify the most recent
+// reconciled commit against the workload's Git surface (issue #135). It is
+// passed through here so the lookup sits alongside the rest of the
+// enrichment (one cluster read per Kustomization, no duplicate fetches);
+// nil is the common case (no GITHUB_REPO/GITHUB_TOKEN env), and the
+// CommitRelevance slice is left empty in that case.
+func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *Config, gh *gitHubClient) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
@@ -601,7 +622,115 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 	}
 	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
+	if gh != nil {
+		e.CommitRelevance = k.resolveCommitRelevance(ctx, gh, seenPods)
+	}
 	return e
+}
+
+// resolveCommitRelevance checks, for every Flux Kustomization the pods
+// resolved to, whether the commit the Kustomization is currently reconciled
+// at actually touches the workload's Git surface. The result is one
+// CommitRelevance per unique Kustomization; non-Flux owners (Argo, a
+// fallback GITOPS_REPO) are skipped because the GitHub commit API only
+// answers the question when the source is GitHub.
+//
+// The lookup is best-effort and never blocks the digest: a nil gh, a
+// non-GitHub URL, an unparseable revision, or any API error degrades to
+// State == "unknown" with a one-line Reason, leaving RepoPaths and the
+// rest of the evidence intact. The function does not touch RepoPaths
+// itself — it only reads the pods' annotations to find the Kustomizations
+// they belong to, so a future KustomizationTopology lookup (#134) can
+// populate ComponentPaths from the same Kustomization read.
+//
+// Component paths default to nil because the topology signal is not yet
+// available in this branch; once #134 lands, the caller can read the
+// spec.components out of the same Kustomization read and pass them in.
+func (k *kube) resolveCommitRelevance(ctx context.Context, gh *gitHubClient, seenPods []podRef) []CommitRelevance {
+	if gh == nil {
+		return nil
+	}
+	if len(seenPods) == 0 {
+		return nil
+	}
+	type key struct{ ns, name string }
+	seen := map[key]bool{}
+	var out []CommitRelevance
+	for _, p := range seenPods {
+		kustom := p.Annotations["kustomize.toolkit.fluxcd.io/name"]
+		if kustom == "" {
+			continue
+		}
+		ns := p.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+		if ns == "" {
+			ns = p.Namespace
+		}
+		kk := key{ns: ns, name: kustom}
+		if seen[kk] {
+			continue
+		}
+		seen[kk] = true
+		out = append(out, k.fluxKustomizationRelevance(ctx, gh, ns, kustom))
+	}
+	return out
+}
+
+// fluxKustomizationRelevance reads one Flux Kustomization, resolves its
+// GitRepository + path, and (when the source is GitHub) classifies the
+// commit it is currently reconciled at against the workload's path. The
+// returned CommitRelevance always carries enough context to render even
+// when the lookup degraded to "unknown".
+func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient, ns, name string) CommitRelevance {
+	rel := CommitRelevance{State: commitRelevanceUnknown}
+	if k == nil {
+		rel.Reason = "no Kubernetes client available for this cluster"
+		return rel
+	}
+	var kuz struct {
+		Spec struct {
+			Path      string `json:"path"`
+			SourceRef struct {
+				Name string `json:"name"`
+				Kind string `json:"kind"`
+			} `json:"sourceRef"`
+			Components []string `json:"components"`
+		} `json:"spec"`
+		Status struct {
+			LastAppliedRevision string `json:"lastAppliedRevision"`
+		} `json:"status"`
+	}
+	p := "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + ns + "/kustomizations/" + name
+	if err := k.get(ctx, p, &kuz); err != nil {
+		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
+		return rel
+	}
+	srcKind := kuz.Spec.SourceRef.Kind
+	if srcKind == "" {
+		srcKind = "GitRepository"
+	}
+	var src struct {
+		Spec struct {
+			URL string `json:"url"`
+		} `json:"spec"`
+	}
+	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
+	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
+		return rel
+	}
+	rel.RepoURL = src.Spec.URL
+	rel.WorkloadPath = kuz.Spec.Path
+	rel.ComponentPaths = kuz.Spec.Components
+	rel.Revision = kuz.Status.LastAppliedRevision
+	return classifyCommit(ctx, gh, rel.RepoURL, rel.Revision, rel.WorkloadPath, rel.ComponentPaths)
+}
+
+// safeErr renders an err as a string without panicking on nil.
+func safeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // resolveJobs fetches, from this client's cluster, every distinct job that an
