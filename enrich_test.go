@@ -1924,3 +1924,117 @@ func TestEnrichNoSubjectEventsAreAmbient(t *testing.T) {
 		t.Fatalf("fallback evidence should be broad/background, got %s", got)
 	}
 }
+
+// newLogsBackendForTest builds a logsBackend wired to a test server without
+// touching process environment, so Enrich-level tests can exercise the
+// backend-logs path directly.
+func newLogsBackendForTest(t *testing.T, srv *httptest.Server) *logsBackend {
+	t.Helper()
+	return &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+}
+
+// TestEnrichBackendLogsNoSubjectGoesAmbient proves the Enrich-level routing:
+// when the alert resolves to no concrete subject, the namespace-wide
+// backend-log lookup is kept but its result is explicitly marked ambient and
+// is not presented as evidence from the failing resource.
+func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/pods") || strings.Contains(r.URL.Path, "/log") || strings.Contains(r.URL.Path, "/nodes") || strings.Contains(r.URL.Path, "/events") {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			q := r.URL.Query().Get("query")
+			if strings.Contains(q, "pod:") {
+				t.Errorf("namespace-only expected, got pod-scoped query %q", q)
+			}
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"unrelated","namespace":"ns1"},"values":[["1","namespace chatter line"]]}]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.BackendLogs) != 0 {
+		t.Fatalf("namespace-wide logs must not enter primary evidence without a subject, got %v", en.BackendLogs)
+	}
+	// "empty" here would be false: the backend answered and its namespace-wide
+	// lines are the Ambient entries below. The state must say so.
+	if en.BackendState != "ambient" {
+		t.Fatalf("expected state \"ambient\" (no subject resolved, namespace-wide lines returned), got %q", en.BackendState)
+	}
+	foundAmbient := false
+	for _, a := range en.Ambient {
+		if !strings.Contains(a, "(ambient, namespace-wide)") {
+			continue
+		}
+		foundAmbient = true
+		if !strings.Contains(a, "namespace chatter line") {
+			t.Fatalf("ambient line must be the namespace-wide line, got %q", a)
+		}
+	}
+	if !foundAmbient {
+		t.Fatalf("expected one ambient-marked backend-log line, got %v", en.Ambient)
+	}
+}
+
+// TestEnrichBackendLogsTargetPodIsPrimary proves the primary path: when the
+// resolved target-pod set is non-empty, backend logs are pod-scoped, the
+// namespace-wide query is not issued, and unrelated namespace log lines never
+// enter the evidence.
+func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/pods") || strings.Contains(r.URL.Path, "/log") || strings.Contains(r.URL.Path, "/nodes") || strings.Contains(r.URL.Path, "/events") {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			q := r.URL.Query().Get("query")
+			if !strings.Contains(q, `pod:"p1"`) {
+				t.Errorf("expected only a pod-scoped query, got %q", q)
+			}
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns1"},"values":[["1","target failure line"]]}]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "p1"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+
+	if len(en.BackendLogs) != 1 || !strings.Contains(en.BackendLogs[0], "target failure line") {
+		t.Fatalf("expected the target pod's line as the only primary line, got %v", en.BackendLogs)
+	}
+	if en.BackendState != "ok" {
+		t.Fatalf("expected state \"ok\", got %q", en.BackendState)
+	}
+	for _, a := range en.Ambient {
+		if strings.Contains(a, "(ambient, namespace-wide)") {
+			t.Fatalf("no ambient backend logs expected when a subject is resolved, got %v", en.Ambient)
+		}
+	}
+}
