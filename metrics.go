@@ -301,23 +301,7 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, start, end time.Time, step time.Duration) []string {
 	var lines []string
 
-	labelFilter := fmt.Sprintf(`namespace="%s"`, escapeLabelValue(ns))
-	if pod != "" {
-		labelFilter += fmt.Sprintf(`,pod="%s"`, escapeLabelValue(pod))
-	}
-
-	type metricQuery struct {
-		name string
-		expr string
-	}
-
-	queries := []metricQuery{
-		{"container_restarts", fmt.Sprintf(`kube_pod_container_status_restarts_total{%s}`, labelFilter)},
-		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / ignoring(container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
-		{"cpu_throttle_ratio", fmt.Sprintf(`rate(container_cpu_throttled_seconds_total{%s}[5m])`, labelFilter)},
-	}
-
-	for _, q := range queries {
+	for _, q := range contextMetricQueries(ns, pod) {
 		summaries, err := p.queryRange(ctx, q.expr, start, end, step)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("%s: query error: %v", q.name, err))
@@ -335,9 +319,36 @@ func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, st
 	return lines
 }
 
-// escapeLabelValue escapes double quotes in a label value for safe embedding
-// in PromQL string literals.
+// contextMetricQueries builds the fixed context-metric expressions for the
+// given namespace and optional pod, escaping label values for PromQL string
+// literals. Kept pure (no I/O) so the escaping can be asserted without a
+// live backend.
+func contextMetricQueries(ns, pod string) []struct {
+	name string
+	expr string
+} {
+	labelFilter := fmt.Sprintf(`namespace="%s"`, escapeLabelValue(ns))
+	if pod != "" {
+		labelFilter += fmt.Sprintf(`,pod="%s"`, escapeLabelValue(pod))
+	}
+
+	return []struct {
+		name string
+		expr string
+	}{
+		{"container_restarts", fmt.Sprintf(`kube_pod_container_status_restarts_total{%s}`, labelFilter)},
+		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / ignoring(container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
+		{"cpu_throttle_ratio", fmt.Sprintf(`rate(container_cpu_throttled_seconds_total{%s}[5m])`, labelFilter)},
+	}
+}
+
+// escapeLabelValue escapes backslashes and double quotes in a label value
+// for safe embedding in PromQL string literals. The backslash pass runs first:
+// escaping quotes first would let its pass double the backslashes it inserted,
+// and an unescaped backslash is read by the backend as the start of an escape
+// sequence, breaking the query.
 func escapeLabelValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
 	return strings.ReplaceAll(v, `"`, `\"`)
 }
 
