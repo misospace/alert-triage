@@ -2165,6 +2165,41 @@ func TestRender_oneShotContainerEvidenceLabelsCurrentStream(t *testing.T) {
 	}
 }
 
+// Issue #128 review: the provenance the renderer must carry is the SELECTED
+// stream, and the one-shot case is not the only one. A restarted (CrashLoop)
+// container is logged through the *previous* stream, so its per-entry header
+// must say "previous stream", not "current" — the mirror image of the
+// one-shot regression above, asserting the label follows the real selection in
+// both the model-visible evidence and the Discord delivery.
+func TestRender_restartedContainerEvidenceLabelsPreviousStream(t *testing.T) {
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodRestart", "namespace": "ns1", "pod": "flaky-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := Enrichment{
+		PodLogs: map[string]string{"ns1/flaky-1": "panic: nil"},
+		PodLogProvenance: map[string]podLogProvenance{
+			"ns1/flaky-1": {Container: "app", Stream: "previous"},
+		},
+		ContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
+	}
+	body := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(body, "container app, previous stream") {
+		t.Errorf("rendered evidence missing 'container app, previous stream' header:\n%s", body)
+	}
+	if strings.Contains(body, "current stream") {
+		t.Errorf("rendered evidence labels a restarted container's log 'current stream':\n%s", body)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "container app, previous stream") {
+		t.Errorf("discord description missing 'container app, previous stream' provenance:\n%s", discord)
+	}
+	if strings.Contains(discord, "current stream") {
+		t.Errorf("discord description labels a restarted container's log 'current stream':\n%s", discord)
+	}
+}
+
 // Issue #128 review (minor, enrich.go:1133): fetchPodLogs records a provenance
 // entry for every spec, even when the spec names no container. The renderers
 // guard with `p.Container != ""`, so an empty-container spec must be dropped
