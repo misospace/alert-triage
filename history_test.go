@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -377,6 +380,100 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 	}
 	if got := reloaded.PriorSeen(sig, title); got != 1 {
 		t.Errorf("after 1 fail + 1 success, PriorSeen = %d, want 1", got)
+	}
+}
+
+// TestHistoryLoadSurvivesOversizedLine is the regression test for issue
+// #162: load used a bufio.Scanner capped at 1 MiB per token, so one line
+// over the cap (bufio.ErrTooLong) ended the whole read and every record
+// after it was dropped; the next Compact then persisted the truncated
+// snapshot. A 2 MiB line sandwiched between two valid records must be
+// skipped and both valid records must still load.
+func TestHistoryLoadSurvivesOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	// 2 MiB line, over the old 1 MiB scanner cap.
+	if _, err := f.WriteString(strings.Repeat("a", 2*1024*1024) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Encode(sighting{Signature: "after_sig", Title: "after_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
+	}
+	if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+		t.Errorf("PriorSeen(after_sig) = %d, want 1 (record after the oversized line must not be dropped)", got)
+	}
+	if got := len(h.entries); got != 2 {
+		t.Errorf("expected 2 entries, got %d", got)
+	}
+}
+
+// TestHistoryLoadOversizedLineIsLogged is the second half of issue #162's
+// acceptance: the oversized line is skipped but logged once, and the read
+// continues past it (no panic, no early stop).
+func TestHistoryLoadOversizedLineIsLogged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("b", 2*1024*1024) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Encode(sighting{Signature: "after_sig", Title: "after_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("NewHistory panicked on oversized line: %v", rec)
+			}
+		}()
+		h, err := NewHistory(path, retain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+			t.Errorf("read stopped at the oversized line: PriorSeen(after_sig) = %d, want 1", got)
+		}
+	}()
+
+	if !strings.Contains(logBuf.String(), "skipping oversized line") {
+		t.Errorf("expected the oversized line to be logged once; log output: %q", logBuf.String())
 	}
 }
 
