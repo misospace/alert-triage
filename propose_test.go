@@ -31,9 +31,15 @@ spec:
               memory: 32Mi
 `
 
+// oomAlerts is a minimal group of alerts that passes the memory-pressure
+// gate: one OOMKilled alert.
+func oomAlerts() []Alert {
+	return []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}}
+}
+
 func TestProposeRaisesOnlyTheOomKilledContainer(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	diff := Propose(triage, "k8s/web.yaml", multiContainerManifest)
+	diff := Propose(oomAlerts(), triage, "k8s/web.yaml", multiContainerManifest)
 	if diff == "" {
 		t.Fatalf("expected a non-empty diff")
 	}
@@ -52,22 +58,85 @@ func TestProposeRaisesOnlyTheOomKilledContainer(t *testing.T) {
 
 func TestProposeRefusesLowConfidence(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "low"}
-	if got := Propose(triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+	if got := Propose(oomAlerts(), triage, "k8s/web.yaml", multiContainerManifest); got != "" {
 		t.Fatalf("expected no proposal for low confidence, got %q", got)
 	}
 }
 
 func TestProposeRefusesNonGitFixLocation(t *testing.T) {
 	triage := Triage{FixLocation: "cluster", Confidence: "high"}
-	if got := Propose(triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+	if got := Propose(oomAlerts(), triage, "k8s/web.yaml", multiContainerManifest); got != "" {
 		t.Fatalf("expected no proposal for non-git fix_location, got %q", got)
 	}
 }
 
 func TestProposeRefusesEmptyPath(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	if got := Propose(triage, "", multiContainerManifest); got != "" {
+	if got := Propose(oomAlerts(), triage, "", multiContainerManifest); got != "" {
 		t.Fatalf("expected no proposal when path is missing, got %q", got)
+	}
+}
+
+// The alert-type gate: a high-confidence git triage is not enough on its own;
+// the group must actually be about a container killed for memory.
+func TestProposeRefusesNonMemoryPressureAlert(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	alerts := []Alert{
+		{Labels: map[string]string{"alertname": "KubeNodeNotReady", "severity": "critical"}},
+	}
+	if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal for a non-memory-pressure alert, got %q", got)
+	}
+}
+
+func TestProposeRefusesNoAlerts(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	if got := Propose(nil, triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal when the group carries no alerts, got %q", got)
+	}
+}
+
+// The gate is a per-alert check over the group: one memory-pressure alert
+// among other noise makes the group eligible.
+func TestProposeAcceptsGroupContainingOOMKilled(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	alerts := []Alert{
+		{Labels: map[string]string{"alertname": "KubePodNotReady", "severity": "warning"}},
+		{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}},
+	}
+	diff := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal when the group contains an OOMKilled alert")
+	}
+}
+
+// ContainerOOMKilled is the kube-state-metrics spelling of the same fault.
+func TestProposeAcceptsContainerOOMKilled(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	alerts := []Alert{{Labels: map[string]string{"alertname": "ContainerOOMKilled", "severity": "warning"}}}
+	diff := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal for ContainerOOMKilled")
+	}
+}
+
+// KubeStateMetrics rules report the fault through the terminated-reason
+// label rather than an alertname of OOMKilled; the gate recognises it.
+func TestProposeAcceptsTerminatedReasonLabel(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	for _, k := range []string{
+		"kube_pod_container_status_terminated_reason",
+		"kube_pod_container_status_last_terminated_reason",
+	} {
+		alerts := []Alert{{Labels: map[string]string{"alertname": "PodTerminated", k: "OOMKilled"}}}
+		if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got == "" {
+			t.Fatalf("expected a proposal for %s=OOMKilled", k)
+		}
+	}
+	// A terminated-reason label with any other reason is not memory pressure.
+	alerts := []Alert{{Labels: map[string]string{"alertname": "PodTerminated", "kube_pod_container_status_terminated_reason": "Error"}}}
+	if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal for a non-OOMKilled terminated reason, got %q", got)
 	}
 }
 

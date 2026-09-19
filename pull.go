@@ -13,6 +13,9 @@ package main
 //     must not silently turn this on.
 //   - fix_location=git AND confidence=high only — strictly tighter than the
 //     proposal gate (proposalEligible also admits "partial").
+//   - The group's alerts must name a memory-pressure fault (OOMKilled /
+//     ContainerOOMKilled alert, or a terminated-reason label of OOMKilled);
+//     Propose enforces the same gate before it touches any file content.
 //   - A non-empty Propose diff that applies cleanly is a hard prerequisite for
 //     any write. The committed content is the patched full file, derived by
 //     applying the validated diff to the authoritative repo content, never a
@@ -389,10 +392,12 @@ type filePatch struct {
 }
 
 // preparePatch fetches the authoritative file from the default branch, runs
-// the validated Propose diff, and applies it to the full content. errNoPatch
-// means Propose declined (change class not validated); errPatchStale means the
-// diff would not apply to the current content (e.g. the file drifted). Neither
-// is an API failure.
+// the validated Propose diff, and applies it to the full content. The group's
+// alerts are passed through to the alert-type gate inside Propose, so a
+// non-memory-pressure alert is refused before any file content is touched.
+// errNoPatch means Propose declined (change class not validated);
+// errPatchStale means the diff would not apply to the current content
+// (e.g. the file drifted). Neither is an API failure.
 func preparePatch(ctx context.Context, gh *gitHubClient, relPath string, r Report) (*filePatch, error) {
 	defaultBranch, defaultHeadSHA, err := gh.defaultBranch(ctx)
 	if err != nil {
@@ -407,7 +412,7 @@ func preparePatch(ctx context.Context, gh *gitHubClient, relPath string, r Repor
 	if err != nil {
 		return nil, err
 	}
-	diff := Propose(r.Triage, relPath, current)
+	diff := Propose(r.Group.Alerts, r.Triage, relPath, current)
 	if diff == "" {
 		return nil, errNoPatch
 	}

@@ -126,7 +126,7 @@ spec:
 
 func TestApplyDiffRoundTrip(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	diff := Propose(triage, "deploy/web.yaml", patchableManifest)
+	diff := Propose(oomAlerts(), triage, "deploy/web.yaml", patchableManifest)
 	if diff == "" {
 		t.Fatalf("expected a diff from Propose")
 	}
@@ -438,7 +438,9 @@ func triageReport() Report {
 	return Report{
 		Group: Group{
 			Cluster: "default",
-			Alerts:  []Alert{{Labels: map[string]string{"alertname": "XPodCrash", "severity": "warning"}}},
+			// The group names an OOMKilled alert: the alert-type gate in
+			// Propose requires a memory-pressure alert for the write arm.
+			Alerts: []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}},
 		},
 		Triage:     Triage{FixLocation: "git", Confidence: "high", WhatToChange: "raise memory limit in deploy/web.yaml", Narrative: "The api container is being OOM-killed."},
 		Narrative:  "The api container is being OOM-killed.",
@@ -655,6 +657,26 @@ func TestDeliverPullSkipsWhenProposeRefuses(t *testing.T) {
 	}
 	if f.prCalls != 0 || f.puts != 0 {
 		t.Errorf("Propose refusal must not write: prs=%d puts=%d", f.prCalls, f.puts)
+	}
+}
+
+func TestDeliverPullSkipsNonMemoryPressureAlert(t *testing.T) {
+	// A high-confidence git triage over a patchable manifest is not enough:
+	// the group fired for a node fault, not a memory kill, so the PR arm
+	// stays silent.
+	f := newFakeGH(t, nil, 0)
+	r := triageReport()
+	r.Group.Alerts = []Alert{{Labels: map[string]string{"alertname": "KubeNodeNotReady", "severity": "critical"}}}
+
+	act, err := deliverPull(context.Background(), f.client(), prCfg(), r)
+	if err != nil {
+		t.Fatalf("deliverPull: %v", err)
+	}
+	if act.Outcome != "skipped" {
+		t.Errorf("expected skipped for a non-memory-pressure alert, got %s", act.Outcome)
+	}
+	if f.prCalls != 0 || f.puts != 0 {
+		t.Errorf("non-memory-pressure alert must not write: prs=%d puts=%d", f.prCalls, f.puts)
 	}
 }
 
@@ -933,7 +955,8 @@ func (f *fakeRepoServer) handle(w http.ResponseWriter, r *http.Request) {
 // validated Propose diff applied to the authoritative original.
 func patchedManifest(t *testing.T) string {
 	t.Helper()
-	diff := Propose(triageReport().Triage, "deploy/web.yaml", patchableManifest)
+	r := triageReport()
+	diff := Propose(r.Group.Alerts, r.Triage, "deploy/web.yaml", patchableManifest)
 	if diff == "" {
 		t.Fatalf("expected Propose to yield a diff for patchableManifest")
 	}
