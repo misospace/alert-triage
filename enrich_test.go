@@ -97,11 +97,11 @@ func TestStripSecrets(t *testing.T) {
 
 func TestFetchPodLogs_empty(t *testing.T) {
 	k := &kube{}
-	got := k.fetchPodLogs(context.Background(), nil, DefaultPodLogConcurrency)
+	got, _ := k.fetchPodLogs(context.Background(), nil, DefaultPodLogConcurrency)
 	if got != nil {
 		t.Errorf("expected nil for empty pods, got %v", got)
 	}
-	got = k.fetchPodLogs(context.Background(), []string{}, DefaultPodLogConcurrency)
+	got, _ = k.fetchPodLogs(context.Background(), []podLogSpec{}, DefaultPodLogConcurrency)
 	if got != nil {
 		t.Errorf("expected nil for empty slice, got %v", got)
 	}
@@ -138,16 +138,19 @@ func TestNormalizePodLogConcurrency(t *testing.T) {
 }
 
 func TestFetchPodLogs_badKey(t *testing.T) {
+	// podLogSpec has no string key to be malformed: only the namespace/name
+	// pair can fail. A nil Name still produces a key, so test the empty-spec
+	// path here too.
 	k := &kube{}
-	got := k.fetchPodLogs(context.Background(), []string{"no-slash"}, DefaultPodLogConcurrency)
+	got, _ := k.fetchPodLogs(context.Background(), []podLogSpec{{Namespace: "ns"}}, DefaultPodLogConcurrency)
 	if len(got) != 0 {
-		t.Errorf("expected empty map for bad key, got %v", got)
+		t.Errorf("expected empty map for empty Name, got %v", got)
 	}
 }
 
 func TestFetchPodLogs_noServer(t *testing.T) {
 	k := &kube{base: "http://127.0.0.1:1"}
-	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"}, DefaultPodLogConcurrency)
+	got, _ := k.fetchPodLogs(context.Background(), []podLogSpec{{Namespace: "ns", Name: "pod"}}, DefaultPodLogConcurrency)
 	if len(got) != 0 {
 		t.Errorf("expected empty map when server unreachable, got %v", got)
 	}
@@ -169,12 +172,15 @@ func TestFetchPodLogs_success(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"}, DefaultPodLogConcurrency)
+	got, prov := k.fetchPodLogs(context.Background(), []podLogSpec{{Namespace: "ns", Name: "pod", Previous: true}}, DefaultPodLogConcurrency)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
 	if !strings.Contains(got["ns/pod"], "line1") {
 		t.Errorf("log missing expected content: %q", got["ns/pod"])
+	}
+	if p := prov["ns/pod"]; p.Stream != "previous" {
+		t.Errorf("provenance stream = %q, want previous", p.Stream)
 	}
 }
 
@@ -185,7 +191,7 @@ func TestFetchPodLogs_stripsSecrets(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"}, DefaultPodLogConcurrency)
+	got, _ := k.fetchPodLogs(context.Background(), []podLogSpec{{Namespace: "ns", Name: "pod"}}, DefaultPodLogConcurrency)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
@@ -204,7 +210,7 @@ func TestFetchPodLogs_capped(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL + "/", token: "tok", hc: http.DefaultClient}
-	got := k.fetchPodLogs(context.Background(), []string{"ns/pod"}, DefaultPodLogConcurrency)
+	got, _ := k.fetchPodLogs(context.Background(), []podLogSpec{{Namespace: "ns", Name: "pod"}}, DefaultPodLogConcurrency)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 log, got %d", len(got))
 	}
@@ -273,7 +279,16 @@ func TestFetchPodLogsStalledPodDoesNotSerialise(t *testing.T) {
 	defer srv.Close()
 
 	k := &kube{base: srv.URL, token: "tok", hc: &http.Client{Timeout: cost * 3}}
-	pods := []string{"ns/p1", "ns/p2", "ns/p3", "ns/p4", "ns/p5", "ns/p6", "ns/p7", "ns/p8"}
+	pods := []podLogSpec{
+		{Namespace: "ns", Name: "p1"},
+		{Namespace: "ns", Name: "p2"},
+		{Namespace: "ns", Name: "p3"},
+		{Namespace: "ns", Name: "p4"},
+		{Namespace: "ns", Name: "p5"},
+		{Namespace: "ns", Name: "p6"},
+		{Namespace: "ns", Name: "p7"},
+		{Namespace: "ns", Name: "p8"},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -282,7 +297,8 @@ func TestFetchPodLogsStalledPodDoesNotSerialise(t *testing.T) {
 	start := time.Now()
 	done := make(chan map[string]string, 1)
 	go func() {
-		done <- k.fetchPodLogs(ctx, pods, DefaultPodLogConcurrency)
+		got, _ := k.fetchPodLogs(ctx, pods, DefaultPodLogConcurrency)
+		done <- got
 	}()
 
 	select {
@@ -898,7 +914,8 @@ func TestFetchPodLogsContextCancelled(t *testing.T) {
 
 	done := make(chan map[string]string, 1)
 	go func() {
-		done <- k.fetchPodLogs(ctx, []string{"ns/pod"}, DefaultPodLogConcurrency)
+		got, _ := k.fetchPodLogs(ctx, []podLogSpec{{Namespace: "ns", Name: "pod"}}, DefaultPodLogConcurrency)
+		done <- got
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -947,13 +964,22 @@ func TestFetchPodLogsConcurrentCallersDoNotRace(t *testing.T) {
 	// callers would race on the same field; the fix passes it on the
 	// stack so there is nothing on *kube to race on.
 	const callers = 8
-	pods := []string{"ns/p1", "ns/p2", "ns/p3", "ns/p4", "ns/p5", "ns/p6", "ns/p7", "ns/p8"}
+	pods := []podLogSpec{
+		{Namespace: "ns", Name: "p1"},
+		{Namespace: "ns", Name: "p2"},
+		{Namespace: "ns", Name: "p3"},
+		{Namespace: "ns", Name: "p4"},
+		{Namespace: "ns", Name: "p5"},
+		{Namespace: "ns", Name: "p6"},
+		{Namespace: "ns", Name: "p7"},
+		{Namespace: "ns", Name: "p8"},
+	}
 	done := make(chan struct{}, callers)
 	for i := 0; i < callers; i++ {
 		concurrency := i%DefaultPodLogConcurrency + 1
 		go func(c int) {
 			defer func() { done <- struct{}{} }()
-			got := k.fetchPodLogs(context.Background(), pods, c)
+			got, _ := k.fetchPodLogs(context.Background(), pods, c)
 			if len(got) != len(pods) {
 				t.Errorf("caller concurrency=%d: expected %d logs, got %d", c, len(pods), len(got))
 			}
@@ -2037,4 +2063,408 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 			t.Fatalf("no ambient backend logs expected when a subject is resolved, got %v", en.Ambient)
 		}
 	}
+}
+
+// Issue #128: a failed one-shot Job container (terminated once, never
+// restarted) must surface as a ContainerDiagnostic and have its log fetched
+// as the CURRENT stream, not previous. The previous-stream request would 404
+// because no previous instance ever existed.
+func TestEnrich_oneShotTerminatedContainerFetchesCurrentLog(t *testing.T) {
+	logCh := make(chan string, 4)
+	pods := `{"items":[
+		{"metadata":{"name":"backup-1","namespace":"ns1"},
+		 "status":{"phase":"Failed",
+			  "containerStatuses":[
+				{"name":"backup","ready":false,"restartCount":0,
+				 "state":{"terminated":{"exitCode":1,"reason":"Error",
+					"message":"checksum mismatch","finishedAt":"2026-01-02T03:04:05Z"}}}]}}
+	]}`
+	srv := newEnrichTestServer(pods, "backup failed: checksum mismatch\n", logCh)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	if len(en.UnhealthyPods) == 0 {
+		t.Fatalf("expected a failed one-shot pod to be listed unhealthy, got none")
+	}
+	found := false
+	for _, d := range en.ContainerDiagnostics {
+		if strings.Contains(d, "backup-1") &&
+			strings.Contains(d, "container backup") &&
+			strings.Contains(d, "exit=1") &&
+			strings.Contains(d, "reason=Error") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a terminated diagnostic for the one-shot container, got: %v", en.ContainerDiagnostics)
+	}
+	select {
+	case q := <-logCh:
+		if !strings.Contains(q, "container=backup") {
+			t.Errorf("log request must name the failing container, got: %s", q)
+		}
+		if p := queryPrevious(q); p != "" {
+			t.Errorf("a one-shot container must use the current log, got previous=%s in: %s", p, q)
+		}
+	default:
+		t.Fatal("expected a log fetch for the failing one-shot container")
+	}
+	if prov, ok := en.PodLogProvenance["ns1/backup-1"]; !ok {
+		t.Errorf("expected provenance recorded for the one-shot pod, got: %v", en.PodLogProvenance)
+	} else if prov.Stream != "current" {
+		t.Errorf("provenance stream = %q, want current", prov.Stream)
+	}
+}
+
+// Issue #128 review regression: the rendered evidence for a one-shot Job
+// must NOT call the current log a "previous container tail", and must
+// surface the diagnostic line that says why the container ended.
+func TestRender_oneShotContainerEvidenceLabelsCurrentStream(t *testing.T) {
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := Enrichment{
+		PodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		PodLogProvenance: map[string]podLogProvenance{
+			"ns1/backup-1": {Container: "backup", Stream: "current"},
+		},
+		ContainerDiagnostics: []string{"ns1/backup-1: container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z — checksum mismatch"},
+	}
+	body := renderEvidence(Report{Group: g, Enrichment: en})
+
+	// The reviewer-flagged regression: never call a current log a previous
+	// container tail.
+	if strings.Contains(body, "previous container tail") {
+		t.Errorf("rendered evidence still labels the section 'previous container tail':\n%s", body)
+	}
+	// The per-entry header must identify container + current stream so the
+	// model and the operator know what they are looking at.
+	if !strings.Contains(body, "container backup, current stream") {
+		t.Errorf("rendered evidence missing 'container backup, current stream' header:\n%s", body)
+	}
+	// The diagnostic line — the short path to root cause for a one-shot Job —
+	// must reach the model before it is called.
+	if !strings.Contains(body, "container backup terminated exit=1 reason=Error") {
+		t.Errorf("rendered evidence missing the terminated-container diagnostic:\n%s", body)
+	}
+
+	// Discord delivery: same provenance requirement, same labels.
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "previous container tail") {
+		t.Errorf("discord description still labels logs 'previous container tail':\n%s", discord)
+	}
+	if !strings.Contains(discord, "container backup, current stream") {
+		t.Errorf("discord description missing container/stream provenance:\n%s", discord)
+	}
+}
+
+// Issue #128 review: the provenance the renderer must carry is the SELECTED
+// stream, and the one-shot case is not the only one. A restarted (CrashLoop)
+// container is logged through the *previous* stream, so its per-entry header
+// must say "previous stream", not "current" — the mirror image of the
+// one-shot regression above, asserting the label follows the real selection in
+// both the model-visible evidence and the Discord delivery.
+func TestRender_restartedContainerEvidenceLabelsPreviousStream(t *testing.T) {
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodRestart", "namespace": "ns1", "pod": "flaky-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := Enrichment{
+		PodLogs: map[string]string{"ns1/flaky-1": "panic: nil"},
+		PodLogProvenance: map[string]podLogProvenance{
+			"ns1/flaky-1": {Container: "app", Stream: "previous"},
+		},
+		ContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
+	}
+	body := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(body, "container app, previous stream") {
+		t.Errorf("rendered evidence missing 'container app, previous stream' header:\n%s", body)
+	}
+	if strings.Contains(body, "current stream") {
+		t.Errorf("rendered evidence labels a restarted container's log 'current stream':\n%s", body)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "container app, previous stream") {
+		t.Errorf("discord description missing 'container app, previous stream' provenance:\n%s", discord)
+	}
+	if strings.Contains(discord, "current stream") {
+		t.Errorf("discord description labels a restarted container's log 'current stream':\n%s", discord)
+	}
+}
+
+// Issue #128 review (minor, enrich.go:1133): fetchPodLogs records a provenance
+// entry for every spec, even when the spec names no container. The renderers
+// guard with `p.Container != ""`, so an empty-container spec must be dropped
+// silently: neither the evidence nor the chat may print a "container , ...
+// stream" header for it. This pins that guard — a regression that rendered
+// the empty-container provenance as a malformed header would be caught here.
+func TestRender_emptyContainerProvenanceIsNotVisible(t *testing.T) {
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := Enrichment{
+		PodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		PodLogProvenance: map[string]podLogProvenance{
+			// Container is empty: the renderers must not surface it.
+			"ns1/backup-1": {Container: "", Stream: "current"},
+		},
+	}
+	body := renderEvidence(Report{Group: g, Enrichment: en})
+	// The pod key and the log must still reach the model...
+	if !strings.Contains(body, "## ns1/backup-1") {
+		t.Fatalf("rendered evidence missing the pod header:\n%s", body)
+	}
+	if !strings.Contains(body, "checksum mismatch") {
+		t.Fatalf("rendered evidence missing the log body:\n%s", body)
+	}
+	// ...and the container/stream provenance header must not, because the
+	// provenance names no container.
+	if strings.Contains(body, "container ") {
+		t.Errorf("rendered evidence leaked a container provenance header for an empty-container spec:\n%s", body)
+	}
+	if strings.Contains(body, "stream:") {
+		t.Errorf("rendered evidence leaked a stream provenance header for an empty-container spec:\n%s", body)
+	}
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "`ns1/backup-1`") {
+		t.Fatalf("discord description missing the plain pod label:\n%s", discord)
+	}
+	if strings.Contains(discord, "container") {
+		t.Errorf("discord description leaked a container provenance label for an empty-container spec:\n%s", discord)
+	}
+	if strings.Contains(discord, "stream") {
+		t.Errorf("discord description leaked a stream provenance label for an empty-container spec:\n%s", discord)
+	}
+}
+
+// Issue #128: a restarted (CrashLoop) container must have its log fetched
+// as the PREVIOUS stream and the failure evidence comes from its last run.
+func TestEnrich_restartedContainerUsesPreviousLog(t *testing.T) {
+	logCh := make(chan string, 4)
+	pods := `{"items":[
+		{"metadata":{"name":"flaky-1","namespace":"ns1"},
+		 "status":{"phase":"Running",
+			  "containerStatuses":[
+				{"name":"app","ready":false,"restartCount":3,
+				 "state":{"waiting":{"reason":"CrashLoopBackOff"}},
+				 "lastState":{"terminated":{"exitCode":1,"reason":"Error",
+					"message":"panic: nil","finishedAt":"2026-01-02T03:04:05Z"}}}]}}
+	]}`
+	srv := newEnrichTestServer(pods, "panic: nil\n", logCh)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodRestart", "namespace": "ns1", "pod": "flaky-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	found := false
+	for _, d := range en.ContainerDiagnostics {
+		if strings.Contains(d, "flaky-1") && strings.Contains(d, "exit=1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a last-run diagnostic for the crashed container, got: %v", en.ContainerDiagnostics)
+	}
+	select {
+	case q := <-logCh:
+		if !strings.Contains(q, "container=app") {
+			t.Errorf("log request must name the failing container, got: %s", q)
+		}
+		if p := queryPrevious(q); p != "true" {
+			t.Errorf("a restarted container must use the previous log, got previous=%q in: %s", p, q)
+		}
+	default:
+		t.Fatal("expected a log fetch for the restarted container")
+	}
+	if prov, ok := en.PodLogProvenance["ns1/flaky-1"]; !ok {
+		t.Errorf("expected provenance recorded for the restarted pod, got: %v", en.PodLogProvenance)
+	} else if prov.Stream != "previous" {
+		t.Errorf("provenance stream = %q, want previous", prov.Stream)
+	}
+}
+
+// Issue #128: a successful (Succeeded) one-shot pod must not be reported as
+// a failure and must not have its log fetched (no diagnostic, no stream).
+func TestEnrich_succeededContainerIsSkipped(t *testing.T) {
+	var logHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/log"):
+			logHits++
+			w.Write([]byte("ok\n"))
+		default:
+			_, _ = io.WriteString(w, `{"items":[
+				{"metadata":{"name":"done-1","namespace":"ns1"},
+				 "status":{"phase":"Succeeded",
+					  "containerStatuses":[
+						{"name":"job","ready":false,"restartCount":0,
+						 "state":{"terminated":{"exitCode":0,"reason":"Completed",
+							"finishedAt":"2026-01-02T03:04:05Z"}}}]}}
+			]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodCompleted", "namespace": "ns1", "pod": "done-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	for _, p := range en.UnhealthyPods {
+		if strings.Contains(p, "done-1") {
+			t.Errorf("Succeeded pod must not be listed unhealthy, got %q", p)
+		}
+	}
+	if len(en.ContainerDiagnostics) != 0 {
+		t.Errorf("Succeeded pod must produce no container diagnostic, got %v", en.ContainerDiagnostics)
+	}
+	if logHits != 0 {
+		t.Errorf("Succeeded pod's log must not be fetched, got %d fetches", logHits)
+	}
+	if len(en.PodLogProvenance) != 0 {
+		t.Errorf("Succeeded pod must not record provenance, got %v", en.PodLogProvenance)
+	}
+}
+
+// Issue #128: a multi-container pod where only one container failed must be
+// logged through the failing container (named explicitly), not the apiserver's
+// default-container choice.
+func TestEnrich_multiContainerLogsFailingContainer(t *testing.T) {
+	var gotContainer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/log"):
+			gotContainer = r.URL.Query().Get("container")
+			w.Write([]byte("sidecar failed: bad certificate\n"))
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[
+				{"metadata":{"name":"multi-1","namespace":"ns1"},
+				 "status":{"phase":"Failed",
+					  "containerStatuses":[
+						{"name":"main","ready":true,"restartCount":0,
+						 "state":{"running":{"startedAt":"2026-01-02T03:00:00Z"}}},
+						{"name":"sidecar","ready":false,"restartCount":0,
+						 "state":{"terminated":{"exitCode":1,"reason":"Error",
+							"message":"bad certificate","finishedAt":"2026-01-02T03:04:05Z"}}}]}}
+			]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "multi-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	if gotContainer != "sidecar" {
+		t.Errorf("expected the failing container (sidecar) to be logged, got %q", gotContainer)
+	}
+	found := false
+	for _, d := range en.ContainerDiagnostics {
+		if strings.Contains(d, "multi-1") && strings.Contains(d, "container sidecar") &&
+			strings.Contains(d, "exit=1") && strings.Contains(d, "reason=Error") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a diagnostic for the failing sidecar container, got %v", en.ContainerDiagnostics)
+	}
+	if prov, ok := en.PodLogProvenance["ns1/multi-1"]; !ok {
+		t.Errorf("expected provenance recorded for the multi-container pod, got: %v", en.PodLogProvenance)
+	} else if prov.Container != "sidecar" {
+		t.Errorf("provenance container = %q, want sidecar", prov.Container)
+	}
+}
+
+// Issue #128: log-fetch failures must not stop the digest — enrichment still
+// returns the other evidence (the diagnostic) when the log endpoint 404s.
+func TestEnrich_logFailureIsNonFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/log"):
+			http.Error(w, "no such container", http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[
+				{"metadata":{"name":"backup-1","namespace":"ns1"},
+				 "status":{"phase":"Failed",
+					  "containerStatuses":[
+						{"name":"backup","ready":false,"restartCount":0,
+						 "state":{"terminated":{"exitCode":1,"reason":"Error",
+							"message":"checksum","finishedAt":"2026-01-02T03:04:05Z"}}}]}}
+			]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
+		Namespaces: []string{"ns1"},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+
+	found := false
+	for _, d := range en.ContainerDiagnostics {
+		if strings.Contains(d, "backup-1") && strings.Contains(d, "exit=1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the diagnostic to survive a log-fetch failure, got %v", en.ContainerDiagnostics)
+	}
+	if len(en.PodLogs) != 0 {
+		t.Errorf("expected no PodLogs after a 404, got %v", en.PodLogs)
+	}
+}
+
+// newEnrichTestServer is a helper that serves the pods listing for the
+// group's namespaces and the pod log endpoint (the caller records each log
+// request). Everything else is empty so no other enrichment side-effects fire.
+func newEnrichTestServer(podsJSON, logBody string, logReqCh chan<- string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, podsJSON)
+		case strings.HasSuffix(r.URL.Path, "/log"):
+			logReqCh <- r.URL.RawQuery
+			_, _ = io.WriteString(w, logBody)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+}
+
+// queryPrevious returns the "previous" query parameter from an encoded
+// query string, for asserting which log stream was requested.
+func queryPrevious(rawQuery string) string {
+	for _, kv := range strings.Split(rawQuery, "&") {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == "previous" {
+			return v
+		}
+	}
+	return ""
 }
