@@ -391,10 +391,52 @@ func TestEscapeLabelValue(t *testing.T) {
 		{"simple", "simple"},
 		{`has"quote`, `has\"quote`},
 		{`multi"ple"quotes`, `multi\"ple\"quotes`},
+		{`foo\bar`, `foo\\bar`},
+		{`foo\\bar`, `foo\\\\bar`},
 	}
 	for _, tt := range tests {
 		if got := escapeLabelValue(tt.in); got != tt.want {
 			t.Errorf("escapeLabelValue(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestContextMetricQueriesEscapesLabelValues guards the issue #161 regression:
+// a namespace (or pod) containing a backslash must not produce a PromQL string
+// literal the backend cannot parse. The expression is asserted verbatim;
+// the label values carry both a backslash and a double quote so any missing
+// escaping pass shows up in the filter.
+func TestContextMetricQueriesEscapesLabelValues(t *testing.T) {
+	queries := contextMetricQueries(`ns\with\backslash`, `pod\with\back`)
+	if len(queries) != 3 {
+		t.Fatalf("expected 3 context metric queries, got %d", len(queries))
+	}
+	wantFilter := `namespace="ns\\with\\backslash",pod="pod\\with\\back"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantFilter) {
+			t.Errorf("%s: expr = %q, want filter %q", q.name, q.expr, wantFilter)
+		}
+	}
+
+	// A value with both a backslash and a quote must be fully escaped in the
+	// right order: `a\`b` -> `a\\\"b` -> `a\\\\\"b`.
+	queries = contextMetricQueries(`a\"b`, "")
+	if len(queries) != 3 {
+		t.Fatalf("expected 3 context metric queries, got %d", len(queries))
+	}
+	wantQuoted := `namespace="a\\\"b"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantQuoted) {
+			t.Errorf("%s: expr = %q, want %q", q.name, q.expr, wantQuoted)
+		}
+	}
+
+	// A plain value must pass through untouched.
+	queries = contextMetricQueries("plain", "pod-plain")
+	wantPlain := `namespace="plain",pod="pod-plain"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantPlain) {
+			t.Errorf("%s: expr = %q, want %q", q.name, q.expr, wantPlain)
 		}
 	}
 }
