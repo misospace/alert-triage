@@ -135,9 +135,9 @@ func TestAmbientBackendStateDoesNotClaimNoLines(t *testing.T) {
 		t.Errorf("discord: must not claim the backend returned no lines when namespace-wide lines were returned:\n%s", discord)
 	}
 
-	// And the true empty case still renders the negative.
+	// And the true empty case still renders the negative, scoped to the subject.
 	en2 := Enrichment{BackendState: "empty"}
-	if !strings.Contains(renderEvidence(Report{Group: g, Enrichment: en2}), "returned no lines for this window") {
+	if !strings.Contains(renderEvidence(Report{Group: g, Enrichment: en2}), "returned no lines for this subject in the window") {
 		t.Error("genuinely empty state must still render the explicit negative")
 	}
 }

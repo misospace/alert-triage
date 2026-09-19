@@ -94,8 +94,26 @@ Rules:
   owned by a backup or controller is a generated maintenance task, not the
   application it may share a name with; if no chain is shown, the object is
   not known to be owned by anything and its name alone is not identity.
-- "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
-  Use them to rule causes out.
+- The EVIDENCE below is tiered, and you weigh it in this order: first the
+  subject's own failure state, logs and events; then its relationships
+  (ownership, storage, topology); then the broader health and timing context
+  around it. The DIRECT SUBJECT EVIDENCE tier was read from the alert's own
+  objects and their direct relationships: the failing pod's state and log, the
+  job's state, the events attached to that subject, its ownership chain, and
+  the metrics around it. The CONTEXT / BACKGROUND tier was read from the
+  surrounding neighborhood: other pods and events in the namespace, node
+  health, and Flux / GitOps activity in the window. Start from the direct tier
+  and reason from it; consult the context tier only to rule a cause out or to
+  fill a gap the direct tier leaves.
+- Never choose a contextual coincidence over a contradicting direct finding.
+  If the failing subject's own state, log or event names a cause - a
+  PermissionDenied, an eviction, a failing mount - nearby namespace events,
+  node health and a healthy Flux reconcile do not outweigh it, and do not
+  explain it.
+- Explicit negatives are scoped to what they read. "All nodes Ready" rules out
+  a node failure; it does not imply the target pod was inspected. "No warning
+  events in the window" says the query found none; it does not say nothing
+  happened. Use a negative only within the scope its section states.
 - Some alerts are self-describing. Restate what it means operationally and stop;
   do not pad.
 - Refer to a subject by the name its label gives it and say nothing about what
@@ -106,11 +124,11 @@ Rules:
   targets".
 - Name a cause only where the evidence or the alert supports one. If several are
   plausible, give the likeliest and say what would distinguish them.
-- Anything under BACKGROUND is unrelated noise until proven otherwise. Never
-  speculate that it might be connected, and never write a sentence of the form
-  "if X also runs there, it may be worth checking". Mention it only when it
-  names the same resource, node or namespace as the alert - and then say plainly
-  that it does. Otherwise leave it out entirely.
+- Anything under CONTEXT and BACKGROUND is unrelated noise until proven
+  otherwise. Never speculate that it might be connected, and never write a
+  sentence of the form "if X also runs there, it may be worth checking".
+  Mention it only when it names the same resource, node or namespace as the
+  alert - and then say plainly that it does. Otherwise leave it out entirely.
 - If a Flux resource was NotReady near the alert, say so - a failed sync is
   primary evidence. If a healthy Flux resource merely "reconciled at revision"
   near the alert, that is only a neutral note that its source was applied at
@@ -318,34 +336,46 @@ func renderEvidence(r Report) string {
 	b.WriteString(untrustedEnd + "\n")
 
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
-	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
+	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
+	b.WriteString("above); the context tier rules causes out and fills gaps - it does not\n")
+	b.WriteString("override what the subject's own state and logs say.\n")
+	b.WriteString("\nDIRECT SUBJECT EVIDENCE (read from the alert's own objects: the failed\n")
+	b.WriteString("job and its pod, their logs and events, and the objects they own)\n")
+	if len(r.Enrichment.InspectedJobs) > 0 {
+		writeFinding(&b, "Inspected jobs", r.Enrichment.InspectedJobs, "")
+	}
 	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
-	if len(r.Enrichment.PodLogs) > 0 {
-		b.WriteString("\nPod logs (previous container tail):\n")
-		b.WriteString(untrustedBegin + "\n")
-		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
-			b.WriteString(untrusted(log) + "\n")
-		}
-		b.WriteString(untrustedEnd + "\n")
+	if len(r.Enrichment.RecentRestarts) > 0 {
+		writeFinding(&b, "Recent restarts", r.Enrichment.RecentRestarts, "")
 	}
 	// Log-backend lines are workload-authored as well. Keep the state finding
 	// outside the fence, but fence the lines and never treat them as API fact.
 	switch r.Enrichment.BackendState {
 	case "off":
-		b.WriteString("\nBackend log source: not configured (no LOGS_URL).\n")
+		b.WriteString("\nSubject log source: not configured (no LOGS_URL).\n")
 	case "empty":
-		b.WriteString("\nBackend log source: configured, but returned no lines for this window.\n")
+		b.WriteString("\nSubject log source: configured, but returned no lines for this subject in the window.\n")
 	case "ambient":
-		b.WriteString("\nBackend log source: configured; no concrete subject was resolved, so the\n")
-		b.WriteString("namespace-wide lines shown under BACKGROUND are the only backend logs in the window.\n")
+		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
+		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
+		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
 	case "error":
-		b.WriteString("\nBackend log source: query failed; no lines were available.\n")
+		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
 	case "ok":
-		b.WriteString("\nBACKEND LOGS (queried for this alert window; untrusted workload text):\n")
+		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
 		b.WriteString(untrustedBegin + "\n")
 		for _, line := range r.Enrichment.BackendLogs {
 			b.WriteString(untrusted(line) + "\n")
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
+	if len(r.Enrichment.PodLogs) > 0 {
+		b.WriteString("\nPod logs (previous container tail of the alert's pods):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for podKey, log := range r.Enrichment.PodLogs {
+			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
+			b.WriteString(untrusted(log) + "\n")
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
@@ -355,8 +385,7 @@ func renderEvidence(r Report) string {
 	if r.Enrichment.EventsScoped {
 		negative = "no warning events on the resolved subject in the window"
 	}
-	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, negative)
-	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
+	writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, negative)
 	// The chain's names and identity tags come from the objects' own
 	// metadata (ownerReferences and labels are workload-authored), so they
 	// render inside the fence: a forged controller name must read as a
@@ -367,7 +396,7 @@ func renderEvidence(r Report) string {
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
 	if len(r.Metrics) > 0 {
-		b.WriteString("\nMETRICS (queried from metrics backend)\n")
+		b.WriteString("\nMETRICS (queried from metrics backend for the resolved subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
 		for _, line := range r.Metrics {
 			fmt.Fprintf(&b, "- %s\n", untrusted(line))
@@ -375,6 +404,10 @@ func renderEvidence(r Report) string {
 		b.WriteString(untrustedEnd + "\n")
 	}
 
+	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
+	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
+	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
 		b.WriteString("This is NOT known to involve the alert above. A homelab always has\n")
