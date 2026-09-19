@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -49,10 +50,7 @@ func (h *History) load() error {
 	defer f.Close()
 
 	cutoff := time.Now().Add(-h.retain)
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
+	for _, line := range readHistoryLines(f) {
 		if len(line) == 0 {
 			continue
 		}
@@ -65,11 +63,38 @@ func (h *History) load() error {
 			h.entries = append(h.entries, s)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		// Same policy as a bad open: surface once, keep running.
-		logf("history: scan failed, keeping what was read: %v", err)
-	}
 	return nil
+}
+
+// readHistoryLines reads a JSONL file line by line, surviving lines over
+// the 1 MiB cap. A bufio.Scanner here used to end the whole read at the
+// first oversized line (bufio.ErrTooLong), silently dropping every record
+// after it; the next Compact then persisted the truncated snapshot, turning
+// a transient read failure into permanent loss. ReadBytes has no such cap:
+// an oversized line is returned whole, logged, and discarded, and the next
+// call resumes at the following line.
+func readHistoryLines(f *os.File) [][]byte {
+	r := bufio.NewReaderSize(f, 64*1024)
+	var lines [][]byte
+	lineNo := 0
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			lines = append(lines, line)
+		}
+		if err != nil {
+			if err != io.EOF {
+				// Same policy as a bad open: surface once, keep running.
+				logf("history: read failed, keeping what was read: %v", err)
+			}
+			return lines
+		}
+		if len(line) > 1024*1024 {
+			// Log once per oversized line, then continue reading.
+			logf("history: skipping oversized line %d (%d bytes)", lineNo, len(line))
+		}
+	}
 }
 
 // PriorSeen reports how many times the given signature has been recorded
