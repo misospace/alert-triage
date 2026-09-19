@@ -984,6 +984,71 @@ func TestDirectPermissionDeniedTiersAboveFluxContext(t *testing.T) {
 	}
 }
 
+// Regression for the review's blocking integration concern. Before #129
+// landed, fetchBackendLogsResult seeded a namespace-only query and returned the
+// whole namespace's chatter as primary, so renderEvidence would have promoted
+// that unrelated Flux/controller noise into the DIRECT tier. #129 now splits
+// the result: only subject-scoped lines come back as primary, and the
+// namespace-only fallback lines come back marked ambient and are routed to the
+// context tier by Enrich. This test pins current-main behaviour in both
+// directions: namespace-only backend logs stay OUT of DIRECT (and land under
+// CONTEXT / BACKGROUND), while subject-scoped backend logs DO land in DIRECT.
+func TestBackendLogsScopedToDirectTier(t *testing.T) {
+	g := Group{
+		Key:        "single/KubeJobFailed",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed", "job_name": "backup", "namespace": "ns1"}}},
+	}
+
+	// Namespace-only fallback: no concrete subject was resolved, so the query
+	// fell back to the whole namespace. Those lines must not be presented
+	// under the DIRECT tier — they are neighborhood noise, not the subject's
+	// own logs.
+	ambient := Enrichment{
+		BackendState: "ambient",
+		Ambient:      []string{"(ambient, namespace-wide) flux reconciled in ns1"},
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: ambient})
+	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing tier headings:\\n%s", got)
+	}
+	ambIdx := strings.Index(got, "flux reconciled in ns1")
+	if ambIdx < 0 {
+		t.Fatalf("namespace-wide line must be rendered:\\n%s", got)
+	}
+	if ambIdx >= directIdx && ambIdx <= contextIdx {
+		t.Errorf("namespace-only backend log at %d landed in the DIRECT tier [%d, %d] (must stay out of it):\\n%s",
+			ambIdx, directIdx, contextIdx, got)
+	}
+	if ambIdx < contextIdx {
+		t.Errorf("namespace-only backend log at %d must sit in the context tier (after %d):\\n%s",
+			ambIdx, contextIdx, got)
+	}
+
+	// A concrete subject was resolved, so the backend returns the subject's
+	// own lines as primary — and those belong in the DIRECT tier.
+	direct := Enrichment{
+		BackendState: "ok",
+		BackendLogs:  []string{"open /var/run/secret: Permission denied"},
+	}
+	got = renderEvidence(Report{Group: g, Enrichment: direct})
+	directIdx = strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx = strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing tier headings:\\n%s", got)
+	}
+	subjIdx := strings.Index(got, "open /var/run/secret: Permission denied")
+	if subjIdx < 0 {
+		t.Fatalf("subject-scoped line must be rendered:\\n%s", got)
+	}
+	if subjIdx < directIdx || subjIdx > contextIdx {
+		t.Errorf("subject-scoped backend log at %d must sit in the DIRECT tier [%d, %d]:\\n%s",
+			subjIdx, directIdx, contextIdx, got)
+	}
+}
+
 // Explicit negatives must keep their scope after the tier split: the node
 // negative lives in the context tier and must not read as an inspection of
 // the subject pod, while the subject-scoped event negative stays in the
