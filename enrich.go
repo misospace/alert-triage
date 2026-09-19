@@ -13,6 +13,7 @@ import (
 	pathpkg "path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -104,22 +105,54 @@ type podList struct {
 			NodeName string `json:"nodeName"`
 		} `json:"spec"`
 		Status struct {
-			Phase             string `json:"phase"`
-			ContainerStatuses []struct {
-				Name         string `json:"name"`
-				RestartCount int    `json:"restartCount"`
-				Ready        bool   `json:"ready"`
-				State        map[string]struct {
-					Reason string `json:"reason"`
-				} `json:"state"`
-				LastTerminationState struct {
-					Terminated struct {
-						FinishedAt time.Time `json:"finishedAt"`
-					} `json:"terminated"`
-				} `json:"lastState"`
-			} `json:"containerStatuses"`
+			Phase             string            `json:"phase"`
+			ContainerStatuses []containerStatus `json:"containerStatuses"`
 		} `json:"status"`
 	} `json:"items"`
+}
+
+// containerStatus is the subset of a pod's containerStatuses this service
+// reads. The current state and the last state are the same Kubernetes union
+// (running | waiting | terminated), so one type models both.
+type containerStatus struct {
+	Name         string         `json:"name"`
+	RestartCount int            `json:"restartCount"`
+	Ready        bool           `json:"ready"`
+	State        containerState `json:"state"`
+	LastState    containerState `json:"lastState"`
+}
+
+// containerState is the union of the three mutually exclusive container
+// states. Each member is a pointer so the zero value (nil) means "absent from
+// the JSON", which is how the apiserver signals which of the three states a
+// container is actually in: exactly one is non-nil.
+type containerState struct {
+	Running    *runningState    `json:"running"`
+	Waiting    *waitingState    `json:"waiting"`
+	Terminated *terminatedState `json:"terminated"`
+}
+
+type runningState struct {
+	StartedAt time.Time `json:"startedAt"`
+}
+
+type waitingState struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// terminatedState is the subset of the "terminated" state that tells an
+// operator why a container ended: the exit code, reason, any message the
+// container left, and when it finished. For a one-shot Job container that
+// terminated once and never restarted, this is state.terminated and the
+// pod's current log is the evidence; for a restarted (CrashLoop) container
+// the last failed run lives in lastState.terminated instead.
+type terminatedState struct {
+	ExitCode   int       `json:"exitCode"`
+	Reason     string    `json:"reason"`
+	Message    string    `json:"message"`
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
 }
 
 type eventItem struct {
@@ -238,7 +271,31 @@ type jobRef struct {
 type Enrichment struct {
 	Nodes         []string
 	UnhealthyPods []string
-	PodLogs       map[string]string // pod key -> tail of previous container log
+	// PodLogs maps a pod key ("namespace/name") to the tail of the log stream
+	// that holds the failure evidence. The stream is chosen per container, not
+	// per pod: a container that never restarted (a one-shot Job) carries its
+	// failure in its *current* log, while a restarted one (a CrashLoop) carries
+	// it in the previous instance, and the container itself is named in the
+	// request so a multi-container pod is not answered by a default choice.
+	PodLogs map[string]string
+	// PodLogProvenance tells the renderer which container and which stream
+	// each PodLogs entry came from, so a "previous-container tail" label
+	// does not silently mislabel a one-shot Job's current log as a previous
+	// one. Keys match PodLogs.
+	PodLogProvenance map[string]podLogProvenance
+	// ContainerDiagnostics are the structured readings this service made
+	// itself about the containers of the pods above: the exit code,
+	// termination reason and finish time of the failed container run.
+	// Rendered outside the untrusted fence, like pod phases and node
+	// conditions — fencing this service's own reading would tell the model to
+	// distrust it (AGENTS.md). The container's own termination message is
+	// carried separately and fenced.
+	ContainerDiagnostics []string
+	// ContainerTerminationMessages are the workload-authored termination
+	// messages of the failed container runs above. They are the container's
+	// own words, so the renderer fences them, like event messages, rather
+	// than trusting them as a service reading.
+	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
 	// "off", "empty", "ambient", or "error" so missing configuration is not
 	// confused with a successful query that returned no lines. "empty" means
@@ -294,7 +351,9 @@ func (e Enrichment) empty() bool {
 		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 &&
 		(e.BackendState == "" || e.BackendState == "off" || e.BackendState == "ambient") &&
 		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 &&
-		len(e.InspectedJobs) == 0 && len(e.Ownership) == 0
+		len(e.InspectedJobs) == 0 && len(e.Ownership) == 0 &&
+		len(e.ContainerDiagnostics) == 0 &&
+		len(e.ContainerTerminationMessages) == 0
 }
 
 // namespaceLabels are the label keys that carry a namespace in practice.
@@ -430,6 +489,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.EventsScoped = len(resolvedSubjects) > 0
 
 	var seenPods []podRef
+	var podLogSpecs []podLogSpec
 	for _, ns := range g.Namespaces {
 		esc := url.PathEscape(ns)
 
@@ -438,10 +498,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			logf("enrich: pods in %s: %v", ns, err)
 		}
 		type scoredPod struct {
-			desc    string
-			score   int // higher = worse health
-			restart int // restart count, surfaced as a finding on its own
-			key     string
+			desc      string
+			score     int // higher = worse health
+			restart   int // restart count, surfaced as a finding on its own
+			key       string
+			container string
+			mode      string // log stream to fetch: "current", "previous", or "" to skip
 		}
 		var unhealthy []scoredPod
 		for _, p := range pods.Items {
@@ -453,37 +515,37 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				OwnerRefs:   p.Metadata.OwnerReferences,
 			})
 			key := p.Metadata.Namespace + "/" + p.Metadata.Name
-			for _, cs := range p.Status.ContainerStatuses {
-				reason := ""
-				for state, s := range cs.State {
-					if state != "running" && s.Reason != "" {
-						reason = s.Reason
-					}
-				}
-				restartedRecently := cs.RestartCount > 0 && !cs.LastTerminationState.Terminated.FinishedAt.IsZero() &&
-					cs.LastTerminationState.Terminated.FinishedAt.After(since)
-				if p.Status.Phase == "Running" && cs.Ready && reason == "" {
-					// A recovered pod that the alert named still matters: its
-					// previous container's log is the evidence we want.
-					if !targetPods[key] && !restartedRecently {
-						continue
-					}
-				}
-				if p.Status.Phase == "Succeeded" {
-					continue
-				}
-				desc := fmt.Sprintf("%s %s", key, p.Status.Phase)
-				if reason != "" {
-					desc += " (" + reason + ")"
-				}
-				if cs.RestartCount > 0 {
-					desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
-				}
-				unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key})
-				if restartedRecently {
+			if p.Status.Phase == "Succeeded" {
+				// A completed one-shot job: its container's terminated state is
+				// a clean exit, not failure evidence, so neither a diagnostic
+				// line nor a log stream is worth shipping for it.
+				continue
+			}
+			for i := range p.Status.ContainerStatuses {
+				cs := &p.Status.ContainerStatuses[i]
+				if recentlyRestarted(*cs, since) {
 					e.RecentRestarts = append(e.RecentRestarts, fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339)))
 				}
-				break
+			}
+			unhealthyPod, cs := podEvidence(targetPods[key], p.Status.ContainerStatuses, since)
+			if !unhealthyPod {
+				continue
+			}
+			mode := podLogMode(cs)
+			reason := stateReason(cs)
+			desc := fmt.Sprintf("%s %s", key, p.Status.Phase)
+			if reason != "" {
+				desc += " (" + reason + ")"
+			}
+			if cs.RestartCount > 0 {
+				desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
+			}
+			unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key, container: cs.Name, mode: mode})
+			if d := containerReadingLine(key, *cs); d != "" {
+				e.ContainerDiagnostics = append(e.ContainerDiagnostics, d)
+			}
+			if m := containerMessageLine(key, *cs); m != "" {
+				e.ContainerTerminationMessages = append(e.ContainerTerminationMessages, m)
 			}
 		}
 		// Promote the pods owned by a job the group's alerts named into the
@@ -513,6 +575,15 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		})
 		for _, sp := range unhealthy {
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
+			if sp.mode != "" {
+				parts := strings.SplitN(sp.key, "/", 2)
+				podLogSpecs = append(podLogSpecs, podLogSpec{
+					Namespace: parts[0],
+					Name:      parts[1],
+					Container: sp.container,
+					Previous:  sp.mode == "previous",
+				})
+			}
 		}
 
 		if items, err := k.fetchEvents(ctx, ns); err == nil {
@@ -529,6 +600,8 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
+	e.ContainerDiagnostics = capList(dedupe(e.ContainerDiagnostics), 8)
+	e.ContainerTerminationMessages = capList(dedupe(e.ContainerTerminationMessages), 8)
 	// The per-pod concurrency lives on the stack, not on *kube: the SIGTERM
 	// shutdown path calls drainBuffer while runFlushLoop's canceled process
 	// may still be unwinding, and both paths run Enrich on the same *kube.
@@ -536,7 +609,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// reading it. Passing the normalised value keeps the shared struct
 	// immutable across concurrent callers (issue #146).
 	logConcurrency := normalizePodLogConcurrency(cfg.PodLogConcurrency)
-	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods, logConcurrency)
+	e.PodLogs, e.PodLogProvenance = k.fetchPodLogs(ctx, podLogSpecs, logConcurrency)
 	if k.logs != nil {
 		var res backendLogResult
 		var err error
@@ -905,8 +978,200 @@ func stripSecrets(s string) string {
 	return s
 }
 
-// fetchPodLogs retrieves the tail of the previous container log for each
-// unhealthy pod. Returns a map keyed by "namespace/name".
+// podLogMode picks the log stream that holds the failure evidence for one
+// container, or "" when no log stream is worth fetching:
+//
+//   - a terminated container that has not restarted (the one-shot Job case)
+//     carries its failure in its *current* log — no previous instance ever
+//     existed for it, so previous=true would 404;
+//   - a container whose previous instance actually exists (restartCount > 0)
+//     — a CrashLoop or a recovered one — has its last failed run in the
+//     previous instance, so previous=true is the relevant failure evidence;
+//   - a container that is still running (a live process, ready or not) has
+//     only a current log, so it is fetched as current;
+//   - anything else (a clean exit, a container that is waiting or has not
+//     started a run yet) has no failure log to fetch, so "" — previous is
+//     never the fallback, because a previous instance may not exist at all.
+func podLogMode(cs *containerStatus) string {
+	switch {
+	case cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0:
+		return "current"
+	case cs.RestartCount > 0:
+		return "previous"
+	case cs.State.Terminated != nil:
+		// A clean (exit 0) terminated run is not failure evidence.
+		return ""
+	case cs.State.Running != nil:
+		return "current"
+	}
+	return ""
+}
+
+// recentlyRestarted reports whether a container's last restart happened
+// inside the window. lastState is the container's previous instance, so its
+// finishedAt stamps the restart; a zero time means no restart has occurred.
+func recentlyRestarted(cs containerStatus, since time.Time) bool {
+	t := cs.LastState.Terminated
+	return cs.RestartCount > 0 && t != nil && !t.FinishedAt.IsZero() && t.FinishedAt.After(since)
+}
+
+// stateReason returns the reason of a container's current state if it is
+// waiting or terminated; a running state carries no reason.
+func stateReason(cs *containerStatus) string {
+	if cs.State.Waiting != nil {
+		return cs.State.Waiting.Reason
+	}
+	if cs.State.Terminated != nil {
+		return cs.State.Terminated.Reason
+	}
+	return ""
+}
+
+// podEvidence reports whether a pod is unhealthy and which of its containers
+// to describe and log. Every container is scanned — not just the first, and
+// not the apiserver's default container — and the most conclusive is
+// returned, so a multi-container pod is diagnosed through the one that
+// actually failed:
+//
+//   - a terminated container with a non-zero exit code: a one-shot failure,
+//     the Job case this issue is about. Without this branch a failed Job pod
+//     that terminated once and never restarted has no waiting state and no
+//     restart, and would be read as healthy;
+//   - a waiting (stuck) container: the CrashLoop and image-pull shapes;
+//   - a container that is not ready in its current run: the pod is not
+//     actually healthy, whether or not the alert named it;
+//   - a container with a previous instance (restartCount > 0): its previous
+//     run's log is the evidence — listed for a pod the alert named, or one
+//     that restarted inside the window; an unrelated recovered pod is not
+//     fished out, which keeps the recovered-pod rule the old first-container
+//     loop applied.
+//
+// A pod whose containers are all healthy, reason-free and un-restarted is
+// not unhealthy; a Succeeded pod never gets here (the caller skips it).
+func podEvidence(isTarget bool, statuses []containerStatus, since time.Time) (bool, *containerStatus) {
+	var failed, waiting, unready, restarted *containerStatus
+	for i := range statuses {
+		cs := &statuses[i]
+		switch {
+		case cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0:
+			if failed == nil {
+				failed = cs
+			}
+		case cs.State.Waiting != nil:
+			if waiting == nil {
+				waiting = cs
+			}
+		case !cs.Ready:
+			if unready == nil {
+				unready = cs
+			}
+		case cs.RestartCount > 0 && (isTarget || recentlyRestarted(*cs, since)):
+			if restarted == nil {
+				restarted = cs
+			}
+		}
+	}
+	switch {
+	case failed != nil:
+		return true, failed
+	case waiting != nil:
+		return true, waiting
+	case unready != nil:
+		return true, unready
+	case restarted != nil:
+		return true, restarted
+	}
+	return false, nil
+}
+
+// terminatedEvidence returns the terminated state that is the failure
+// evidence for a container, or nil when none is a failure:
+//
+//   - a terminated current run (the one-shot Job case) is the evidence
+//     directly;
+//   - a container that is stuck waiting (a CrashLoop) whose previous
+//     instance terminated is the evidence — the last failed run is the
+//     failure, not the current waiting state.
+//
+// A clean exit (exit code 0) is not a failure, so it yields no line; the
+// caller checks the exit code.
+func terminatedEvidence(cs containerStatus) *terminatedState {
+	if cs.State.Terminated != nil {
+		return cs.State.Terminated
+	}
+	if cs.State.Waiting != nil && cs.LastState.Terminated != nil {
+		return cs.LastState.Terminated
+	}
+	return nil
+}
+
+// containerReadingLine renders the structured reading this service makes
+// itself for a failed container: the exit code, termination reason and
+// finish time. It is deliberately message-free: the container's own
+// termination message is workload-authored and travels in
+// ContainerTerminationMessages, where the renderer fences it (the split
+// issue #128's review asked for). Rendered outside the untrusted fence,
+// like pod phases and node conditions, because it is this service's reading
+// rather than a quote — fencing it would tell the model to distrust it.
+// A clean exit (exit code 0) is not a failure, so it produces no line.
+func containerReadingLine(key string, cs containerStatus) string {
+	t := terminatedEvidence(cs)
+	if t == nil || t.ExitCode == 0 {
+		return ""
+	}
+	line := fmt.Sprintf("%s: container %s terminated exit=%d", key, cs.Name, t.ExitCode)
+	if t.Reason != "" {
+		line += " reason=" + t.Reason
+	}
+	if !t.FinishedAt.IsZero() {
+		line += " at " + t.FinishedAt.Format(time.RFC3339)
+	}
+	return line
+}
+
+// containerMessageLine renders a failed container's own termination message
+// for the fenced block. It repeats the pod key and container name so the
+// fenced quote stands on its own: a line of workload text with no
+// attribution would read as the service's own assertion. It produces no
+// line when the container left no message — a clean exit (exit code 0) is
+// not a failure, and a failed run that said nothing has nothing to fence.
+func containerMessageLine(key string, cs containerStatus) string {
+	t := terminatedEvidence(cs)
+	if t == nil || t.ExitCode == 0 || t.Message == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s: container %s message: %s", key, cs.Name, truncate(t.Message, 160))
+}
+
+// podLogSpec is one log fetch: the pod, the container whose log is wanted,
+// and which stream. A container is named explicitly rather than left to the
+// apiserver's default-container choice, so a multi-container pod is always
+// logged through the container that actually failed.
+type podLogSpec struct {
+	Namespace string
+	Name      string
+	Container string
+	Previous  bool
+}
+
+// podLogProvenance tells renderEvidence and Discord delivery which container
+// produced the log and which stream it came from. Without this a one-shot
+// Job's current log would be mislabelled "previous container tail" — the
+// motivating bug of issue #128's review.
+type podLogProvenance struct {
+	Container string
+	Stream    string // "current" or "previous"
+}
+
+// fetchPodLogs retrieves the tail of each pod's failure-evidence log. It
+// returns a map keyed by "namespace/name" and a parallel provenance map
+// describing the container and stream ("current"/"previous") each came
+// from. The container and stream that hold the failure evidence are
+// carried per-entry, so a multi-container pod is answered by the
+// container that failed rather than the apiserver's default, and the
+// renderer does not falsely label a current log as "previous container
+// tail". A failure to fetch one pod's log is non-fatal: the rest of the
+// evidence, and the digest, still ship.
 //
 // The per-pod GETs run under a bounded semaphore rather than strictly in
 // series: one stalled apiserver on pod 1 must not serialise the remaining
@@ -932,28 +1197,36 @@ func stripSecrets(s string) string {
 // process may still be unwinding; both paths share the same *kube and the
 // goroutines spawned here read concurrency, so any writeable field would
 // race with itself.
-func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int) map[string]string {
-	if len(pods) == 0 || k.hc == nil {
-		return nil
+func (k *kube) fetchPodLogs(ctx context.Context, specs []podLogSpec, concurrency int) (map[string]string, map[string]podLogProvenance) {
+	if len(specs) == 0 || k.hc == nil {
+		return nil, nil
 	}
 
 	concurrency = normalizePodLogConcurrency(concurrency)
 
 	logs := make(map[string]string)
+	prov := make(map[string]podLogProvenance)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
-	for _, podKey := range pods {
-		parts := strings.SplitN(podKey, "/", 2)
-		if len(parts) != 2 {
-			continue
+	for _, spec := range specs {
+		key := spec.Namespace + "/" + spec.Name
+		stream := "current"
+		if spec.Previous {
+			stream = "previous"
 		}
-		ns, name := parts[0], parts[1]
-		path := "/api/v1/namespaces/" + ns + "/pods/" + name +
-			fmt.Sprintf("/log?previous=true&tailLines=%d", podLogTail)
+		query := url.Values{}
+		query.Set("tailLines", strconv.Itoa(podLogTail))
+		if spec.Container != "" {
+			query.Set("container", spec.Container)
+		}
+		if spec.Previous {
+			query.Set("previous", "true")
+		}
+		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?%s", spec.Namespace, spec.Name, query.Encode())
 
 		wg.Add(1)
-		go func(podKey, path string) {
+		go func(key, path string) {
 			defer wg.Done()
 			// Acquire inside the goroutine: a leaked slot here can't
 			// stall the dispatcher, and the wait error path returns
@@ -972,7 +1245,7 @@ func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int)
 			req.Header.Set("Authorization", "Bearer "+k.token)
 			resp, err := k.hc.Do(req)
 			if err != nil {
-				logf("enrich: pod logs (%s): %v", podKey, err)
+				logf("enrich: pod logs (%s): %v", key, err)
 				return
 			}
 			if resp.StatusCode != http.StatusOK {
@@ -988,12 +1261,16 @@ func (k *kube) fetchPodLogs(ctx context.Context, pods []string, concurrency int)
 			// concurrent, the 4096-byte cap and secret stripping are
 			// unchanged from the serial walk.
 			mu.Lock()
-			logs[podKey] = stripSecrets(strings.TrimSpace(string(data)))
+			logs[key] = stripSecrets(strings.TrimSpace(string(data)))
 			mu.Unlock()
-		}(podKey, path)
+		}(key, path)
+		// Provenance is derived from the spec, so it is recorded before
+		// the read returns. If the read fails the entry is simply absent
+		// from logs and the renderer never sees it.
+		prov[key] = podLogProvenance{Container: spec.Container, Stream: stream}
 	}
 	wg.Wait()
-	return logs
+	return logs, prov
 }
 
 // fluxActivity reports Flux resources that are failing, and - only when

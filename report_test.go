@@ -247,6 +247,103 @@ func TestUntrustedCannotForgeTheFence(t *testing.T) {
 	}
 }
 
+// A terminated container's reading splits in two, and each half must land on
+// the correct side of the untrusted fence (the split the issue #128 review
+// demanded, and that AGENTS.md prescribes):
+//
+//   - the structured reading — exit code, reason, finish time — is this
+//     service's own finding, so it stays OUTSIDE the fence, like a pod phase.
+//     Fencing it would tell the model to distrust the service's own reading.
+//
+//   - the container's own termination message is workload-authored, so it is
+//     quoted INSIDE the fence, like an event message. A buggy or malicious
+//     container must not be able to smuggle text into the trusted reading.
+//
+// The one-shot Job case is the shape under test: the container is terminated
+// non-zero and the whole diagnostic reaches the model.
+func TestContainerTerminationReadingOutsideMessageInside(t *testing.T) {
+	const (
+		podKey = "ns1/backup-1"
+		// Structured reading: the service's own words, must be outside the fence.
+		reading = podKey + ": container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"
+		// Workload-authored message: must be inside the fence.
+		message = podKey + ": container backup message: checksum mismatch"
+	)
+	rpt := Report{
+		Group:      Group{Key: "single/" + podKey, Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}}},
+		Enrichment: Enrichment{ContainerDiagnostics: []string{reading}, ContainerTerminationMessages: []string{message}},
+	}
+	got := renderEvidence(rpt)
+
+	// Both halves rendered at all.
+	if !strings.Contains(got, reading) {
+		t.Fatalf("rendered evidence missing the container reading:\n%s", got)
+	}
+	if !strings.Contains(got, message) {
+		t.Fatalf("rendered evidence missing the container message:\n%s", got)
+	}
+	// Fences balanced.
+	if strings.Count(got, untrustedBegin) != strings.Count(got, untrustedEnd) {
+		t.Fatalf("unbalanced fences:\n%s", got)
+	}
+
+	// Remove every fenced region; the reading must survive and the message must not.
+	stripped := stripFences(got)
+	if !strings.Contains(stripped, "terminated exit=1") {
+		t.Errorf("structured reading landed inside an untrusted fence (should stay outside):\nstripped=%q\nfull=\n%s", stripped, got)
+	}
+	if strings.Contains(stripped, "message: checksum mismatch") {
+		t.Errorf("workload-authored message escaped the untrusted fence (should be inside):\nstripped=%q\nfull=\n%s", stripped, got)
+	}
+	// The message must actually sit inside a fence, not merely be absent from
+	// the stripped text for an unrelated reason.
+	if !messageInsideFence(got, "checksum mismatch") {
+		t.Errorf("message not found inside any untrusted fence:\n%s", got)
+	}
+}
+
+// stripFences returns body with the content of every untrustedBegin..untrustedEnd
+// region removed (markers inclusive). The test relies on the fences being
+// balanced, which it checks separately.
+func stripFences(body string) string {
+	var out strings.Builder
+	rest := body
+	for {
+		i := strings.Index(rest, untrustedBegin)
+		if i < 0 {
+			out.WriteString(rest)
+			return out.String()
+		}
+		out.WriteString(rest[:i])
+		rest = rest[i+len(untrustedBegin):]
+		j := strings.Index(rest, untrustedEnd)
+		if j < 0 {
+			return out.String() // unbalanced; stop
+		}
+		rest = rest[j+len(untrustedEnd):]
+	}
+}
+
+// messageInsideFence reports whether sub appears strictly inside at least one
+// untrustedBegin..untrustedEnd region.
+func messageInsideFence(body, sub string) bool {
+	for rest := body; ; {
+		i := strings.Index(rest, untrustedBegin)
+		if i < 0 {
+			return false
+		}
+		rest = rest[i+len(untrustedBegin):]
+		j := strings.Index(rest, untrustedEnd)
+		if j < 0 {
+			return false
+		}
+		if strings.Contains(rest[:j], sub) {
+			return true
+		}
+		rest = rest[j+len(untrustedEnd):]
+	}
+}
+
 // The negative case is this service's own sentence, not a quote, so fencing it
 // would tell the model our own findings are untrusted.
 func TestEmptyFindingIsNotFenced(t *testing.T) {

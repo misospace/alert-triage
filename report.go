@@ -320,11 +320,26 @@ func renderEvidence(r Report) string {
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
 	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
+	// The structured reading (exit code, reason, finish time) is this
+	// service's own, so it stays outside the fence, like pod phases. The
+	// container's own termination message is quoted separately, inside the
+	// fence, like event text — the split the issue #128 review asked for.
+	writeFinding(&b, "Container terminations", r.Enrichment.ContainerDiagnostics, "no terminated containers in scope")
+	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.ContainerTerminationMessages, "no terminated containers left a message")
 	if len(r.Enrichment.PodLogs) > 0 {
-		b.WriteString("\nPod logs (previous container tail):\n")
+		b.WriteString("\nPod failure logs:\n")
 		b.WriteString(untrustedBegin + "\n")
 		for podKey, log := range r.Enrichment.PodLogs {
 			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
+			// Identify the container and stream per-entry: a one-shot
+			// Job pod is logged through the *current* stream, a
+			// CrashLoop through the *previous* one, and a multi-container
+			// pod through the container that failed. The section
+			// heading "previous container tail" used to lie about both
+			// cases (issue #128 review).
+			if p := r.Enrichment.PodLogProvenance[podKey]; p.Container != "" {
+				fmt.Fprintf(&b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
+			}
 			b.WriteString(untrusted(log) + "\n")
 		}
 		b.WriteString(untrustedEnd + "\n")
@@ -549,10 +564,18 @@ func discordDescription(cfg *Config, r Report) string {
 	}
 	writeDiscordSection(&desc, "Unhealthy nodes", r.Enrichment.Nodes)
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
+	writeDiscordSection(&desc, "Container terminations", r.Enrichment.ContainerDiagnostics)
+	writeDiscordSection(&desc, "Container termination messages", r.Enrichment.ContainerTerminationMessages)
 	if len(r.Enrichment.PodLogs) > 0 {
-		desc.WriteString("**Pod logs (previous container tail)**\n")
+		// Per-entry header carries the container and stream so the chat
+		// does not mislabel a one-shot Job's current log as a previous
+		// container tail (issue #128 review).
 		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&desc, "• `%s`:\n```\n%s\n```\n", podKey, sanitizeFenceContent(strings.TrimSpace(log)))
+			label := podKey
+			if p := r.Enrichment.PodLogProvenance[podKey]; p.Container != "" {
+				label = fmt.Sprintf("%s — container %s, %s stream", podKey, p.Container, p.Stream)
+			}
+			fmt.Fprintf(&desc, "**Pod failure logs** — `%s`:\n```\n%s\n```\n", label, sanitizeFenceContent(strings.TrimSpace(log)))
 		}
 	}
 	switch r.Enrichment.BackendState {
