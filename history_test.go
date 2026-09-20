@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -452,6 +453,20 @@ func TestHistoryLoadOversizedLineIsLogged(t *testing.T) {
 	}
 	f.Close()
 
+	// The oversized line begins immediately after the first newline in the
+	// file. That is the file offset where the loader skipped it, and the
+	// log must report it (issue #162 acceptance: line number AND file
+	// offset, not just a byte length).
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstNL := bytes.IndexByte(data, '\n')
+	if firstNL < 0 {
+		t.Fatal("expected a newline after the first line")
+	}
+	oversizedOff := firstNL + 1
+
 	var logBuf bytes.Buffer
 	prev := log.Writer()
 	log.SetOutput(&logBuf)
@@ -472,8 +487,57 @@ func TestHistoryLoadOversizedLineIsLogged(t *testing.T) {
 		}
 	}()
 
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "skipping oversized line") {
+		t.Errorf("expected the oversized line to be logged once; log output: %q", logOut)
+	}
+	if !strings.Contains(logOut, fmt.Sprintf("at file offset %d", oversizedOff)) {
+		t.Errorf("expected the log to report the file offset %d where parsing skipped; log output: %q", oversizedOff, logOut)
+	}
+}
+
+// TestHistoryLoadOversizedFinalLineWithoutNewline is the regression for the
+// unterminated oversized final line: ReadBytes returns it with io.EOF, and
+// the loader must detect the oversize before that EOF return so the record
+// is logged and skipped exactly once (rather than silently appended) and
+// the read does not stop.
+func TestHistoryLoadOversizedFinalLineWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	// A 2 MiB final line with no trailing newline (e.g. killed mid-write).
+	if _, err := f.WriteString(strings.Repeat("c", 2*1024*1024)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
+	}
+	if got := len(h.entries); got != 1 {
+		t.Errorf("expected 1 entry (oversized final line skipped), got %d", got)
+	}
 	if !strings.Contains(logBuf.String(), "skipping oversized line") {
-		t.Errorf("expected the oversized line to be logged once; log output: %q", logBuf.String())
+		t.Errorf("expected the unterminated oversized final line to be logged once; log output: %q", logBuf.String())
 	}
 }
 

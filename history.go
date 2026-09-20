@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -50,51 +51,152 @@ func (h *History) load() error {
 	defer f.Close()
 
 	cutoff := time.Now().Add(-h.retain)
-	for _, line := range readHistoryLines(f) {
-		if len(line) == 0 {
-			continue
-		}
+	// Stream the file line by line so a single corrupt/out-of-band line is
+	// bounded in memory and the rest of the file never all sits in memory
+	// at once. Each line is parsed as it is read; the oversized-line
+	// handling (skip + log) lives in readHistoryLines.
+	readHistoryLines(f, func(line []byte) bool {
 		var s sighting
 		// A truncated final line (killed mid-write) must not stop startup.
 		if err := json.Unmarshal(line, &s); err != nil {
-			continue
+			return true
 		}
 		if s.At.After(cutoff) {
 			h.entries = append(h.entries, s)
 		}
-	}
+		return true
+	})
 	return nil
 }
 
-// readHistoryLines reads a JSONL file line by line, surviving lines over
-// the 1 MiB cap. A bufio.Scanner here used to end the whole read at the
-// first oversized line (bufio.ErrTooLong), silently dropping every record
+// oversizedLineCap is the per-line size the loader is willing to retain.
+// JSONL lines here are small; anything over this cap is a corrupt or
+// out-of-band record that is skipped and logged.
+const oversizedLineCap = 1024 * 1024
+
+// oversizedLineSample is how much of an oversized record we keep around so
+// the skip log can quote a fragment. The rest of the record is discarded
+// through its newline, so a corrupt line is bounded in memory instead of
+// fully buffered.
+const oversizedLineSample = 512
+
+// readHistoryLines streams a JSONL file line by line, calling parse with
+// each line as it is read. parse returns false to stop the read early.
+//
+// A bufio.Scanner here used to end the whole read at the first line over
+// its 1 MiB token cap (bufio.ErrTooLong), silently dropping every record
 // after it; the next Compact then persisted the truncated snapshot, turning
 // a transient read failure into permanent loss. ReadBytes has no such cap:
-// an oversized line is returned whole, logged, and discarded, and the next
-// call resumes at the following line.
-func readHistoryLines(f *os.File) [][]byte {
+// an oversized line is skipped, logged once with its line number and the
+// file offset where parsing resumed, and the read continues from the
+// following line. The stream is read into parse one line at a time, so the
+// file is never buffered whole, and an oversized record is retained only up
+// to oversizedLineSample bytes while the remainder is discarded.
+func readHistoryLines(f *os.File, parse func(line []byte) bool) {
 	r := bufio.NewReaderSize(f, 64*1024)
-	var lines [][]byte
-	lineNo := 0
+	var (
+		lineNo int
+		// off tracks the absolute file offset of the start of the current
+		// line. The loader runs over a freshly opened file, so the read
+		// offset equals the file offset.
+		off int64
+	)
 	for {
-		line, err := r.ReadBytes('\n')
+		line, lineStart, consumed, err := readHistoryLine(r, off)
+		off = lineStart + int64(consumed)
 		if len(line) > 0 {
 			lineNo++
-			lines = append(lines, line)
+		}
+		// Oversize is detected from how much of the stream the record
+		// consumed, not from the (bounded) sample we retained. The check
+		// runs before the EOF return on purpose: an unterminated oversized
+		// final line (ReadBytes returns it with io.EOF) must be logged and
+		// skipped exactly once, not appended.
+		if int64(consumed) > oversizedLineCap {
+			// Log once per oversized line: which line, the file offset the
+			// skip happened at (lineStart), the record's length, and the
+			// retained sample as a fragment so the operator can identify
+			// the record.
+			logf("history: skipping oversized line %d at file offset %d (%d bytes over %d cap, %q)",
+				lineNo, lineStart, consumed-oversizedLineCap, oversizedLineCap, string(line))
 		}
 		if err != nil {
 			if err != io.EOF {
 				// Same policy as a bad open: surface once, keep running.
 				logf("history: read failed, keeping what was read: %v", err)
 			}
-			return lines
+			return
 		}
-		if len(line) > 1024*1024 {
-			// Log once per oversized line, then continue reading.
-			logf("history: skipping oversized line %d (%d bytes)", lineNo, len(line))
+		if len(line) == 0 || int64(consumed) > oversizedLineCap {
+			// Blank lines and oversized lines are skipped: the loader
+			// resumes from the line after the one just skipped.
+			continue
+		}
+		if !parse(line) {
+			return
 		}
 	}
+}
+
+// readHistoryLine reads one line from r. startOff is the file offset where
+// this line begins; it is returned so the caller can report the offset in
+// the oversized-line log. consumed is the number of bytes taken from the
+// stream for this line (including the terminator, when there is one) so
+// the caller can advance its running offset correctly even when the
+// oversized line's retained sample is shorter than the record it skipped.
+//
+// Lines within the cap are returned whole. An oversized line is retained
+// only up to oversizedLineSample bytes and the remainder is discarded
+// through its newline, so a corrupt/out-of-band record cannot occupy an
+// unbounded amount of memory.
+//
+// The returned error is nil only when the line was newline-terminated.
+// io.EOF means the line ended the file (a final line without a trailing
+// newline).
+func readHistoryLine(r *bufio.Reader, startOff int64) (line []byte, lineStart int64, consumed int, err error) {
+	first, firstErr := r.ReadBytes('\n')
+	if len(first) <= oversizedLineCap {
+		// Normal path: the whole line was within the cap (or the file
+		// ended short). Nothing to discard.
+		return first, startOff, len(first), firstErr
+	}
+	// Oversized path: `first` alone already exceeds the cap.
+	total := len(first)
+	if bytes.IndexByte(first, '\n') >= 0 {
+		// The terminating newline is already in `first`: the record is
+		// complete. Retain only a sample.
+		return tailSample(first, oversizedLineSample), startOff, total, nil
+	}
+	// The record continues past `first`. Retain the tail of what we have
+	// and discard the rest as we stream through to the next newline.
+	retained := tailSample(first, oversizedLineSample-1)
+	for {
+		next, nextErr := r.ReadBytes('\n')
+		total += len(next)
+		if bytes.IndexByte(next, '\n') >= 0 {
+			// Newline found: the skipped record is complete.
+			combined := make([]byte, 0, len(retained)+len(next))
+			combined = append(append(combined, retained...), next...)
+			return tailSample(combined, oversizedLineSample), startOff, total, nil
+		}
+		// No newline in this chunk: it is all part of the skipped record.
+		retained = append(append([]byte(nil), retained...), next...)
+		retained = tailSample(retained, oversizedLineSample-1)
+		if nextErr != nil {
+			// No newline and the read stopped: the record ran to end of
+			// file (io.EOF) or the stream failed.
+			return retained, startOff, total, nextErr
+		}
+	}
+}
+
+// tailSample returns the last n bytes of b (or all of b when it is no
+// longer than n).
+func tailSample(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	return b[len(b)-n:]
 }
 
 // PriorSeen reports how many times the given signature has been recorded
