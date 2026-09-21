@@ -20,6 +20,11 @@ type Report struct {
 	Narrative  string
 	Triage     Triage
 	Metrics    []string // compact metric summaries from Prometheus backend
+	// MetricsScoped records whether the metrics query was bounded to a
+	// resolved subject pod. When false, the lines are namespace-wide and the
+	// renderer must present them as context, never as subject-scoped evidence
+	// (issue #136 review).
+	MetricsScoped bool
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -381,34 +386,21 @@ func renderEvidence(r Report) string {
 	if len(r.Enrichment.InspectedJobs) > 0 {
 		writeFinding(&b, "Inspected jobs", r.Enrichment.InspectedJobs, "")
 	}
-	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
-	if len(r.Enrichment.RecentRestarts) > 0 {
-		writeFinding(&b, "Recent restarts", r.Enrichment.RecentRestarts, "")
+	// Only pods that are a resolved alert subject are direct evidence. The
+	// namespace-wide remainder of the same scan renders under CONTEXT, so an
+	// unrelated crashing pod in the same namespace cannot be promoted into the
+	// subject's tier (issue #136 review).
+	writeFinding(&b, "Unhealthy pods", r.Enrichment.SubjectPods, "no unhealthy pods on the alert's subjects")
+	if len(r.Enrichment.SubjectRestarts) > 0 {
+		writeFinding(&b, "Recent restarts", r.Enrichment.SubjectRestarts, "")
 	}
 	// The structured reading (exit code, reason, finish time) is this
 	// service's own, so it stays outside the fence, like pod phases. The
 	// container's own termination message is quoted separately, inside the
 	// fence, like event text — the split the issue #128 review asked for.
-	writeFinding(&b, "Container terminations", r.Enrichment.ContainerDiagnostics, "no terminated containers in scope")
-	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.ContainerTerminationMessages, "no terminated containers left a message")
-	if len(r.Enrichment.PodLogs) > 0 {
-		b.WriteString("\nPod failure logs:\n")
-		b.WriteString(untrustedBegin + "\n")
-		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
-			// Identify the container and stream per-entry: a one-shot
-			// Job pod is logged through the *current* stream, a
-			// CrashLoop through the *previous* one, and a multi-container
-			// pod through the container that failed. The section
-			// heading "previous container tail" used to lie about both
-			// cases (issue #128 review).
-			if p := r.Enrichment.PodLogProvenance[podKey]; p.Container != "" {
-				fmt.Fprintf(&b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
-			}
-			b.WriteString(untrusted(log) + "\n")
-		}
-		b.WriteString(untrustedEnd + "\n")
-	}
+	writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
+	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
+	writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
 	// Log-backend lines are workload-authored as well. Keep the state finding
 	// outside the fence, but fence the lines and never treat them as API fact.
 	switch r.Enrichment.BackendState {
@@ -446,7 +438,7 @@ func renderEvidence(r Report) string {
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
-	if len(r.Metrics) > 0 {
+	if r.MetricsScoped && len(r.Metrics) > 0 {
 		b.WriteString("\nMETRICS (queried from metrics backend for the resolved subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
 		for _, line := range r.Metrics {
@@ -457,6 +449,24 @@ func renderEvidence(r Report) string {
 
 	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
 	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
+	writeFinding(&b, "Other unhealthy pods in the namespace", r.Enrichment.ContextPods, "no other unhealthy pods in the namespace")
+	if len(r.Enrichment.ContextRestarts) > 0 {
+		writeFinding(&b, "Other recent restarts in the namespace", r.Enrichment.ContextRestarts, "")
+	}
+	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics, "no other terminated containers in the namespace")
+	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages, "no other terminated containers left a message")
+	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
+	// Metrics are only subject-scoped when the query carried a resolved pod
+	// label; otherwise they were namespace-wide and must not be described as
+	// evidence about the subject (issue #136 review).
+	if !r.MetricsScoped && len(r.Metrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the namespace, not necessarily the subject; untrusted label values):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.Metrics {
+			fmt.Fprintf(&b, "- %s\n", untrusted(line))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	if len(r.Enrichment.Ambient) > 0 {
@@ -559,6 +569,27 @@ func writeCommitMessage(b *strings.Builder, message string) {
 	b.WriteString("  message:\n")
 	b.WriteString(untrustedBegin + "\n")
 	fmt.Fprintf(b, "  %s\n", untrusted(message))
+	b.WriteString(untrustedEnd + "\n")
+}
+
+// writePodLogBlock renders a pod-log map inside the untrusted fence. The
+// provenance lookup names the container and stream per entry, so a one-shot
+// Job's current log is not silently mislabelled as a previous-container tail
+// (issue #128 review); state and headings outside the fence stay this
+// service's own reading.
+func writePodLogBlock(b *strings.Builder, title string, logs map[string]string, prov map[string]podLogProvenance) {
+	if len(logs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\n%s:\n", title)
+	b.WriteString(untrustedBegin + "\n")
+	for podKey, log := range logs {
+		fmt.Fprintf(b, "## %s\n", untrusted(podKey))
+		if p := prov[podKey]; p.Container != "" {
+			fmt.Fprintf(b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
+		}
+		b.WriteString(untrusted(log) + "\n")
+	}
 	b.WriteString(untrustedEnd + "\n")
 }
 

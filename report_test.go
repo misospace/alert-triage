@@ -271,7 +271,7 @@ func TestContainerTerminationReadingOutsideMessageInside(t *testing.T) {
 	)
 	rpt := Report{
 		Group:      Group{Key: "single/" + podKey, Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}}},
-		Enrichment: Enrichment{ContainerDiagnostics: []string{reading}, ContainerTerminationMessages: []string{message}},
+		Enrichment: Enrichment{SubjectContainerDiagnostics: []string{reading}, SubjectContainerTerminationMessages: []string{message}},
 	}
 	got := renderEvidence(rpt)
 
@@ -584,7 +584,7 @@ func TestGitHubPodLogsFenceEscape(t *testing.T) {
 			}},
 		},
 		Enrichment: Enrichment{
-			PodLogs: map[string]string{"ns/foo": payload},
+			SubjectPodLogs: map[string]string{"ns/foo": payload},
 		},
 	}
 
@@ -761,19 +761,19 @@ func TestRenderEvidenceFencesOwnershipChains(t *testing.T) {
 	got := renderEvidence(rpt)
 
 	if strings.Count(got, untrustedBegin) != strings.Count(got, untrustedEnd) {
-		t.Fatalf("unbalanced fences:\\n%s", got)
+		t.Fatalf("unbalanced fences:\n%s", got)
 	}
 	// Alert block + ownership block, no more.
 	if strings.Count(got, untrustedBegin) != 2 {
-		t.Fatalf("want the alert block and the ownership block fenced, got %d fences:\\n%s", strings.Count(got, untrustedBegin), got)
+		t.Fatalf("want the alert block and the ownership block fenced, got %d fences:\n%s", strings.Count(got, untrustedBegin), got)
 	}
 	// The forged fence inside the controller name must not survive intact.
 	if strings.Contains(got, injected) {
-		t.Errorf("injected text was not defanged:\\n%s", got)
+		t.Errorf("injected text was not defanged:\n%s", got)
 	}
 	// The chain itself is still shown, so the model has the evidence.
 	if !strings.Contains(got, "Job/ns1/backup -> Backup/") {
-		t.Errorf("ownership chain content was dropped:\\n%s", got)
+		t.Errorf("ownership chain content was dropped:\n%s", got)
 	}
 }
 
@@ -842,7 +842,7 @@ func TestEmptyOwnershipNotFenced(t *testing.T) {
 	}
 	got := renderEvidence(rpt)
 	if !strings.Contains(got, "Ownership chains: no ownership chains recorded") {
-		t.Errorf("missing explicit negative for ownership:\\n%s", got)
+		t.Errorf("missing explicit negative for ownership:\n%s", got)
 	}
 }
 
@@ -857,18 +857,18 @@ func TestRenderEvidencePlacesTiersDirectThenContext(t *testing.T) {
 			Alerts:     []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed", "job_name": "backup", "namespace": "ns1"}}},
 		},
 		Enrichment: Enrichment{
-			Scope:         "namespaces ns1 plus cluster node health",
-			InspectedJobs: []string{"ns1/backup"},
-			UnhealthyPods: []string{"ns1/backup-0 Failed (PermissionDenied)"},
-			PodLogs:       map[string]string{"ns1/backup-0": "previous container log line"},
-			BackendLogs:   []string{"subject backend log line"},
-			BackendState:  "ok",
-			EventsScoped:  true,
-			Events:        []string{"FailedMount on Pod (e.g. backup-0): mount failed"},
-			Ownership:     []string{"Pod/ns1/backup-0 -> Job/ns1/backup"},
-			Nodes:         []string{"node-eula NotReady (MemoryPressure)"},
-			FluxActivity:  []string{"ns1/kustomization-llm reconciled at revision main@0982756"},
-			Ambient:       []string{"VolumeFailedDelete on PersistentVolume (e.g. pvc-1): still attached"},
+			Scope:          "namespaces ns1 plus cluster node health",
+			InspectedJobs:  []string{"ns1/backup"},
+			SubjectPods:    []string{"ns1/backup-0 Failed (PermissionDenied)"},
+			SubjectPodLogs: map[string]string{"ns1/backup-0": "previous container log line"},
+			BackendLogs:    []string{"subject backend log line"},
+			BackendState:   "ok",
+			EventsScoped:   true,
+			Events:         []string{"FailedMount on Pod (e.g. backup-0): mount failed"},
+			Ownership:      []string{"Pod/ns1/backup-0 -> Job/ns1/backup"},
+			Nodes:          []string{"node-eula NotReady (MemoryPressure)"},
+			FluxActivity:   []string{"ns1/kustomization-llm reconciled at revision main@0982756"},
+			Ambient:        []string{"VolumeFailedDelete on PersistentVolume (e.g. pvc-1): still attached"},
 		},
 	}
 	got := renderEvidence(rpt)
@@ -876,10 +876,10 @@ func TestRenderEvidencePlacesTiersDirectThenContext(t *testing.T) {
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
 	if directIdx < 0 || contextIdx < 0 {
-		t.Fatalf("missing tier headings:\\n%s", got)
+		t.Fatalf("missing tier headings:\n%s", got)
 	}
 	if directIdx > contextIdx {
-		t.Errorf("direct tier must come before the context tier (direct=%d, context=%d):\\n%s", directIdx, contextIdx, got)
+		t.Errorf("direct tier must come before the context tier (direct=%d, context=%d):\n%s", directIdx, contextIdx, got)
 	}
 
 	inDirect := []string{
@@ -896,9 +896,9 @@ func TestRenderEvidencePlacesTiersDirectThenContext(t *testing.T) {
 	for _, want := range inDirect {
 		idx := strings.Index(got, want)
 		if idx < 0 {
-			t.Errorf("direct-tier marker %q missing:\\n%s", want, got)
+			t.Errorf("direct-tier marker %q missing:\n%s", want, got)
 		} else if idx < directIdx || idx > contextIdx {
-			t.Errorf("direct-tier item %q at %d falls outside the direct tier [%d, %d]:\\n%s", want, idx, directIdx, contextIdx, got)
+			t.Errorf("direct-tier item %q at %d falls outside the direct tier [%d, %d]:\n%s", want, idx, directIdx, contextIdx, got)
 		}
 	}
 
@@ -912,15 +912,15 @@ func TestRenderEvidencePlacesTiersDirectThenContext(t *testing.T) {
 	for _, want := range inContext {
 		idx := strings.Index(got, want)
 		if idx < 0 {
-			t.Errorf("context-tier marker %q missing:\\n%s", want, got)
+			t.Errorf("context-tier marker %q missing:\n%s", want, got)
 		} else if idx < directIdx || idx <= contextIdx {
-			t.Errorf("context item %q at %d is not in the context tier [%d, end]:\\n%s", want, idx, contextIdx, got)
+			t.Errorf("context item %q at %d is not in the context tier [%d, end]:\n%s", want, idx, contextIdx, got)
 		}
 	}
 
 	// Fences must stay balanced across both tiers.
 	if strings.Count(got, untrustedBegin) != strings.Count(got, untrustedEnd) {
-		t.Errorf("unbalanced untrusted fences:\\n%s", got)
+		t.Errorf("unbalanced untrusted fences:\n%s", got)
 	}
 }
 
@@ -957,11 +957,11 @@ func TestDirectPermissionDeniedTiersAboveFluxContext(t *testing.T) {
 			Alerts:     []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "pod": "llm-1", "namespace": "ns1"}}},
 		},
 		Enrichment: Enrichment{
-			Scope:         "namespaces ns1 plus cluster node health",
-			UnhealthyPods: []string{"ns1/llm-1 Running (PermissionDenied)"},
-			PodLogs:       map[string]string{"ns1/llm-1": "open /var/run/secret: Permission denied"},
-			FluxActivity:  []string{"ns1/kustomization-llm reconciled at revision main@0982756"},
-			Nodes:         []string{"all nodes healthy"},
+			Scope:          "namespaces ns1 plus cluster node health",
+			SubjectPods:    []string{"ns1/llm-1 Running (PermissionDenied)"},
+			SubjectPodLogs: map[string]string{"ns1/llm-1": "open /var/run/secret: Permission denied"},
+			FluxActivity:   []string{"ns1/kustomization-llm reconciled at revision main@0982756"},
+			Nodes:          []string{"all nodes healthy"},
 		},
 	}
 	got := renderEvidence(rpt)
@@ -969,18 +969,18 @@ func TestDirectPermissionDeniedTiersAboveFluxContext(t *testing.T) {
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
 	if directIdx < 0 || contextIdx < 0 {
-		t.Fatalf("missing tier headings:\\n%s", got)
+		t.Fatalf("missing tier headings:\n%s", got)
 	}
 	permIdx := strings.Index(got, "Permission denied")
 	if permIdx < directIdx || permIdx > contextIdx {
-		t.Errorf("direct PermissionDenied log at %d must sit in the direct tier [%d, %d]:\\n%s", permIdx, directIdx, contextIdx, got)
+		t.Errorf("direct PermissionDenied log at %d must sit in the direct tier [%d, %d]:\n%s", permIdx, directIdx, contextIdx, got)
 	}
 	fluxIdx := strings.Index(got, "reconciled at revision")
 	if fluxIdx < 0 {
-		t.Fatalf("healthy Flux reconcile must still be rendered:\\n%s", got)
+		t.Fatalf("healthy Flux reconcile must still be rendered:\n%s", got)
 	}
 	if fluxIdx < contextIdx {
-		t.Errorf("healthy Flux reconcile at %d must not outrank direct subject evidence (direct tier ends at %d):\\n%s", fluxIdx, contextIdx, got)
+		t.Errorf("healthy Flux reconcile at %d must not outrank direct subject evidence (direct tier ends at %d):\n%s", fluxIdx, contextIdx, got)
 	}
 }
 
@@ -1012,18 +1012,18 @@ func TestBackendLogsScopedToDirectTier(t *testing.T) {
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
 	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
-		t.Fatalf("missing tier headings:\\n%s", got)
+		t.Fatalf("missing tier headings:\n%s", got)
 	}
 	ambIdx := strings.Index(got, "flux reconciled in ns1")
 	if ambIdx < 0 {
-		t.Fatalf("namespace-wide line must be rendered:\\n%s", got)
+		t.Fatalf("namespace-wide line must be rendered:\n%s", got)
 	}
 	if ambIdx >= directIdx && ambIdx <= contextIdx {
-		t.Errorf("namespace-only backend log at %d landed in the DIRECT tier [%d, %d] (must stay out of it):\\n%s",
+		t.Errorf("namespace-only backend log at %d landed in the DIRECT tier [%d, %d] (must stay out of it):\n%s",
 			ambIdx, directIdx, contextIdx, got)
 	}
 	if ambIdx < contextIdx {
-		t.Errorf("namespace-only backend log at %d must sit in the context tier (after %d):\\n%s",
+		t.Errorf("namespace-only backend log at %d must sit in the context tier (after %d):\n%s",
 			ambIdx, contextIdx, got)
 	}
 
@@ -1037,14 +1037,14 @@ func TestBackendLogsScopedToDirectTier(t *testing.T) {
 	directIdx = strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx = strings.Index(got, "CONTEXT / BACKGROUND")
 	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
-		t.Fatalf("missing tier headings:\\n%s", got)
+		t.Fatalf("missing tier headings:\n%s", got)
 	}
 	subjIdx := strings.Index(got, "open /var/run/secret: Permission denied")
 	if subjIdx < 0 {
-		t.Fatalf("subject-scoped line must be rendered:\\n%s", got)
+		t.Fatalf("subject-scoped line must be rendered:\n%s", got)
 	}
 	if subjIdx < directIdx || subjIdx > contextIdx {
-		t.Errorf("subject-scoped backend log at %d must sit in the DIRECT tier [%d, %d]:\\n%s",
+		t.Errorf("subject-scoped backend log at %d must sit in the DIRECT tier [%d, %d]:\n%s",
 			subjIdx, directIdx, contextIdx, got)
 	}
 }
@@ -1061,14 +1061,76 @@ func TestExplicitNegativesKeepTheirScopeAcrossTiers(t *testing.T) {
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
 	if directIdx < 0 || contextIdx < 0 {
-		t.Fatalf("missing tier headings:\\n%s", got)
+		t.Fatalf("missing tier headings:\n%s", got)
 	}
 	nodeIdx := strings.Index(got, "all nodes Ready")
 	if nodeIdx < 0 || nodeIdx < contextIdx {
-		t.Errorf("node-health negative must sit in the context tier (got %d, context tier at %d):\\n%s", nodeIdx, contextIdx, got)
+		t.Errorf("node-health negative must sit in the context tier (got %d, context tier at %d):\n%s", nodeIdx, contextIdx, got)
 	}
 	eventIdx := strings.Index(got, "no warning events on the resolved subject in the window")
 	if eventIdx < 0 || eventIdx < directIdx || eventIdx > contextIdx {
-		t.Errorf("subject-scoped event negative must sit in the direct tier (got %d, tier [%d, %d]):\\n%s", eventIdx, directIdx, contextIdx, got)
+		t.Errorf("subject-scoped event negative must sit in the direct tier (got %d, tier [%d, %d]):\n%s", eventIdx, directIdx, contextIdx, got)
+	}
+}
+
+// Pod logs follow the same provenance rule as the rest of the pod scan: only a
+// resolved subject's logs are DIRECT evidence; a namespace pod's logs stay in
+// CONTEXT. This is the log half of the issue #136 review regression.
+func TestPodLogsSplitBetweenSubjectAndContext(t *testing.T) {
+	got := renderEvidence(Report{
+		Group: Group{Key: "single/KubePodNotReady", Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "target"}}}},
+		Enrichment: Enrichment{
+			SubjectPods:    []string{"ns1/target Failed (PermissionDenied)"},
+			ContextPods:    []string{"ns1/noise Failed (Error)"},
+			SubjectPodLogs: map[string]string{"ns1/target": "open /var/run/secret: Permission denied"},
+			ContextPodLogs: map[string]string{"ns1/noise": "unrelated crashloop chatter"},
+		},
+	})
+	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing or misordered tier headings:\n%s", got)
+	}
+	if i := strings.Index(got, "Permission denied"); i < directIdx || i > contextIdx {
+		t.Errorf("subject pod log at %d must sit in DIRECT [%d, %d]:\n%s", i, directIdx, contextIdx, got)
+	}
+	ni := strings.Index(got, "unrelated crashloop chatter")
+	if ni < 0 {
+		t.Fatalf("context pod log not rendered at all:\n%s", got)
+	}
+	if ni < contextIdx {
+		t.Errorf("namespace pod log at %d must not appear in DIRECT (context starts at %d):\n%s", ni, contextIdx, got)
+	}
+}
+
+// Metrics provenance: a group with a namespace but no subject pod label runs a
+// namespace-wide query, so the renderer must describe the lines as namespace
+// context, never as "for the resolved subject" (issue #136 review).
+func TestNamespaceWideMetricsNotSubjectScoped(t *testing.T) {
+	g := Group{Key: "single/KubeJobFailed", Alerts: []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}}}}
+	namespaceWide := Report{Group: g, Metrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}}
+	got := renderEvidence(namespaceWide)
+	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing or misordered tier headings:\n%s", got)
+	}
+	mi := strings.Index(got, "CPUThrottlingHigh")
+	if mi < 0 {
+		t.Fatalf("metrics not rendered:\n%s", got)
+	}
+	if mi < contextIdx {
+		t.Errorf("namespace-wide metrics at %d must sit in CONTEXT (starts %d), not DIRECT:\n%s", mi, contextIdx, got)
+	}
+	if strings.Contains(got[:contextIdx], "for the resolved subject") {
+		t.Errorf("namespace-wide metrics described as subject-scoped in the direct tier:\n%s", got)
+	}
+
+	scoped := Report{Group: g, Metrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}, MetricsScoped: true}
+	got = renderEvidence(scoped)
+	directIdx = strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx = strings.Index(got, "CONTEXT / BACKGROUND")
+	if mi := strings.Index(got, "CPUThrottlingHigh"); mi < directIdx || mi > contextIdx {
+		t.Errorf("subject-scoped metrics at %d must sit in DIRECT [%d, %d]:\n%s", mi, directIdx, contextIdx, got)
 	}
 }
