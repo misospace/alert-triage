@@ -3251,7 +3251,10 @@ func TestEnrichPodIdentityAndSameClaimSibling(t *testing.T) {
 				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
 			{"metadata":{"name":"app-xyz","namespace":"ns1"},
 			 "spec":{
-				"containers":[{"name":"app","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"securityContext":{"fsGroup":3000,"runAsNonRoot":true},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":2000},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":true}]}],
 				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
 			 "status":{"phase":"Running","containerStatuses":[
 				{"name":"app","ready":true,"state":{"running":{}}}]}},
@@ -3302,6 +3305,69 @@ func TestEnrichPodIdentityAndSameClaimSibling(t *testing.T) {
 	if !strings.Contains(sib, "Running") || !strings.Contains(sib, "1/1 ready") {
 		t.Errorf("sibling %q must carry phase and readiness", sib)
 	}
+	// The sibling must carry its own declared identity and mount so the
+	// operator can compare it with the mover's on the same claim. Container
+	// runAsUser overrides the pod; pod fsGroup/runAsNonRoot are inherited.
+	for _, want := range []string{
+		"container app (declared: runAsUser=2000 runAsGroup=unset fsGroup=3000 runAsNonRoot=true)",
+		"data-claim at /data (read-only)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("sibling %q missing %q", sib, want)
+		}
+	}
+}
+
+// A sibling with several containers must only report the container(s) that
+// actually mount the matched claim, so the identity/mount detail does not
+// imply the other containers touch the volume.
+func TestEnrichSiblingDetailOnlyListsMountingContainers(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"app-xyz","namespace":"ns1"},
+			 "spec":{
+				"containers":[
+					{"name":"app","securityContext":{"runAsUser":2000},
+					 "volumeMounts":[{"name":"data","mountPath":"/data"}]},
+					{"name":"sidecar"}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}},
+				{"name":"sidecar","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "app-xyz") {
+			sib = s
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected app-xyz as a same-claim sibling, got %v", en.PVCSiblings)
+	}
+	if !strings.Contains(sib, "container app (declared: runAsUser=2000") {
+		t.Errorf("sibling %q must describe the mounting container app", sib)
+	}
+	if strings.Contains(sib, "sidecar") {
+		t.Errorf("sibling %q must not describe a container that does not mount the claim", sib)
+	}
 }
 
 // A KubeJobFailed alert names a Job via job_name and carries no pod label
@@ -3323,7 +3389,10 @@ func TestEnrichJobFailedPodIdentityAndSiblings(t *testing.T) {
 				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
 			{"metadata":{"name":"web-0","namespace":"ns1"},
 			 "spec":{
-				"containers":[{"name":"app","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"securityContext":{"runAsGroup":4000},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":5000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
 				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
 			 "status":{"phase":"Running","containerStatuses":[
 				{"name":"app","ready":true,"state":{"running":{}}}]}}
@@ -3351,14 +3420,22 @@ func TestEnrichJobFailedPodIdentityAndSiblings(t *testing.T) {
 	if !strings.Contains(id, "runAsUser=4000") || !strings.Contains(id, "data-claim at /data") {
 		t.Errorf("job pod identity = %q, want declared identity and PVC mount", id)
 	}
-	var found bool
+	var sib string
 	for _, s := range en.PVCSiblings {
 		if strings.Contains(s, "web-0") {
-			found = true
+			sib = s
 		}
 	}
-	if !found {
+	if sib == "" {
 		t.Fatalf("expected the same-claim sibling web-0 for the job pod, got %v", en.PVCSiblings)
+	}
+	for _, want := range []string{
+		"container app (declared: runAsUser=5000 runAsGroup=4000 fsGroup=unset runAsNonRoot=false)",
+		"data-claim at /data (read-write)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("job sibling %q missing %q", sib, want)
+		}
 	}
 }
 

@@ -644,6 +644,14 @@ type Enrichment struct {
 // is meant to avoid.
 const sameClaimSibMax = 3
 
+// identityFields renders a declared identity as the key=value list the prompt
+// and evidence use, preserving "unset" for fields neither the pod nor the
+// container declared.
+func identityFields(id containerID) string {
+	u, gr, fg, nr := id.format()
+	return fmt.Sprintf("runAsUser=%s runAsGroup=%s fsGroup=%s runAsNonRoot=%s", u, gr, fg, nr)
+}
+
 // podIdentities assembles the Enrichment.PodID lines. It works from the pods
 // already gathered for the group, so it adds no requests and no permissions:
 // the same read-only GETs as the rest of Enrich. For each target pod, one line
@@ -681,8 +689,7 @@ func podIdentities(targetPods map[string]*podItem) map[string]string {
 				b.WriteString("; ")
 			}
 			id := p.containerSpec(n).effective(p.Spec.Security)
-			u, gr, fg, nr := id.format()
-			fmt.Fprintf(&b, "container %s (declared: runAsUser=%s runAsGroup=%s fsGroup=%s runAsNonRoot=%s)", n, u, gr, fg, nr)
+			fmt.Fprintf(&b, "container %s (declared: %s)", n, identityFields(id))
 			claims := p.containerMounts(n)
 			claimNames := make([]string, 0, len(claims))
 			for c := range claims {
@@ -722,6 +729,32 @@ func sameClaimTargets(targetPods map[string]*podItem, namespace string) map[stri
 		}
 	}
 	return out
+}
+
+// siblingClaimDetail describes the containers of a same-claim sibling that
+// actually mount the matched claim: each container's effective declared
+// identity and its mount path/read-only state. It is the comparison the
+// permission hypothesis needs — the mover's declared UID/GID/mount beside the
+// serving workload's on the same claim — and only containers that mount the
+// claim are listed, so a multi-container sibling does not imply the others
+// touch the volume. Returns "" when the spec read carried no matching mount.
+func siblingClaimDetail(p *podItem, claim string) string {
+	var parts []string
+	for i := range p.Spec.Containers {
+		c := &p.Spec.Containers[i]
+		m, ok := p.containerMounts(c.Name)[claim]
+		if !ok {
+			continue
+		}
+		mode := "read-write"
+		if m.ReadOnly {
+			mode = "read-only"
+		}
+		parts = append(parts, fmt.Sprintf("container %s (declared: %s), %s at %s (%s)",
+			c.Name, identityFields(c.effective(p.Spec.Security)), claim, m.Path, mode))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }
 
 func (e Enrichment) empty() bool {
@@ -1053,7 +1086,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 					continue
 				}
 				sibSeen[k2] = true
-				e.PVCSiblings = append(e.PVCSiblings, fmt.Sprintf("same-claim %s: %s %s (%s)", claim, p.Metadata.Namespace+"/"+p.Metadata.Name, p.Status.Phase, p.ready()))
+				line := fmt.Sprintf("same-claim %s: %s %s (%s)", claim, p.Metadata.Namespace+"/"+p.Metadata.Name, p.Status.Phase, p.ready())
+				if d := siblingClaimDetail(p, claim); d != "" {
+					line += "; " + d
+				}
+				e.PVCSiblings = append(e.PVCSiblings, line)
 			}
 		}
 
