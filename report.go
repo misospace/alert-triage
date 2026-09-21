@@ -144,12 +144,28 @@ Rules:
   near the alert, that is only a neutral note that its source was applied at
   that revision - it is not evidence the workload was deployed or its
   configuration changed, so never call it a deploy, a change, or a trigger.
+- "Declared identity" is the pod/container securityContext the spec declares:
+  the container's value overrides the pod's field by field, and a field that
+  neither sets is "unset". Never fill an unset field in - the image is not
+  evidence. The declared identity does not state on-disk file ownership or
+  mode, and the Kubernetes API does not expose those; you may combine a
+  declared non-root identity with PermissionDenied log lines, but you must
+  not report a stat result as if you had read the filesystem.
+- Same-claim siblings are other pods in the namespace that mount a Persistent
+  VolumeClaim the alert's target pod also mounts. They are comparison
+  context, not the alert's subject: do not call one the application. A
+  healthy same-claim sibling says the fault is specific to the target (a
+  permission or storage-mover problem), not a storage-wide outage; a
+  failing sibling says the serving workload is also unhealthy.
 
 Also decide where a fix would have to be made. The cluster is managed by GitOps:
 a commit to the repository is reconciled onto it automatically.
 
   git      - fixable by editing the repository alone: image tags, chart values,
-             resource limits, replicas, affinity, scheduling, config.
+             resource limits, replicas, affinity, scheduling, config, and the
+             securityContext (runAsUser/runAsGroup/fsGroup) the workload
+             declares - a mover that should write as root but declares a
+             non-root identity is fixed here.
   partial  - a repository change helps but does not finish the job; some manual
              action against the cluster or hardware is still required.
   cluster  - needs an action against the cluster or hardware and no repository
@@ -414,6 +430,12 @@ func renderEvidence(r Report) string {
 		writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
 		writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
 		writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
+		// The declared identity and PVC mounts are read from the subject's own
+		// spec, so they are direct evidence. The negative is scoped to the
+		// resolving: it says no resolved subject pod carried a declared
+		// securityContext or PVC mount, not that the filesystem is unowned.
+		writeFinding(&b, "Pod execution identity and PVC mounts", podIDLines(r.Enrichment.PodID),
+			"the resolved subject pod(s) declared no securityContext and mounted no PVC")
 	} else {
 		// No subject pod resolved or seen: report the absence of an
 		// inspection, not a clean bill of health.
@@ -485,6 +507,11 @@ func renderEvidence(r Report) string {
 	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics, "no other terminated containers in the namespace")
 	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages, "no other terminated containers left a message")
 	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
+	// Same-claim siblings are comparison context, never the subject: they
+	// mount a claim the subject mounts, but that relationship alone does not
+	// say what workload the claim serves.
+	writeFinding(&b, "Same-claim siblings (comparison context only)", r.Enrichment.PVCSiblings,
+		"no other pod in the namespace mounts a claim the resolved subject pod mounts")
 	// Metric scope is per source: alert-rule expression results and fixed
 	// metrics without a pod label may span the namespace or cluster, so they
 	// render as context and are never described as evidence about the subject.
@@ -622,6 +649,24 @@ func writePodLogBlock(b *strings.Builder, title string, logs map[string]string, 
 	b.WriteString(untrustedEnd + "\n")
 }
 
+// podIDLines returns the pod-identity lines in sorted key order so the
+// rendered evidence is deterministic across runs.
+func podIDLines(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, m[k])
+	}
+	return out
+}
+
 func orUnknown(s string) string {
 	if s == "" {
 		return "unknown"
@@ -711,6 +756,8 @@ func discordDescription(cfg *Config, r Report) string {
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Container terminations", r.Enrichment.ContainerDiagnostics)
 	writeDiscordSection(&desc, "Container termination messages", r.Enrichment.ContainerTerminationMessages)
+	writeDiscordSection(&desc, "Pod identity & PVC mounts", podIDLines(r.Enrichment.PodID))
+	writeDiscordSection(&desc, "Same-claim siblings", r.Enrichment.PVCSiblings)
 	if len(r.Enrichment.PodLogs) > 0 {
 		// Per-entry header carries the container and stream so the chat
 		// does not mislabel a one-shot Job's current log as a previous
