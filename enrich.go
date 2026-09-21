@@ -304,6 +304,11 @@ type Enrichment struct {
 	// lines were routed to Ambient — the source is configured and answered.
 	BackendLogs  []string
 	BackendState string
+	// BackendScoped records whether the backend-log query was bounded to a
+	// resolved subject pod rather than falling back to the namespace. It keeps
+	// the "empty" state honest: only a subject-scoped query may claim it
+	// returned no lines for the subject (issue #136 review).
+	BackendScoped bool
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -318,6 +323,40 @@ type Enrichment struct {
 	// evidence the alert is about, so it is surfaced as its own finding rather
 	// than only mentioned inside UnhealthyPods.
 	RecentRestarts []string
+	// SubjectPods is the subset of UnhealthyPods that belongs to a resolved
+	// alert subject: a pod an alert named, or a pod owned by a Job an alert
+	// named. Only this subset is guaranteed subject-scoped, so only it may be
+	// presented as DIRECT SUBJECT EVIDENCE. UnhealthyPods is the full
+	// namespace scan and is context.
+	SubjectPods []string
+	// ContextPods is UnhealthyPods minus SubjectPods: namespace-wide pod
+	// failure state not known to concern the alert.
+	ContextPods []string
+	// SubjectPodObserved records whether at least one resolved subject pod was
+	// actually found in the namespace listing. When false, the Subject* fields
+	// are empty because no subject pod was inspected, not because the subject
+	// was healthy; the renderer must say so rather than emit a health negative
+	// scoped to a subject it never saw (issue #136 review).
+	SubjectPodObserved bool
+	// SubjectRestarts and ContextRestarts split RecentRestarts the same way.
+	SubjectRestarts []string
+	ContextRestarts []string
+	// SubjectContainerDiagnostics and ContextContainerDiagnostics split
+	// ContainerDiagnostics the same way: only a resolved subject's structured
+	// container reading is direct evidence.
+	SubjectContainerDiagnostics []string
+	ContextContainerDiagnostics []string
+	// SubjectContainerTerminationMessages and ContextContainerTerminationMessages
+	// split ContainerTerminationMessages the same way.
+	SubjectContainerTerminationMessages []string
+	ContextContainerTerminationMessages []string
+	// SubjectPodLogs and ContextPodLogs split PodLogs the same way: only a
+	// resolved subject's logs are direct evidence. Keys match PodLogs, and the
+	// matching Subject/ContextPodLogProvenance carries the container and stream.
+	SubjectPodLogs          map[string]string
+	ContextPodLogs          map[string]string
+	SubjectPodLogProvenance map[string]podLogProvenance
+	ContextPodLogProvenance map[string]podLogProvenance
 	// Ambient is context not known to concern the alert: cluster-wide findings
 	// when no namespace is named, and namespace events outside a resolved subject
 	// graph. It is kept apart so a coincidence is not read as a cause.
@@ -526,6 +565,22 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			container string
 			mode      string // log stream to fetch: "current", "previous", or "" to skip
 		}
+		// Promote the pods owned by a job the group's alerts named into the
+		// direct-target set before scoring, so a job-owned pod is recognised as
+		// a subject while its state, logs and termination are recorded — not
+		// only when the post-scan sort decides which pods survive truncation.
+		for _, j := range jobTargets {
+			if j.Namespace != ns {
+				continue
+			}
+			for _, p := range pods.Items {
+				owner := podOwner{Labels: p.Metadata.Labels, OwnerReferences: p.Metadata.OwnerReferences}
+				if jobOwnedBy(*j, owner) {
+					targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
+					resolvedSubjects[subjectKey{kind: "Pod", name: p.Metadata.Name, namespace: p.Metadata.Namespace}] = true
+				}
+			}
+		}
 		var unhealthy []scoredPod
 		for _, p := range pods.Items {
 			seenPods = append(seenPods, podRef{
@@ -536,19 +591,37 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				OwnerRefs:   p.Metadata.OwnerReferences,
 			})
 			key := p.Metadata.Namespace + "/" + p.Metadata.Name
+			// Record that a resolved subject was actually seen, before the
+			// Succeeded skip: a completed one-shot pod is still a subject we
+			// inspected, and its absence from the Subject* findings is then a
+			// true negative rather than "nothing was looked at".
+			if targetPods[key] {
+				e.SubjectPodObserved = true
+			}
 			if p.Status.Phase == "Succeeded" {
 				// A completed one-shot job: its container's terminated state is
 				// a clean exit, not failure evidence, so neither a diagnostic
 				// line nor a log stream is worth shipping for it.
 				continue
 			}
+			// Only a pod an alert named, or a pod owned by a Job an alert
+			// named, is a resolved subject. Everything else in the namespace is
+			// context, so the renderer never promotes namespace noise to
+			// DIRECT SUBJECT EVIDENCE (issue #136 review).
+			isSubject := targetPods[key]
 			for i := range p.Status.ContainerStatuses {
 				cs := &p.Status.ContainerStatuses[i]
 				if recentlyRestarted(*cs, since) {
-					e.RecentRestarts = append(e.RecentRestarts, fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339)))
+					line := fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339))
+					e.RecentRestarts = append(e.RecentRestarts, line)
+					if isSubject {
+						e.SubjectRestarts = append(e.SubjectRestarts, line)
+					} else {
+						e.ContextRestarts = append(e.ContextRestarts, line)
+					}
 				}
 			}
-			unhealthyPod, cs := podEvidence(targetPods[key], p.Status.ContainerStatuses, since)
+			unhealthyPod, cs := podEvidence(isSubject, p.Status.ContainerStatuses, since)
 			if !unhealthyPod {
 				continue
 			}
@@ -564,23 +637,18 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key, container: cs.Name, mode: mode})
 			if d := containerReadingLine(key, *cs); d != "" {
 				e.ContainerDiagnostics = append(e.ContainerDiagnostics, d)
+				if isSubject {
+					e.SubjectContainerDiagnostics = append(e.SubjectContainerDiagnostics, d)
+				} else {
+					e.ContextContainerDiagnostics = append(e.ContextContainerDiagnostics, d)
+				}
 			}
 			if m := containerMessageLine(key, *cs); m != "" {
 				e.ContainerTerminationMessages = append(e.ContainerTerminationMessages, m)
-			}
-		}
-		// Promote the pods owned by a job the group's alerts named into the
-		// direct-target set, so they survive namespace noise and list
-		// truncation exactly as a pod-labelled alert's own pod does.
-		for _, j := range jobTargets {
-			if j.Namespace != ns {
-				continue
-			}
-			for _, p := range pods.Items {
-				owner := podOwner{Labels: p.Metadata.Labels, OwnerReferences: p.Metadata.OwnerReferences}
-				if jobOwnedBy(*j, owner) {
-					targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
-					resolvedSubjects[subjectKey{kind: "Pod", name: p.Metadata.Name, namespace: p.Metadata.Namespace}] = true
+				if isSubject {
+					e.SubjectContainerTerminationMessages = append(e.SubjectContainerTerminationMessages, m)
+				} else {
+					e.ContextContainerTerminationMessages = append(e.ContextContainerTerminationMessages, m)
 				}
 			}
 		}
@@ -596,6 +664,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		})
 		for _, sp := range unhealthy {
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
+			if targetPods[sp.key] {
+				e.SubjectPods = append(e.SubjectPods, sp.desc)
+			} else {
+				e.ContextPods = append(e.ContextPods, sp.desc)
+			}
 			if sp.mode != "" {
 				parts := strings.SplitN(sp.key, "/", 2)
 				podLogSpecs = append(podLogSpecs, podLogSpec{
@@ -620,9 +693,17 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
+	e.SubjectPods = capList(e.SubjectPods, 8)
+	e.ContextPods = capList(e.ContextPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
+	e.SubjectRestarts = capList(dedupe(e.SubjectRestarts), 6)
+	e.ContextRestarts = capList(dedupe(e.ContextRestarts), 6)
 	e.ContainerDiagnostics = capList(dedupe(e.ContainerDiagnostics), 8)
+	e.SubjectContainerDiagnostics = capList(dedupe(e.SubjectContainerDiagnostics), 8)
+	e.ContextContainerDiagnostics = capList(dedupe(e.ContextContainerDiagnostics), 8)
 	e.ContainerTerminationMessages = capList(dedupe(e.ContainerTerminationMessages), 8)
+	e.SubjectContainerTerminationMessages = capList(dedupe(e.SubjectContainerTerminationMessages), 8)
+	e.ContextContainerTerminationMessages = capList(dedupe(e.ContextContainerTerminationMessages), 8)
 	// The per-pod concurrency lives on the stack, not on *kube: the SIGTERM
 	// shutdown path calls drainBuffer while runFlushLoop's canceled process
 	// may still be unwinding, and both paths run Enrich on the same *kube.
@@ -631,9 +712,30 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// immutable across concurrent callers (issue #146).
 	logConcurrency := normalizePodLogConcurrency(cfg.PodLogConcurrency)
 	e.PodLogs, e.PodLogProvenance = k.fetchPodLogs(ctx, podLogSpecs, logConcurrency)
+	// Split the log map by subject membership so the renderer can present only
+	// a resolved subject's logs as direct evidence and everything else as
+	// context. Keys are "namespace/name", the same form targetPods uses.
+	if len(e.PodLogs) > 0 {
+		e.SubjectPodLogs = map[string]string{}
+		e.ContextPodLogs = map[string]string{}
+		e.SubjectPodLogProvenance = map[string]podLogProvenance{}
+		e.ContextPodLogProvenance = map[string]podLogProvenance{}
+		for key, log := range e.PodLogs {
+			if targetPods[key] {
+				e.SubjectPodLogs[key] = log
+				e.SubjectPodLogProvenance[key] = e.PodLogProvenance[key]
+			} else {
+				e.ContextPodLogs[key] = log
+				e.ContextPodLogProvenance[key] = e.PodLogProvenance[key]
+			}
+		}
+	}
 	if k.logs != nil {
 		var res backendLogResult
 		var err error
+		// The query is subject-scoped exactly when a resolved subject existed;
+		// otherwise fetchBackendLogsResult falls back to the namespace.
+		e.BackendScoped = len(targetPods) > 0
 		res, err = k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
 		if err != nil {
 			e.BackendState = "error"

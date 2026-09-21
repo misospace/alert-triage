@@ -19,7 +19,17 @@ type Report struct {
 	PriorSeen  int
 	Narrative  string
 	Triage     Triage
-	Metrics    []string // compact metric summaries from Prometheus backend
+	// SubjectMetrics are metric summaries whose query was explicitly bounded to
+	// the resolved subject pod (the fixed context metrics, when a pod label was
+	// available). They render in DIRECT SUBJECT EVIDENCE. Alert-rule expression
+	// results are never placed here: the expression is replayed as written and
+	// may aggregate more than the subject (issue #136 review).
+	SubjectMetrics []string
+	// ContextMetrics are metric summaries that may span the namespace or
+	// cluster: alert-rule expression results and fixed context metrics without
+	// a pod label. They render in CONTEXT / BACKGROUND, never as subject
+	// evidence.
+	ContextMetrics []string
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -94,8 +104,26 @@ Rules:
   owned by a backup or controller is a generated maintenance task, not the
   application it may share a name with; if no chain is shown, the object is
   not known to be owned by anything and its name alone is not identity.
-- "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
-  Use them to rule causes out.
+- The EVIDENCE below is tiered, and you weigh it in this order: first the
+  subject's own failure state, logs and events; then its relationships
+  (ownership, storage, topology); then the broader health and timing context
+  around it. The DIRECT SUBJECT EVIDENCE tier was read from the alert's own
+  objects and their direct relationships: the failing pod's state and log, the
+  job's state, the events attached to that subject, its ownership chain, and
+  the metrics around it. The CONTEXT / BACKGROUND tier was read from the
+  surrounding neighborhood: other pods and events in the namespace, node
+  health, and Flux / GitOps activity in the window. Start from the direct tier
+  and reason from it; consult the context tier only to rule a cause out or to
+  fill a gap the direct tier leaves.
+- Never choose a contextual coincidence over a contradicting direct finding.
+  If the failing subject's own state, log or event names a cause - a
+  PermissionDenied, an eviction, a failing mount - nearby namespace events,
+  node health and a healthy Flux reconcile do not outweigh it, and do not
+  explain it.
+- Explicit negatives are scoped to what they read. "All nodes Ready" rules out
+  a node failure; it does not imply the target pod was inspected. "No warning
+  events in the window" says the query found none; it does not say nothing
+  happened. Use a negative only within the scope its section states.
 - Some alerts are self-describing. Restate what it means operationally and stop;
   do not pad.
 - Refer to a subject by the name its label gives it and say nothing about what
@@ -106,11 +134,11 @@ Rules:
   targets".
 - Name a cause only where the evidence or the alert supports one. If several are
   plausible, give the likeliest and say what would distinguish them.
-- Anything under BACKGROUND is unrelated noise until proven otherwise. Never
-  speculate that it might be connected, and never write a sentence of the form
-  "if X also runs there, it may be worth checking". Mention it only when it
-  names the same resource, node or namespace as the alert - and then say plainly
-  that it does. Otherwise leave it out entirely.
+- Anything under CONTEXT and BACKGROUND is unrelated noise until proven
+  otherwise. Never speculate that it might be connected, and never write a
+  sentence of the form "if X also runs there, it may be worth checking".
+  Mention it only when it names the same resource, node or namespace as the
+  alert - and then say plainly that it does. Otherwise leave it out entirely.
 - If a Flux resource was NotReady near the alert, say so - a failed sync is
   primary evidence. If a healthy Flux resource merely "reconciled at revision"
   near the alert, that is only a neutral note that its source was applied at
@@ -354,46 +382,66 @@ func renderEvidence(r Report) string {
 	b.WriteString(untrustedEnd + "\n")
 
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
-	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
-	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
-	// The structured reading (exit code, reason, finish time) is this
-	// service's own, so it stays outside the fence, like pod phases. The
-	// container's own termination message is quoted separately, inside the
-	// fence, like event text — the split the issue #128 review asked for.
-	writeFinding(&b, "Container terminations", r.Enrichment.ContainerDiagnostics, "no terminated containers in scope")
-	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.ContainerTerminationMessages, "no terminated containers left a message")
-	if len(r.Enrichment.PodLogs) > 0 {
-		b.WriteString("\nPod failure logs:\n")
-		b.WriteString(untrustedBegin + "\n")
-		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
-			// Identify the container and stream per-entry: a one-shot
-			// Job pod is logged through the *current* stream, a
-			// CrashLoop through the *previous* one, and a multi-container
-			// pod through the container that failed. The section
-			// heading "previous container tail" used to lie about both
-			// cases (issue #128 review).
-			if p := r.Enrichment.PodLogProvenance[podKey]; p.Container != "" {
-				fmt.Fprintf(&b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
-			}
-			b.WriteString(untrusted(log) + "\n")
+	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
+	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
+	b.WriteString("above); the context tier rules causes out and fills gaps - it does not\n")
+	b.WriteString("override what the subject's own state and logs say.\n")
+	b.WriteString("\nDIRECT SUBJECT EVIDENCE (read from the alert's own objects: the failed\n")
+	b.WriteString("job and its pod, their logs and events, and the objects they own)\n")
+	if len(r.Enrichment.InspectedJobs) > 0 {
+		writeFinding(&b, "Inspected jobs", r.Enrichment.InspectedJobs, "")
+	}
+	// Only pods that are a resolved alert subject are direct evidence. The
+	// namespace-wide remainder of the same scan renders under CONTEXT, so an
+	// unrelated crashing pod in the same namespace cannot be promoted into the
+	// subject's tier. When no subject pod was observed at all, a scoped health
+	// negative would falsely imply we inspected it, so say that plainly
+	// instead (issue #136 review).
+	subjectObserved := r.Enrichment.SubjectPodObserved ||
+		len(r.Enrichment.SubjectPods) > 0 ||
+		len(r.Enrichment.SubjectContainerDiagnostics) > 0 ||
+		len(r.Enrichment.SubjectContainerTerminationMessages) > 0 ||
+		len(r.Enrichment.SubjectPodLogs) > 0
+	if subjectObserved {
+		writeFinding(&b, "Unhealthy pods", r.Enrichment.SubjectPods, "no unhealthy pods on the alert's subjects")
+		if len(r.Enrichment.SubjectRestarts) > 0 {
+			writeFinding(&b, "Recent restarts", r.Enrichment.SubjectRestarts, "")
 		}
-		b.WriteString(untrustedEnd + "\n")
+		// The structured reading (exit code, reason, finish time) is this
+		// service's own, so it stays outside the fence, like pod phases. The
+		// container's own termination message is quoted separately, inside the
+		// fence, like event text — the split the issue #128 review asked for.
+		writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
+		writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
+		writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
+	} else {
+		// No subject pod resolved or seen: report the absence of an
+		// inspection, not a clean bill of health.
+		b.WriteString("\nNo subject pod was observed for this alert, so there is no subject pod state, container reading or log to report; any namespace pod scan is shown under CONTEXT.\n")
 	}
 	// Log-backend lines are workload-authored as well. Keep the state finding
 	// outside the fence, but fence the lines and never treat them as API fact.
 	switch r.Enrichment.BackendState {
 	case "off":
-		b.WriteString("\nBackend log source: not configured (no LOGS_URL).\n")
+		b.WriteString("\nSubject log source: not configured (no LOGS_URL).\n")
 	case "empty":
-		b.WriteString("\nBackend log source: configured, but returned no lines for this window.\n")
+		// "empty" is ambiguous on its own: the query may have been bounded to
+		// the subject, or fallen back to the namespace when no subject was
+		// resolved. Claiming a subject inspection in the latter case is a
+		// false negative scoped to an object we never queried.
+		if r.Enrichment.BackendScoped {
+			b.WriteString("\nSubject log source: configured, but returned no lines for this subject in the window.\n")
+		} else {
+			b.WriteString("\nLog source: configured, but returned no lines for the namespace in the window.\n")
+		}
 	case "ambient":
-		b.WriteString("\nBackend log source: configured; no concrete subject was resolved, so the\n")
-		b.WriteString("namespace-wide lines shown under BACKGROUND are the only backend logs in the window.\n")
+		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
+		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
+		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
 	case "error":
-		b.WriteString("\nBackend log source: query failed; no lines were available.\n")
+		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
 	case "ok":
-		b.WriteString("\nBACKEND LOGS (queried for this alert window; untrusted workload text):\n")
+		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
 		b.WriteString(untrustedBegin + "\n")
 		for _, line := range r.Enrichment.BackendLogs {
 			b.WriteString(untrusted(line) + "\n")
@@ -402,12 +450,14 @@ func renderEvidence(r Report) string {
 	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
-	negative := "no warning events in the window"
+	// Only a resolved subject graph makes these subject-scoped; without one the
+	// events were routed to Ambient and a subject-scoped negative would claim an
+	// inspection that never happened.
 	if r.Enrichment.EventsScoped {
-		negative = "no warning events on the resolved subject in the window"
+		writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, "no warning events on the resolved subject in the window")
+	} else {
+		b.WriteString("\nNo resolved alert subject, so no subject-scoped events were queried; namespace events are shown in the context tier.\n")
 	}
-	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, negative)
-	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	// The chain's names and identity tags come from the objects' own
 	// metadata (ownerReferences and labels are workload-authored), so they
 	// render inside the fence: a forged controller name must read as a
@@ -417,15 +467,37 @@ func renderEvidence(r Report) string {
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
-	if len(r.Metrics) > 0 {
-		b.WriteString("\nMETRICS (queried from metrics backend)\n")
+	if len(r.SubjectMetrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the resolved subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
-		for _, line := range r.Metrics {
+		for _, line := range r.SubjectMetrics {
 			fmt.Fprintf(&b, "- %s\n", untrusted(line))
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
 
+	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
+	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
+	writeFinding(&b, "Other unhealthy pods in the namespace (context, not the alert's subject)", r.Enrichment.ContextPods, "no other unhealthy pods in the namespace")
+	if len(r.Enrichment.ContextRestarts) > 0 {
+		writeFinding(&b, "Other recent restarts in the namespace", r.Enrichment.ContextRestarts, "")
+	}
+	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics, "no other terminated containers in the namespace")
+	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages, "no other terminated containers left a message")
+	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
+	// Metric scope is per source: alert-rule expression results and fixed
+	// metrics without a pod label may span the namespace or cluster, so they
+	// render as context and are never described as evidence about the subject.
+	if len(r.ContextMetrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the namespace or alert rule, not necessarily the subject; untrusted label values):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.ContextMetrics {
+			fmt.Fprintf(&b, "- %s\n", untrusted(line))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
+	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
 		b.WriteString("This is NOT known to involve the alert above. A homelab always has\n")
@@ -526,6 +598,27 @@ func writeCommitMessage(b *strings.Builder, message string) {
 	b.WriteString("  message:\n")
 	b.WriteString(untrustedBegin + "\n")
 	fmt.Fprintf(b, "  %s\n", untrusted(message))
+	b.WriteString(untrustedEnd + "\n")
+}
+
+// writePodLogBlock renders a pod-log map inside the untrusted fence. The
+// provenance lookup names the container and stream per entry, so a one-shot
+// Job's current log is not silently mislabelled as a previous-container tail
+// (issue #128 review); state and headings outside the fence stay this
+// service's own reading.
+func writePodLogBlock(b *strings.Builder, title string, logs map[string]string, prov map[string]podLogProvenance) {
+	if len(logs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\n%s:\n", title)
+	b.WriteString(untrustedBegin + "\n")
+	for podKey, log := range logs {
+		fmt.Fprintf(b, "## %s\n", untrusted(podKey))
+		if p := prov[podKey]; p.Container != "" {
+			fmt.Fprintf(b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
+		}
+		b.WriteString(untrusted(log) + "\n")
+	}
 	b.WriteString(untrustedEnd + "\n")
 }
 

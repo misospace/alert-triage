@@ -53,8 +53,10 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})
 
-	// Absence must read as a ruled-out cause, never as missing data.
-	for _, want := range []string{"all nodes Ready", "no warning events", "no Flux reconciles or failures in the window"} {
+	// Absence must read as a ruled-out cause, never as missing data. With no
+	// resolved subject the event absence is stated as "not queried" rather than
+	// an "on the subject" negative that would imply an inspection.
+	for _, want := range []string{"all nodes Ready", "no subject-scoped events were queried", "no Flux reconciles or failures in the window"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, out)
 		}
@@ -135,10 +137,16 @@ func TestAmbientBackendStateDoesNotClaimNoLines(t *testing.T) {
 		t.Errorf("discord: must not claim the backend returned no lines when namespace-wide lines were returned:\n%s", discord)
 	}
 
-	// And the true empty case still renders the negative.
-	en2 := Enrichment{BackendState: "empty"}
-	if !strings.Contains(renderEvidence(Report{Group: g, Enrichment: en2}), "returned no lines for this window") {
-		t.Error("genuinely empty state must still render the explicit negative")
+	// And a subject-scoped query that found nothing is a true subject negative.
+	en2 := Enrichment{BackendState: "empty", BackendScoped: true}
+	if !strings.Contains(renderEvidence(Report{Group: g, Enrichment: en2}), "returned no lines for this subject in the window") {
+		t.Error("subject-scoped empty state must still render the explicit subject negative")
+	}
+	// A namespace-only fallback that found nothing must not claim the subject
+	// was queried.
+	en3 := Enrichment{BackendState: "empty"}
+	if got := renderEvidence(Report{Group: g, Enrichment: en3}); strings.Contains(got, "for this subject") {
+		t.Errorf("namespace-fallback empty state must not claim a subject inspection:\n%s", got)
 	}
 }
 

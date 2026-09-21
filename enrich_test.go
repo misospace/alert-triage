@@ -1404,6 +1404,127 @@ func TestEnrichJobFailedUnrelatedPod(t *testing.T) {
 	}
 }
 
+// TestEnrichSubjectPodProvenanceExcludesUnrelatedNoise is the issue #136
+// review regression. A resolved subject pod (here the Job-owned backup-0) and
+// an unrelated failing pod can both be in the namespace scan. Only the
+// subject's state, diagnostics and termination message may be classified as
+// direct evidence; the unrelated pod must stay in the context tier, or the
+// renderer promotes namespace noise into a tier the prompt says was read from
+// the alert's own object.
+func TestEnrichSubjectPodProvenanceExcludesUnrelatedNoise(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"terminated":{"exitCode":1,"reason":"Error","message":"owned failure"}}}]}},
+			{"metadata":{"name":"noisy","namespace":"ns1",
+				"ownerReferences":[{"kind":"DaemonSet","name":"ds-0","uid":"ds-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"terminated":{"exitCode":1,"reason":"Error","message":"noise failure"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if !podInList(t, en.SubjectPods, "ns1/backup-0") {
+		t.Errorf("job-owned pod missing from SubjectPods: %v", en.SubjectPods)
+	}
+	if podInList(t, en.SubjectPods, "ns1/noisy") {
+		t.Errorf("unrelated pod promoted to SubjectPods: %v", en.SubjectPods)
+	}
+	if !podInList(t, en.ContextPods, "ns1/noisy") {
+		t.Errorf("unrelated pod missing from ContextPods: %v", en.ContextPods)
+	}
+	if podInList(t, en.ContextPods, "ns1/backup-0") {
+		t.Errorf("subject pod leaked into ContextPods: %v", en.ContextPods)
+	}
+	if !podInList(t, en.SubjectContainerDiagnostics, "ns1/backup-0") || podInList(t, en.SubjectContainerDiagnostics, "ns1/noisy") {
+		t.Errorf("SubjectContainerDiagnostics = %v, want only ns1/backup-0", en.SubjectContainerDiagnostics)
+	}
+	if !podInList(t, en.ContextContainerDiagnostics, "ns1/noisy") || podInList(t, en.ContextContainerDiagnostics, "ns1/backup-0") {
+		t.Errorf("ContextContainerDiagnostics = %v, want only ns1/noisy", en.ContextContainerDiagnostics)
+	}
+	if !podInList(t, en.SubjectContainerTerminationMessages, "owned failure") || podInList(t, en.SubjectContainerTerminationMessages, "noise failure") {
+		t.Errorf("SubjectContainerTerminationMessages = %v, want only the subject message", en.SubjectContainerTerminationMessages)
+	}
+	if !podInList(t, en.ContextContainerTerminationMessages, "noise failure") || podInList(t, en.ContextContainerTerminationMessages, "owned failure") {
+		t.Errorf("ContextContainerTerminationMessages = %v, want only the unrelated message", en.ContextContainerTerminationMessages)
+	}
+
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing or misordered tier headings:\n%s", got)
+	}
+	if i := strings.Index(got, "owned failure"); i < directIdx || i > contextIdx {
+		t.Errorf("subject termination message at %d must sit in DIRECT [%d, %d]:\n%s", i, directIdx, contextIdx, got)
+	}
+	ni := strings.Index(got, "noise failure")
+	if ni < 0 {
+		t.Fatalf("unrelated message not rendered at all:\n%s", got)
+	}
+	if ni < contextIdx {
+		t.Errorf("unrelated termination message at %d must not appear in DIRECT (context starts at %d):\n%s", ni, contextIdx, got)
+	}
+	if i := strings.Index(got, "ns1/noisy"); i >= 0 && i < contextIdx {
+		t.Errorf("unrelated pod at %d appeared before the context tier (%d):\n%s", i, contextIdx, got)
+	}
+}
+
+// TestEnrichAbsentSubjectPodNotObserved covers the other half of the review:
+// an alert names a pod that is absent from the namespace listing. Nothing was
+// inspected, so SubjectPodObserved must stay false and the renderer must say
+// so rather than report the missing pod as healthy.
+func TestEnrichAbsentSubjectPodNotObserved(t *testing.T) {
+	pods := `{"items":[
+		{"metadata":{"name":"other","namespace":"ns1"},
+			"status":{"phase":"Failed",
+				"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+					"state":{"error":{"reason":"Error"}}}]}}
+	]}`
+	srv := jobAPIHarness(t, pods, nil)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "ghost",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.SubjectPodObserved {
+		t.Errorf("absent subject pod must not be recorded as observed")
+	}
+	if len(en.SubjectPods) != 0 {
+		t.Errorf("absent subject must yield no subject pods, got %v", en.SubjectPods)
+	}
+	if !podInList(t, en.ContextPods, "ns1/other") {
+		t.Errorf("unrelated namespace pod should be context, got %v", en.ContextPods)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "No subject pod was observed for this alert") {
+		t.Errorf("renderer should report the missing subject, not a health negative:\n%s", got)
+	}
+}
+
 // TestEnrichJobFailedMissingJob covers a job that is gone (404): enrichment
 // must degrade gracefully — no job in InspectedJobs, no job in the scope
 // string — and must still ship the namespace listing it gathered.
@@ -2005,6 +2126,9 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	if en.BackendState != "ambient" {
 		t.Fatalf("expected state \"ambient\" (no subject resolved, namespace-wide lines returned), got %q", en.BackendState)
 	}
+	if en.BackendScoped {
+		t.Errorf("no subject was resolved, so the backend query was not subject-scoped")
+	}
 	foundAmbient := false
 	for _, a := range en.Ambient {
 		if !strings.Contains(a, "(ambient, namespace-wide)") {
@@ -2017,6 +2141,44 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	}
 	if !foundAmbient {
 		t.Fatalf("expected one ambient-marked backend-log line, got %v", en.Ambient)
+	}
+}
+
+// TestEnrichBackendLogsNoSubjectEmptyNotScoped is the issue #136 review
+// regression for the ambiguous "empty" state: with no resolved subject the
+// namespace-only fallback ran and returned nothing. The query was not
+// subject-scoped, so the rendered evidence must not claim it looked for the
+// subject's lines.
+func TestEnrichBackendLogsNoSubjectEmptyNotScoped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "empty" {
+		t.Fatalf("expected state \"empty\", got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Fatalf("no subject was resolved, so the query must not be marked subject-scoped")
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(got, "for this subject") {
+		t.Errorf("namespace-fallback empty state must not claim a subject inspection:\n%s", got)
+	}
+	if !strings.Contains(got, "returned no lines for the namespace in the window") {
+		t.Errorf("expected the namespace-scoped empty wording:\n%s", got)
 	}
 }
 
@@ -2057,6 +2219,9 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 	}
 	if en.BackendState != "ok" {
 		t.Fatalf("expected state \"ok\", got %q", en.BackendState)
+	}
+	if !en.BackendScoped {
+		t.Errorf("a resolved target pod must mark the backend query subject-scoped")
 	}
 	for _, a := range en.Ambient {
 		if strings.Contains(a, "(ambient, namespace-wide)") {
@@ -2136,6 +2301,13 @@ func TestRender_oneShotContainerEvidenceLabelsCurrentStream(t *testing.T) {
 			"ns1/backup-1": {Container: "backup", Stream: "current"},
 		},
 		ContainerDiagnostics: []string{"ns1/backup-1: container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z — checksum mismatch"},
+		// The alert names ns1/backup-1, so the same evidence is subject-scoped
+		// and renders in the direct tier; the fields above serve Discord.
+		SubjectPodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/backup-1": {Container: "backup", Stream: "current"},
+		},
+		SubjectContainerDiagnostics: []string{"ns1/backup-1: container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z — checksum mismatch"},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 
@@ -2182,6 +2354,13 @@ func TestRender_restartedContainerEvidenceLabelsPreviousStream(t *testing.T) {
 			"ns1/flaky-1": {Container: "app", Stream: "previous"},
 		},
 		ContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
+		// Subject-scoped mirror for renderEvidence; the fields above serve
+		// Discord.
+		SubjectPodLogs: map[string]string{"ns1/flaky-1": "panic: nil"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/flaky-1": {Container: "app", Stream: "previous"},
+		},
+		SubjectContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 	if !strings.Contains(body, "container app, previous stream") {
@@ -2217,6 +2396,10 @@ func TestRender_emptyContainerProvenanceIsNotVisible(t *testing.T) {
 			// Container is empty: the renderers must not surface it.
 			"ns1/backup-1": {Container: "", Stream: "current"},
 		},
+		SubjectPodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/backup-1": {Container: "", Stream: "current"},
+		},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 	// The pod key and the log must still reach the model...
@@ -2227,8 +2410,10 @@ func TestRender_emptyContainerProvenanceIsNotVisible(t *testing.T) {
 		t.Fatalf("rendered evidence missing the log body:\n%s", body)
 	}
 	// ...and the container/stream provenance header must not, because the
-	// provenance names no container.
-	if strings.Contains(body, "container ") {
+	// provenance names no container. Match the malformed header form
+	// ("container <name>, <stream> stream:") rather than the word alone, since
+	// the tier headings legitimately say "container terminations".
+	if strings.Contains(body, "container ,") || strings.Contains(body, "container  ") {
 		t.Errorf("rendered evidence leaked a container provenance header for an empty-container spec:\n%s", body)
 	}
 	if strings.Contains(body, "stream:") {
