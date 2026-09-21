@@ -6,13 +6,17 @@ package main
 // is only shown when every guardrail below passes silently.
 //
 // The guardrails, in order, are:
-//  1. The triage must be high-confidence and point at git (or partial where the
+//  1. The group's alerts must name a memory-pressure fault (an OOMKilled /
+//     ContainerOOMKilled alert, or a terminated-reason label of OOMKilled).
+//     A memory bump is defensible only because a container was killed for
+//     memory; on any other alert the same triage is guesswork dressed as a fix.
+//  2. The triage must be high-confidence and point at git (or partial where the
 //     fix site is a file).
-//  2. A relative file path must be attached. Without it there is nothing to
+//  3. A relative file path must be attached. Without it there is nothing to
 //     anchor the change.
-//  3. The file must parse as a YAML document and round-trip with only the
+//  4. The file must parse as a YAML document and round-trip with only the
 //     intended scalar changed.
-//  4. The value must parse as a Kubernetes quantity and the new value must
+//  5. The value must parse as a Kubernetes quantity and the new value must
 //     stay within a bounded multiplier of the old one.
 //
 // An empty return means no proposal is warranted; the report layer renders the
@@ -32,7 +36,14 @@ import (
 const maxMultiplier = 8.0
 
 // Propose returns a unified diff or "" when no proposal should be shown.
-func Propose(t Triage, relativePath, original string) string {
+// alerts are the group's alerts: the alert-type gate (guardrail 1) runs
+// before any file content is touched, so a non-memory-pressure alert is
+// refused without a YAML walk.
+func Propose(alerts []Alert, t Triage, relativePath, original string) string {
+	if !memoryPressureAlerts(alerts) {
+		log.Printf("propose: dropped, no memory-pressure alert in group")
+		return ""
+	}
 	if !proposalEligible(t) {
 		log.Printf("propose: dropped, confidence=%q fix_location=%q", t.Confidence, t.FixLocation)
 		return ""
@@ -58,6 +69,34 @@ func proposalEligible(t Triage) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(t.Confidence), "high")
+}
+
+// memoryPressureAlerts reports whether the group carries a memory-pressure
+// alert, i.e. the one kind of fault for which raising a memory limit is a
+// defensible fix: an alert named OOMKilled or ContainerOOMKilled, or a
+// kube-state-metrics style rule carrying a
+// kube_pod_container_status[_last]_terminated_reason label of OOMKilled.
+// A group that fired for anything else — node health, image pulls, probes,
+// networking — is refused before any YAML walk.
+func memoryPressureAlerts(alerts []Alert) bool {
+	terminatedReason := func(v string) bool {
+		return strings.EqualFold(strings.TrimSpace(v), "OOMKilled")
+	}
+	for _, a := range alerts {
+		name := a.name()
+		if name == "OOMKilled" || name == "ContainerOOMKilled" {
+			return true
+		}
+		for _, k := range []string{
+			"kube_pod_container_status_terminated_reason",
+			"kube_pod_container_status_last_terminated_reason",
+		} {
+			if terminatedReason(a.Labels[k]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // memoryTarget pins the parent block that owns the memory scalar.

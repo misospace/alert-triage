@@ -294,8 +294,8 @@ func TestEnrichMetricsWithRulesSharesRulesAcrossGroups(t *testing.T) {
 	// Enrich two groups sharing the same rules map.
 	g1 := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}}}
 	g2 := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "HighCPU"}}}}
-	lines1 := p.EnrichMetricsWithRules(context.Background(), g1, 1*time.Hour, rules, nil)
-	lines2 := p.EnrichMetricsWithRules(context.Background(), g2, 1*time.Hour, rules, nil)
+	ev1 := p.EnrichMetricsWithRules(context.Background(), g1, 1*time.Hour, rules, nil)
+	ev2 := p.EnrichMetricsWithRules(context.Background(), g2, 1*time.Hour, rules, nil)
 
 	// The rules endpoint must not have been hit again.
 	if rulesCalls != 1 {
@@ -305,8 +305,8 @@ func TestEnrichMetricsWithRulesSharesRulesAcrossGroups(t *testing.T) {
 	if queryCalls != 2 {
 		t.Errorf("expected 2 query_range calls (one per group), got %d", queryCalls)
 	}
-	if len(lines1) == 0 || len(lines2) == 0 {
-		t.Errorf("expected metric lines for both groups, got %v / %v", lines1, lines2)
+	if len(ev1.Context) == 0 || len(ev2.Context) == 0 {
+		t.Errorf("expected rule metric lines for both groups, got %v / %v", ev1, ev2)
 	}
 }
 
@@ -323,13 +323,69 @@ func TestEnrichMetricsWithRulesBackendError(t *testing.T) {
 	}
 
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "TestAlert"}}}}
-	lines := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, err)
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, err)
 
-	if len(lines) != 1 {
-		t.Fatalf("expected 1 error line, got %d: %v", len(lines), lines)
+	if len(ev.Context) != 1 {
+		t.Fatalf("expected 1 error line, got %d: %v", len(ev.Context), ev.Context)
 	}
-	if !strings.Contains(lines[0], "metrics backend error") {
-		t.Errorf("expected 'metrics backend error' line, got %q", lines[0])
+	if !strings.Contains(ev.Context[0], "metrics backend error") {
+		t.Errorf("expected 'metrics backend error' line, got %q", ev.Context[0])
+	}
+}
+
+// TestMetricsRuleResultStaysContextDespitePodLabel pins the issue #136 review
+// finding: a common pod label bounds only the fixed context metrics, not the
+// alert-rule expression. That expression is replayed as written and may
+// aggregate a namespace, workload or cluster, so its result must stay Context
+// even when the group carries a pod label and the fixed metrics are Subject.
+func TestMetricsRuleResultStaysContextDespitePodLabel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/query_range" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			return
+		}
+		json.NewEncoder(w).Encode(queryRangeResponse{
+			Status: "success",
+			Data: queryRangeData{
+				ResultType: "matrix",
+				Result: []queryResult{{
+					Metric: map[string]string{"namespace": "default"},
+					Values: [][]interface{}{{float64(1000), "1"}},
+				}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	rules := map[string]string{"HighMemory": "container_memory_working_set_bytes > 1000"}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{
+		"alertname": "HighMemory", "namespace": "default", "pod": "web-1",
+	}}}}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	for _, line := range ev.Subject {
+		if strings.Contains(line, "HighMemory") {
+			t.Errorf("alert-rule result classified as subject-scoped: %q", line)
+		}
+	}
+	ruleInContext := false
+	for _, line := range ev.Context {
+		if strings.Contains(line, "HighMemory") {
+			ruleInContext = true
+		}
+	}
+	if !ruleInContext {
+		t.Errorf("alert-rule result missing from context: %v", ev.Context)
+	}
+	podBoundedInSubject := false
+	for _, line := range ev.Subject {
+		if strings.Contains(line, "container_restarts") {
+			podBoundedInSubject = true
+		}
+	}
+	if !podBoundedInSubject {
+		t.Errorf("pod-bounded fixed metrics missing from subject: %v", ev.Subject)
 	}
 }
 
@@ -391,10 +447,52 @@ func TestEscapeLabelValue(t *testing.T) {
 		{"simple", "simple"},
 		{`has"quote`, `has\"quote`},
 		{`multi"ple"quotes`, `multi\"ple\"quotes`},
+		{`foo\bar`, `foo\\bar`},
+		{`foo\\bar`, `foo\\\\bar`},
 	}
 	for _, tt := range tests {
 		if got := escapeLabelValue(tt.in); got != tt.want {
 			t.Errorf("escapeLabelValue(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestContextMetricQueriesEscapesLabelValues guards the issue #161 regression:
+// a namespace (or pod) containing a backslash must not produce a PromQL string
+// literal the backend cannot parse. The expression is asserted verbatim;
+// the label values carry both a backslash and a double quote so any missing
+// escaping pass shows up in the filter.
+func TestContextMetricQueriesEscapesLabelValues(t *testing.T) {
+	queries := contextMetricQueries(`ns\with\backslash`, `pod\with\back`)
+	if len(queries) != 3 {
+		t.Fatalf("expected 3 context metric queries, got %d", len(queries))
+	}
+	wantFilter := `namespace="ns\\with\\backslash",pod="pod\\with\\back"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantFilter) {
+			t.Errorf("%s: expr = %q, want filter %q", q.name, q.expr, wantFilter)
+		}
+	}
+
+	// A value with both a backslash and a quote must be fully escaped in the
+	// right order: `a\`b` -> `a\\\"b` -> `a\\\\\"b`.
+	queries = contextMetricQueries(`a\"b`, "")
+	if len(queries) != 3 {
+		t.Fatalf("expected 3 context metric queries, got %d", len(queries))
+	}
+	wantQuoted := `namespace="a\\\"b"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantQuoted) {
+			t.Errorf("%s: expr = %q, want %q", q.name, q.expr, wantQuoted)
+		}
+	}
+
+	// A plain value must pass through untouched.
+	queries = contextMetricQueries("plain", "pod-plain")
+	wantPlain := `namespace="plain",pod="pod-plain"`
+	for _, q := range queries {
+		if !strings.Contains(q.expr, wantPlain) {
+			t.Errorf("%s: expr = %q, want %q", q.name, q.expr, wantPlain)
 		}
 	}
 }
@@ -469,7 +567,7 @@ func TestRenderEvidenceWithMetrics(t *testing.T) {
 			Alerts:     []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}},
 			Namespaces: []string{"default"},
 		},
-		Metrics: []string{
+		ContextMetrics: []string{
 			"HighMemory min=0.85 max=0.97 last=0.96 rising {namespace=default,pod=web-1}",
 		},
 	}

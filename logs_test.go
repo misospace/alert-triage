@@ -293,8 +293,9 @@ func TestQueryLokiStatusError(t *testing.T) {
 }
 
 // TestFetchBackendLogsDedup verifies the per-(namespace,pod) query dedup:
-// N alerts sharing the same pod in the same namespace must result in only
-// two backend hits (one namespace-only + one pod-specific), not N+1.
+// N alerts sharing the same pod in the same namespace must result in exactly
+// one pod-scoped query, not N. (The unconditional namespace-only query is
+// dropped when subjects are resolved.)
 func TestFetchBackendLogsDedup(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,16 +315,176 @@ func TestFetchBackendLogsDedup(t *testing.T) {
 	g := Group{
 		Namespaces: []string{"ns-a"},
 		Alerts: []Alert{
-			{Labels: map[string]string{"pod": "p1", "alertname": "x"}},
-			{Labels: map[string]string{"pod": "p1", "alertname": "y"}},
-			{Labels: map[string]string{"pod": "p1", "alertname": "z"}},
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "x"}},
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "y"}},
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "z"}},
 		},
 	}
-	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute); err != nil {
+	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts)); err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("expected exactly 1 pod-scoped query after dedup, got %d", got)
+	}
+}
+
+// TestFetchBackendLogsTargetPodsIsPrimary verifies that when a concrete
+// subject is known (via the enrichment's resolved target-pod set), the
+// namespace-only query is not issued at all and no namespace-wide lines leak
+// into the primary evidence.
+func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		queries = append(queries, q)
+		w.Header().Set("Content-Type", "application/json")
+		if q == `namespace:"ns-a" AND pod:"p1"` {
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns-a"},"values":[["1","target pod failure line"]]}]}}`)
+			return
+		}
+		// Namespace-wide query: unrelated controller chatter must never appear.
+		_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"flux-controller","namespace":"ns-a"},"values":[["1","unrelated flux chatter"]]}]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	// The alert carries no pod label; the resolved target set does.
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts:     []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed"}}},
+	}
+	targetPods := map[string]bool{"ns-a/p1": true}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPods)
+	if err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if len(res.Primary) == 0 || !strings.Contains(res.Primary[0], "target pod failure line") {
+		t.Fatalf("expected the target pod's line as primary evidence, got %#v", res.Primary)
+	}
+	for _, line := range res.Primary {
+		if strings.Contains(line, "unrelated flux chatter") {
+			t.Fatalf("namespace-wide line entered primary evidence: %#v", res.Primary)
+		}
+	}
+	if len(res.Ambient) != 0 {
+		t.Fatalf("no ambient context expected when a subject is resolved, got %#v", res.Ambient)
+	}
+	if len(queries) != 1 {
+		t.Fatalf("expected exactly one (pod-scoped) query, got %d: %v", len(queries), queries)
+	}
+	if !strings.Contains(queries[0], "pod:") {
+		t.Fatalf("the only query must be pod-scoped, got %q", queries[0])
+	}
+}
+
+// TestFetchBackendLogsTargetDedup verifies multiple alerts resolving to
+// different target pods issue one query per distinct (namespace,pod), and
+// never a namespace-only query.
+func TestFetchBackendLogsTargetDedup(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Query().Get("query"), "pod:") {
+			t.Errorf("unexpected non-pod-scoped query %q", r.URL.RawQuery)
+		}
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "x"}},
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "y"}},
+			{Labels: map[string]string{"pod": "p2", "namespace": "ns-a", "alertname": "z"}},
+		},
+	}
+	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts)); err != nil {
 		t.Fatalf("fetchBackendLogsResult: %v", err)
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Fatalf("expected exactly 2 queries (namespace + pod) after dedup, got %d", got)
+		t.Fatalf("expected exactly 2 pod-scoped queries (one per distinct pod), got %d", got)
+	}
+}
+
+// TestFetchBackendLogsNoSubjectIsAmbient verifies the fallback: with no
+// concrete subject the namespace-wide lookup still runs, but its result is
+// explicitly marked ambient and never placed in the primary evidence.
+func TestFetchBackendLogsNoSubjectIsAmbient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		if strings.Contains(q, "pod:") {
+			t.Errorf("no pod-scoped query expected, got %q", q)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"other","namespace":"ns-a"},"values":[["1","namespace chatter"]]}]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts:     []Alert{{Labels: map[string]string{"alertname": "SomeAlert"}}},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
+	if err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if len(res.Primary) != 0 {
+		t.Fatalf("expected no primary evidence without a subject, got %#v", res.Primary)
+	}
+	if len(res.Ambient) != 1 || !strings.Contains(res.Ambient[0], "(ambient, namespace-wide)") {
+		t.Fatalf("expected exactly one explicitly-ambient line, got %#v", res.Ambient)
+	}
+}
+
+// TestTargetPodsByNamespace verifies the namespace/pod key split. The first
+// "/" separates namespace from pod, so extra slashes belong to the pod name;
+// keys missing either half are dropped rather than turned into bogus queries.
+func TestTargetPodsByNamespace(t *testing.T) {
+	got := targetPodsByNamespace(map[string]bool{
+		"ns-a/p1": true,
+		"ns-a/p2": true,
+		"ns-b/p1": true,
+		"/p":      true, // no namespace
+		"ns/":     true, // no pod
+		"noSlash": true, // not a key
+		"ns/p/od": true, // extra slash is part of the pod name
+	})
+	if len(got) != 3 {
+		t.Fatalf("expected 3 namespaces, got %#v", got)
+	}
+	if len(got["ns-a"]) != 2 || got["ns-a"][0] != "p1" || got["ns-a"][1] != "p2" {
+		t.Fatalf("ns-a = %#v, want [p1 p2] sorted", got["ns-a"])
+	}
+	if len(got["ns-b"]) != 1 || got["ns-b"][0] != "p1" {
+		t.Fatalf("ns-b = %#v", got["ns-b"])
+	}
+	if len(got["ns"]) != 1 || got["ns"][0] != "p/od" {
+		t.Fatalf("extra slashes belong to the pod name, got %#v", got["ns"])
+	}
+	if _, ok := got[""]; ok {
+		t.Fatalf("blank namespace key must be dropped, got %#v", got)
 	}
 }
 
@@ -346,12 +507,15 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 		hc:     srv.Client(),
 	}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "x"}}}}
-	lines, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute)
+	lines, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if err != nil {
 		t.Fatalf("fetchBackendLogsResult: %v", err)
 	}
-	if lines != nil {
-		t.Fatalf("expected nil lines for empty namespace, got %v", lines)
+	if lines.Primary != nil {
+		t.Fatalf("expected nil primary for empty namespace, got %v", lines.Primary)
+	}
+	if lines.Ambient != nil {
+		t.Fatalf("expected no ambient for empty namespace, got %v", lines.Ambient)
 	}
 	if got := atomic.LoadInt32(&hits); got != 0 {
 		t.Fatalf("expected zero backend hits for empty-namespace short-circuit, got %d", got)
@@ -361,12 +525,12 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 // TestFetchBackendLogsNilReceiver ensures the nil-receiver guard works.
 func TestFetchBackendLogsNilReceiver(t *testing.T) {
 	var b *logsBackend
-	lines, err := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute)
+	res, err := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute, nil)
 	if err != nil {
 		t.Fatalf("nil receiver should be a no-op, got err=%v", err)
 	}
-	if lines != nil {
-		t.Fatalf("nil receiver should return nil lines, got %v", lines)
+	if res.Primary != nil || res.Ambient != nil {
+		t.Fatalf("nil receiver should return empty results, got %#v", res)
 	}
 }
 

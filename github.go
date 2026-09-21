@@ -455,6 +455,555 @@ func (g *gitHubClient) setHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "alert-triage")
 }
 
+// Commit relevance for a Flux reconcile. A healthy Flux reconcile is neutral
+// (see fluxActivity), but when the source is GitHub we can fetch the commit
+// that the revision references and check whether its changed files intersect
+// the workload's GitOps path or declared component paths. The evidence is
+// deliberately best-effort: a non-GitHub source, a private-repo 404, an
+// unparseable revision, or any API failure degrades to Unknown so the digest
+// keeps shipping instead of being blocked on an external lookup.
+//
+// The State values are the three the issue asks for:
+//   - "touches"          - the commit changed at least one file under the
+//     workload path or one of the declared component
+//     paths.
+//   - "does_not_touch"   - the commit was fetched successfully and no changed
+//     file intersects the workload/component paths.
+//   - "unknown"          - any other reason: unsupported host, unparseable
+//     revision, API failure, private-repo auth failure,
+//     or empty workload path.
+const (
+	commitRelevanceTouches      = "touches"
+	commitRelevanceDoesNotTouch = "does_not_touch"
+	commitRelevanceUnknown      = "unknown"
+)
+
+// CommitRelevance is the result of classifying a reconciled GitHub commit
+// against the workload's Git surface. Fields are populated as far as the
+// lookup could get; Reason is always human-readable and is the single thing
+// the rendering layer shows when State is "unknown" so the operator can see
+// why the check degraded. CommitMessage is the raw commit message body and
+// is treated as untrusted external text by the renderer; the page also
+// never carries the full message — only a short, flattened summary line.
+type CommitRelevance struct {
+	State          string   // touches | does_not_touch | unknown
+	RepoURL        string   // e.g. https://github.com/owner/repo
+	Revision       string   // the full Flux revision string the lookup tried
+	SHA            string   // the bare SHA the API was queried with
+	WorkloadPath   string   // repository-relative workload path that was checked
+	ComponentPaths []string // repository-relative component paths (issue #134)
+	MatchingPaths  []string // subset of changed files that matched
+	CommitMessage  string   // short, flattened message; treated as untrusted
+	Reason         string   // short explanation; shown only when State == "unknown"
+}
+
+// parseGitHubRepoURL extracts the owner/name from a GitHub repository URL.
+// Accepted forms:
+//   - https://github.com/<owner>/<repo>[.git]
+//   - http://github.com/<owner>/<repo>[.git]
+//   - git@github.com:<owner>/<repo>[.git]
+//   - ssh://git@github.com/<owner>/<repo>[.git]
+//
+// Non-github.com hosts (a self-hosted Enterprise host, a GitLab URL) return
+// ("", "", false) so the lookup degrades to "unknown" rather than guessing.
+// Trailing ".git", trailing slashes, and the auth segment are stripped before
+// the owner/repo pair is extracted. This is a string parser, not a URL parser:
+// the GitHub Enterprise case has too many forms to be worth a full parse.
+func parseGitHubRepoURL(raw string) (owner, name string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	// Normalise the scp-style ssh form ("git@github.com:owner/repo")
+	// to "ssh://git@github.com/owner/repo" so the url.Parse below can
+	// extract the host: the standard library treats the scp form as a
+	// single opaque path.
+	if i := strings.Index(raw, "@"); i >= 0 && !strings.Contains(raw[i:], "://") {
+		// Find the first ':' after the '@', which separates the
+		// host from the path in scp syntax.
+		rest := raw[i+1:]
+		if j := strings.Index(rest, ":"); j >= 0 {
+			host := rest[:j]
+			path := rest[j+1:]
+			raw = "ssh://" + raw[:i] + "@" + host + "/" + path
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Maybe the input was just "github.com/owner/repo"; split on '/'.
+		parts := strings.Split(strings.TrimLeft(raw, "/"), "/")
+		return matchGitHubHost(parts)
+	}
+	host := strings.ToLower(u.Host)
+	if i := strings.Index(host, ":"); i >= 0 {
+		host = host[:i]
+	}
+	if host != "github.com" {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	// parts is [owner, repo]; reject anything longer so a stray
+	// fragment does not produce a malformed lookup.
+	return splitOwnerRepo(parts)
+}
+
+// matchGitHubHost turns ["github.com", owner, repo(.git?)] into (owner, repo)
+// for the case where the input lacked a scheme and the host ended up in
+// the path. Anything other than exactly three path elements is rejected.
+func matchGitHubHost(parts []string) (owner, name string, ok bool) {
+	if len(parts) == 3 && strings.EqualFold(parts[0], "github.com") {
+		return splitOwnerRepo(parts[1:])
+	}
+	return "", "", false
+}
+
+// splitOwnerRepo turns [owner, repo] into (owner, repo-without-.git).
+// Rejects empty entries so a stray fragment or double slash cannot
+// produce a malformed repo lookup.
+func splitOwnerRepo(parts []string) (owner, name string, ok bool) {
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	o, r := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if o == "" || r == "" {
+		return "", "", false
+	}
+	return o, strings.TrimSuffix(r, ".git"), true
+}
+
+// parseFluxRevisionSHA extracts a usable SHA from a Flux revision string.
+// Flux v2 stamps revisions in the form:
+//
+//	refs/heads/<branch>@sha1:<40-char-hex>
+//	refs/tags/<tag>@sha1:<40-char-hex>
+//	<branch>@sha1:<40-char-hex>
+//	sha1:<40-char-hex>
+//	<40-char-hex>
+//
+// Any revision string that does not carry a 40-character lowercase or
+// uppercase hex SHA returns ("", false) so the GitHub lookup degrades to
+// "unknown" rather than firing an API request that the server will reject.
+// The algorithm prefix is hard-coded to "sha1" because that is what Flux
+// stamps today; a future "sha256:" prefix would be a separate change so
+// it is rejected rather than silently coerced.
+func parseFluxRevisionSHA(rev string) (sha string, ok bool) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", false
+	}
+	// Accept either "<algo>:<hex>" (when the part before ":" looks like
+	// a Flux ref) or a bare 40-char hex. The two arms are kept separate
+	// so a future algorithm prefix is a single-line change rather than
+	// a rewrite of this branch.
+	if i := strings.Index(rev, ":"); i >= 0 {
+		head := rev[:i]
+		algo := head
+		if j := strings.LastIndex(head, "@"); j >= 0 {
+			algo = head[j+1:]
+		}
+		if algo != "sha1" {
+			return "", false
+		}
+		rev = rev[i+1:]
+	}
+	if !isHex40(rev) {
+		return "", false
+	}
+	return strings.ToLower(rev), true
+}
+
+// isHex40 is true for a 40-character string of [0-9a-fA-F]. SHA-1 is the
+// algorithm Flux stamps today; a 64-character SHA-256 revision is not
+// currently produced by Flux but the helper is kept strict so the parser
+// does not silently accept a truncated value.
+func isHex40(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// pathIntersects reports whether any changed file lives under one of the
+// declared workload paths. The matching paths are returned so the renderer
+// can list exactly which files were the trigger; the workload path and any
+// declared component paths are all considered equivalent (a component is
+// part of the workload's effective Git surface per #134).
+//
+// All comparisons are done on cleaned, repository-relative paths: leading
+// and trailing slashes are stripped, ".." segments are collapsed, and the
+// match is a path-prefix check so a workload at "apps/payments" matches a
+// changed file at "apps/payments/deployment.yaml". The comparison is also
+// anchored at the path boundary, so a workload at "app" does NOT match a
+// changed file at "application/x" — the prefix has to land on a segment
+// boundary, otherwise unrelated directories fuse.
+func pathIntersects(workloadPath string, componentPaths, changedFiles []string) []string {
+	var matches []string
+	roots := make([]string, 0, 1+len(componentPaths))
+	if w := cleanRepoPath(workloadPath); w != "" {
+		roots = append(roots, w)
+	}
+	for _, c := range componentPaths {
+		if cp := cleanRepoPath(c); cp != "" && cp != cleanRepoPath(workloadPath) {
+			roots = append(roots, cp)
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	for _, f := range changedFiles {
+		cf := cleanRepoPath(f)
+		if cf == "" {
+			continue
+		}
+		for _, root := range roots {
+			if cf == root || strings.HasPrefix(cf, root+"/") {
+				matches = append(matches, f)
+				break
+			}
+		}
+	}
+	return matches
+}
+
+// resolveWorkloadPaths normalizes the workload path and each declared
+// component path to repository-relative form. Flux documents
+// spec.components as local, relative paths: every component is relative to
+// the Kustomization's spec.path (the workload path), not to the repo root.
+// So each component is resolved against the workload path using repo path
+// semantics, whether or not it contains "..": a component "deploy/prod"
+// under workload "apps/payments" is "apps/payments/deploy/prod", and
+// "../shared" under workload "apps/payments/prod" is "apps/payments/shared".
+// A component that resolves above the repo root (a malformed spec) is
+// reported as not-ok; it would match changed files that are not part of
+// this workload's Git surface, so the caller degrades to "unknown".
+func resolveWorkloadPaths(workloadPath string, componentPaths []string) ([]string, bool) {
+	base := cleanRepoPath(workloadPath)
+	if base == "" {
+		return nil, false
+	}
+	resolved := make([]string, 0, len(componentPaths))
+	for _, c := range componentPaths {
+		rel := joinRepoPaths(base, c)
+		if rel == "" {
+			// Escapes the repo root: reject the whole lookup.
+			return nil, false
+		}
+		resolved = append(resolved, rel)
+	}
+	return resolved, true
+}
+
+// joinRepoPaths resolves a component path against a base repo-relative
+// path, returning "" when the result escapes the repo root. Uses
+// repository (Unix) path semantics. The component is split on its raw
+// form: ".." segments are the very thing being resolved, so they must
+// survive (cleanRepoPath would have dropped them). A component without
+// any ".." simply appends its segments to the base, which is exactly
+// how Flux's local relative component paths compose.
+func joinRepoPaths(base, comp string) string {
+	parts := strings.Split(cleanRepoPath(base), "/")
+	for _, seg := range strings.Split(strings.TrimLeft(comp, "/"), "/") {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(parts) == 0 {
+				// Escapes the repo root.
+				return ""
+			}
+			parts = parts[:len(parts)-1]
+		default:
+			parts = append(parts, seg)
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// cleanRepoPath trims leading/trailing slashes and collapses redundant
+// separators without using filepath.Clean (which is OS-dependent — this is
+// always a Unix-style Git path). A leading ".." or "." collapses to "" so
+// the caller can drop it; the digest never renders traversal attempts.
+func cleanRepoPath(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.TrimLeft(p, "/")
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return ""
+	}
+	// Replace any run of '/' with a single one, then split on '/' so
+	// ".." segments can be removed the same way path.Clean would for a
+	// repository-relative path.
+	parts := strings.Split(strings.ReplaceAll(p, "\\", "/"), "/")
+	out := parts[:0]
+	for _, seg := range parts {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			// Reaching a parent of the repo root is meaningless here;
+			// drop the segment so we never emit a path that escapes.
+			continue
+		default:
+			out = append(out, seg)
+		}
+	}
+	return strings.Join(out, "/")
+}
+
+// fetchCommitFiles retrieves the full list of files changed in a single
+// commit, following the endpoint's pagination. ownerRepo is the
+// "owner/name" the commit belongs to — derived from the workload's
+// GitRepository URL, not necessarily the configured GITHUB_REPO the client
+// was built against (the token and HTTP client are reused across repos; only
+// the /repos/ path changes).
+//
+// The commit endpoint is paginated: a large commit (a mass rename) can
+// spread its files across multiple pages of up to 300. We follow the Link
+// rel="next" header until there is no next page so an incomplete file list
+// never turns into a confident "does not touch" — the whole point of the
+// lookup (issue #135) is a positive negative, and that only holds when the
+// file set is complete. A hard page cap bounds a misbehaving proxy that
+// repeats rel="next"; hitting it is an error so the caller degrades to
+// "unknown".
+//
+// A 404 (the most common non-success — private-repo auth failure, a fork
+// the token cannot see, a never-existed SHA) is folded into the err return
+// so the caller can label the relevance "unknown". Network errors,
+// timeouts, and 5xx all bubble up untouched so the caller can decide
+// whether to log them. The 1 MiB per-page decode cap (in fetchCommitPage)
+// keeps a misbehaving proxy returning a verbose error body from blowing
+// memory.
+func (g *gitHubClient) fetchCommitFiles(ctx context.Context, ownerRepo, sha string) ([]string, error) {
+	if g == nil {
+		return nil, fmt.Errorf("github: no client")
+	}
+	if ownerRepo == "" {
+		return nil, fmt.Errorf("github: empty repo")
+	}
+	if sha == "" {
+		return nil, fmt.Errorf("github: empty sha")
+	}
+
+	// 300 is the documented per-page maximum for this endpoint; per_page is
+	// fixed on the first page and carried forward in each rel="next" URL.
+	url := g.apiURL + "/repos/" + ownerRepo + "/commits/" + sha + "?per_page=300"
+	// 300 files/page * 100 pages = 30k files, far beyond any real commit.
+	const maxPages = 100
+	var out []string
+	for i := 0; ; i++ {
+		if i >= maxPages {
+			return nil, fmt.Errorf("github: commit %s file list incomplete (reached %d pages)", sha, maxPages)
+		}
+		files, next, err := g.fetchCommitPage(ctx, url)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, files...)
+		if next == "" {
+			break
+		}
+		url = next
+	}
+	return out, nil
+}
+
+// fetchCommitPage fetches one page of the commit endpoint and returns the
+// file names on that page plus the URL of the next page (from the Link
+// rel="next" header) or "" when there is no next page.
+func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	g.setHeaders(req)
+
+	resp, err := g.hc.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", fmt.Errorf("github: commit not found or token lacks access")
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		// Rate-limited or private-repo permission denied; the message
+		// is not actionable for the operator, so collapse to one shape.
+		return nil, "", fmt.Errorf("github: commit forbidden (rate limit or permissions)")
+	}
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, "", fmt.Errorf("github commit: %s: %s", resp.Status, string(body))
+	}
+	var payload struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return nil, "", fmt.Errorf("github commit decode: %w", err)
+	}
+	out := make([]string, 0, len(payload.Files))
+	for _, f := range payload.Files {
+		if f.Filename != "" {
+			out = append(out, f.Filename)
+		}
+	}
+	next := ""
+	if link := resp.Header.Get("Link"); link != "" {
+		next = parseLinkNext(link)
+	}
+	return out, next, nil
+}
+
+// parseLinkNext extracts the next-page URL from a GitHub Link header
+// ("<url>; rel=\"next\", <url>; rel=\"last\"") or "" when the header has no
+// rel="next" part. The URL is the part wrapped in <...>; we take the whole
+// thing so its per_page/page query params are preserved verbatim.
+func parseLinkNext(link string) string {
+	for _, part := range strings.Split(link, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.Contains(part, `rel="next"`) {
+			continue
+		}
+		i := strings.IndexByte(part, '<')
+		j := strings.LastIndexByte(part, '>')
+		if i >= 0 && j > i {
+			return part[i+1 : j]
+		}
+		return part
+	}
+	return ""
+}
+
+// fetchCommitMessage returns the first line of the commit message, capped
+// to a safe length and flattened so a single newline cannot smuggle a
+// second line into the evidence. ownerRepo carries the parsed source
+// "owner/name" (see fetchCommitFiles); the client's token and transport are
+// reused. Returns "" on any failure; the caller is responsible for the
+// untrusted fence and never has to gate on a missing message.
+func (g *gitHubClient) fetchCommitMessage(ctx context.Context, ownerRepo, sha string) string {
+	if g == nil || ownerRepo == "" || sha == "" {
+		return ""
+	}
+	u := g.apiURL + "/repos/" + ownerRepo + "/commits/" + sha
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	g.setHeaders(req)
+	resp, err := g.hc.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return ""
+	}
+	var payload struct {
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
+		return ""
+	}
+	msg := payload.Commit.Message
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	return strings.TrimSpace(msg)
+}
+
+// classifyCommit is the convenience entry point the enrichment layer uses.
+// It parses the repo URL and revision, fetches the commit's files if both
+// parsed and the workload path is non-empty, and classifies the result as
+// touches/does_not_touch/unknown. Failures at any step degrade to a single
+// CommitRelevance with State == "unknown" so the renderer can present a
+// neutral note ("could not determine") rather than pretending the lookup
+// did not happen.
+//
+// componentPaths may be nil; they are accepted separately so callers that
+// do not yet have #134's KustomizationTopology in their hands can still
+// classify against the workload path alone. The shape stays the same once
+// #134 lands — only the slice gets populated from there.
+func classifyCommit(ctx context.Context, gh *gitHubClient, repoURL, revision, workloadPath string, componentPaths []string) CommitRelevance {
+	out := CommitRelevance{
+		RepoURL:        repoURL,
+		Revision:       revision,
+		WorkloadPath:   workloadPath,
+		ComponentPaths: append([]string(nil), componentPaths...),
+		State:          commitRelevanceUnknown,
+	}
+	if gh == nil {
+		out.Reason = "GitHub client not configured (GITHUB_REPO/GITHUB_TOKEN unset)"
+		return out
+	}
+	if repoURL == "" {
+		out.Reason = "no GitOps repository URL resolved for the workload"
+		return out
+	}
+	owner, name, ok := parseGitHubRepoURL(repoURL)
+	if !ok {
+		out.Reason = "GitOps repository host is not github.com"
+		return out
+	}
+	// The commit is fetched from the repo the workload's GitRepository
+	// resolved to — owner/name above — not from the configured GITHUB_REPO
+	// the client was built against. The client's token and HTTP transport
+	// are reused across repos; only the /repos/ path changes. A workload
+	// whose source lives in a different (GitHub) repo than the
+	// issue-tracking one is a perfectly valid lookup, and treating it as
+	// "unknown" would turn a working cross-repo deployment into a silent
+	// negative.
+	ownerRepo := owner + "/" + name
+	sha, ok := parseFluxRevisionSHA(revision)
+	if !ok {
+		out.Reason = "Flux revision is not SHA-bearing: " + truncate(revision, 80)
+		return out
+	}
+	if workloadPath == "" {
+		out.Reason = "no workload path resolved (resolveRepoPaths returned nothing)"
+		return out
+	}
+	// A Kustomization's declared components are relative to its spec.path,
+	// not to the repo root, so they are resolved against the workload path
+	// before the path intersection is computed. A component that escapes
+	// the repo root after resolution (a malformed spec) is dropped: it
+	// would match things that are not part of this workload's Git surface.
+	resolved, ok := resolveWorkloadPaths(workloadPath, componentPaths)
+	if !ok {
+		out.Reason = "workload path is not a valid repo-relative path"
+		return out
+	}
+	out.WorkloadPath = cleanRepoPath(workloadPath)
+	out.ComponentPaths = append([]string(nil), resolved...)
+	out.SHA = sha
+	files, err := gh.fetchCommitFiles(ctx, ownerRepo, sha)
+	if err != nil {
+		out.Reason = truncate(err.Error(), 200)
+		return out
+	}
+	matches := pathIntersects(out.WorkloadPath, out.ComponentPaths, files)
+	out.MatchingPaths = matches
+	if len(matches) > 0 {
+		out.State = commitRelevanceTouches
+		out.CommitMessage = gh.fetchCommitMessage(ctx, ownerRepo, sha)
+		return out
+	}
+	out.State = commitRelevanceDoesNotTouch
+	out.CommitMessage = gh.fetchCommitMessage(ctx, ownerRepo, sha)
+	return out
+}
+
 // clamp lives in enrich.go; the GitHub body builder reuses it.
 
 // renderEvidence assembles the cluster evidence collected during enrichment

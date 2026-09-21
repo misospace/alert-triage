@@ -53,8 +53,10 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})
 
-	// Absence must read as a ruled-out cause, never as missing data.
-	for _, want := range []string{"all nodes Ready", "no warning events", "recent deploy is unlikely"} {
+	// Absence must read as a ruled-out cause, never as missing data. With no
+	// resolved subject the event absence is stated as "not queried" rather than
+	// an "on the subject" negative that would imply an inspection.
+	for _, want := range []string{"all nodes Ready", "no subject-scoped events were queried", "no Flux reconciles or failures in the window"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, out)
 		}
@@ -100,6 +102,51 @@ func TestRepeatedEventsCollapse(t *testing.T) {
 	}
 	if !strings.Contains(got[0], "x43") {
 		t.Errorf("collapsed line should carry the count, got %q", got[0])
+	}
+}
+
+// TestAmbientBackendStateDoesNotClaimNoLines is the render-level regression
+// the reviewer called out: when the no-subject fallback fires, the backend did
+// return lines — they are deliberately routed to Ambient. The state is
+// "ambient", and neither the model prompt nor the chat may print the "empty"
+// finding ("returned no lines for this window") beside the very lines we
+// routed to BACKGROUND.
+func TestAmbientBackendStateDoesNotClaimNoLines(t *testing.T) {
+	g := Group{
+		Key:        "sig-amb",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1"}}},
+	}
+	en := Enrichment{
+		BackendState: "ambient",
+		Ambient:      []string{"(ambient, namespace-wide) namespace chatter line"},
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "returned no lines for this window") {
+		t.Errorf("model prompt: must not claim the backend returned no lines when namespace-wide lines were returned:\n%s", model)
+	}
+	if !strings.Contains(model, "namespace chatter line") {
+		t.Errorf("model prompt: the namespace-wide line must be rendered (under BACKGROUND):\n%s", model)
+	}
+
+	// Ambient never reaches Discord, so the chat only has to avoid the false
+	// "no lines" claim, not to carry the line itself.
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "returned no lines for this window") {
+		t.Errorf("discord: must not claim the backend returned no lines when namespace-wide lines were returned:\n%s", discord)
+	}
+
+	// And a subject-scoped query that found nothing is a true subject negative.
+	en2 := Enrichment{BackendState: "empty", BackendScoped: true}
+	if !strings.Contains(renderEvidence(Report{Group: g, Enrichment: en2}), "returned no lines for this subject in the window") {
+		t.Error("subject-scoped empty state must still render the explicit subject negative")
+	}
+	// A namespace-only fallback that found nothing must not claim the subject
+	// was queried.
+	en3 := Enrichment{BackendState: "empty"}
+	if got := renderEvidence(Report{Group: g, Enrichment: en3}); strings.Contains(got, "for this subject") {
+		t.Errorf("namespace-fallback empty state must not claim a subject inspection:\n%s", got)
 	}
 }
 

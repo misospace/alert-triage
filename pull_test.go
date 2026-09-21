@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -125,7 +126,7 @@ spec:
 
 func TestApplyDiffRoundTrip(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	diff := Propose(triage, "deploy/web.yaml", patchableManifest)
+	diff := Propose(oomAlerts(), triage, "deploy/web.yaml", patchableManifest)
 	if diff == "" {
 		t.Fatalf("expected a diff from Propose")
 	}
@@ -437,7 +438,9 @@ func triageReport() Report {
 	return Report{
 		Group: Group{
 			Cluster: "default",
-			Alerts:  []Alert{{Labels: map[string]string{"alertname": "XPodCrash", "severity": "warning"}}},
+			// The group names an OOMKilled alert: the alert-type gate in
+			// Propose requires a memory-pressure alert for the write arm.
+			Alerts: []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}},
 		},
 		Triage:     Triage{FixLocation: "git", Confidence: "high", WhatToChange: "raise memory limit in deploy/web.yaml", Narrative: "The api container is being OOM-killed."},
 		Narrative:  "The api container is being OOM-killed.",
@@ -654,6 +657,26 @@ func TestDeliverPullSkipsWhenProposeRefuses(t *testing.T) {
 	}
 	if f.prCalls != 0 || f.puts != 0 {
 		t.Errorf("Propose refusal must not write: prs=%d puts=%d", f.prCalls, f.puts)
+	}
+}
+
+func TestDeliverPullSkipsNonMemoryPressureAlert(t *testing.T) {
+	// A high-confidence git triage over a patchable manifest is not enough:
+	// the group fired for a node fault, not a memory kill, so the PR arm
+	// stays silent.
+	f := newFakeGH(t, nil, 0)
+	r := triageReport()
+	r.Group.Alerts = []Alert{{Labels: map[string]string{"alertname": "KubeNodeNotReady", "severity": "critical"}}}
+
+	act, err := deliverPull(context.Background(), f.client(), prCfg(), r)
+	if err != nil {
+		t.Fatalf("deliverPull: %v", err)
+	}
+	if act.Outcome != "skipped" {
+		t.Errorf("expected skipped for a non-memory-pressure alert, got %s", act.Outcome)
+	}
+	if f.prCalls != 0 || f.puts != 0 {
+		t.Errorf("non-memory-pressure alert must not write: prs=%d puts=%d", f.prCalls, f.puts)
 	}
 }
 
@@ -932,7 +955,8 @@ func (f *fakeRepoServer) handle(w http.ResponseWriter, r *http.Request) {
 // validated Propose diff applied to the authoritative original.
 func patchedManifest(t *testing.T) string {
 	t.Helper()
-	diff := Propose(triageReport().Triage, "deploy/web.yaml", patchableManifest)
+	r := triageReport()
+	diff := Propose(r.Group.Alerts, r.Triage, "deploy/web.yaml", patchableManifest)
 	if diff == "" {
 		t.Fatalf("expected Propose to yield a diff for patchableManifest")
 	}
@@ -1077,5 +1101,43 @@ func TestDeliverPullRefusesSymlinkTarget(t *testing.T) {
 	f.mu.Unlock()
 	if n != 0 {
 		t.Errorf("a symlink target must not create a branch, got %d", n)
+	}
+}
+
+// A stalled GitHub PR API must not hold the delivery loop for the full 30s
+// budget: cancelling the caller's context — as a SIGTERM drain does — must
+// abort the in-flight request promptly. This mirrors the issue arm's
+// TestDeliverGitHubContextCancelledInFlight and the Discord arm's
+// TestDeliverContextCancelledInFlight (issue #145); the PR arm's first call
+// is the /pulls list, so a blocked server there is enough to hold it.
+func TestDeliverPullContextCancelledInFlight(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hold the connection open without responding so the /pulls list
+		// request is in flight; releasing it lets srv.Close() not wait.
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: &http.Client{}, apiURL: srv.URL}
+
+	r := triageReport()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := deliverPull(ctx, g, prCfg(), r)
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("deliverPull took %v after context cancellation, want < 200ms", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected error on context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context cancellation error, got %v", err)
 	}
 }
