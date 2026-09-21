@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2979,5 +2980,608 @@ func TestEnrichNoGitHubClientLeavesRelevanceEmpty(t *testing.T) {
 	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if len(en.CommitRelevance) != 0 {
 		t.Fatalf("expected CommitRelevance to be empty without gh, got %d entries: %+v", len(en.CommitRelevance), en.CommitRelevance)
+	}
+}
+
+// --- Declared execution identity and PVC relationships (issue #132) ---
+
+// podItemFromJSON decodes a single-item pod list into one podItem, for tests
+// that only need one pod.
+func podItemFromJSON(t *testing.T, raw string) podItem {
+	t.Helper()
+	var list podList
+	if err := json.Unmarshal([]byte(`{"items":[`+raw+`]}`), &list); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(list.Items))
+	}
+	return list.Items[0]
+}
+
+// A pod that declares its execution identity at the pod level (not the
+// container level) must have those fields captured, so a permission hypothesis
+// can be grounded in what the pod declared.
+func TestPodItemPodLevelSecurityContext(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true}},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"restartCount":2,
+			 "state":{"waiting":{"reason":"CrashLoopBackOff"}}}
+		]}
+	}`)
+	if p.Spec.Security == nil {
+		t.Fatal("expected a pod-level securityContext, got nil")
+	}
+	u, g, fg, nr := p.Spec.Security.format()
+	if u != "1000" || g != "2000" || fg != "3000" || nr != "true" {
+		t.Errorf("pod securityContext = (%q,%q,%q,%q), want (1000,2000,3000,true)", u, g, fg, nr)
+	}
+}
+
+// The container securityContext and volumeMounts live under spec.containers,
+// not status.containerStatuses: this is the exact shape the apiserver returns,
+// and the one the feature must read.
+func TestPodItemContainerOverridesPodIdentity(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true},
+			"containers":[{"name":"mover",
+				"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+				"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+			"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"restartCount":1,
+			 "state":{"waiting":{"reason":"CrashLoopBackOff"}}}
+		]}
+	}`)
+	cs := p.containerSpec("mover")
+	if cs == nil {
+		t.Fatal("expected the spec container mover to be captured from spec.containers")
+	}
+	eff := cs.effective(p.Spec.Security)
+	u, g, fg, nr := eff.format()
+	// runAsUser/RunAsNonRoot overridden by the container, runAsGroup/fsGroup
+	// inherited from the pod.
+	if u != "4000" || g != "2000" || fg != "3000" || nr != "false" {
+		t.Errorf("effective = (%q,%q,%q,%q), want (4000,2000,3000,false)", u, g, fg, nr)
+	}
+}
+
+// When neither the pod nor the container declares anything, every field reads
+// "unset" - it must not be guessed as root from the image.
+func TestPodItemAllIdentityUnset(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,
+			 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if p.Spec.Security != nil {
+		t.Fatalf("expected no pod securityContext, got %v", *p.Spec.Security)
+	}
+	eff := p.containerSpec("mover").effective(p.Spec.Security)
+	u, g, fg, nr := eff.format()
+	if u != "unset" || g != "unset" || fg != "unset" || nr != "unset" {
+		t.Errorf("unset pod = (%q,%q,%q,%q), want (unset,unset,unset,unset)", u, g, fg, nr)
+	}
+}
+
+// runAsNonRoot must keep its three states: an explicit false, an explicit true,
+// and an absent value that stays unset rather than collapsing to false.
+func TestPodItemRunAsNonRootThreeState(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"unset", `{"runAsUser":100}`, "unset"},
+		{"true", `{"runAsNonRoot":true}`, "true"},
+		{"false", `{"runAsNonRoot":false}`, "false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := podItemFromJSON(t, `{
+				"metadata":{"name":"mover","namespace":"ns1"},
+				"spec":{"containers":[{"name":"mover","securityContext":`+tc.json+`}]},
+				"status":{"phase":"Failed","containerStatuses":[
+					{"name":"mover","ready":false,"state":{"waiting":{"reason":"Error"}}}
+				]}
+			}`)
+			eff := p.containerSpec("mover").effective(nil)
+			_, _, _, nr := eff.format()
+			if nr != tc.want {
+				t.Errorf("runAsNonRoot = %q, want %q", nr, tc.want)
+			}
+		})
+	}
+}
+
+// A container securityContext present but with a single field must still leave
+// the unset fields unset rather than defaulting them.
+func TestPodItemPartialContainerIdentity(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"containers":[{"name":"mover",
+			"securityContext":{"runAsUser":100}}]},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"waiting":{"reason":"Error"}}}
+		]}
+	}`)
+	eff := p.containerSpec("mover").effective(nil)
+	u, g, fg, nr := eff.format()
+	if u != "100" || g != "unset" || fg != "unset" || nr != "unset" {
+		t.Errorf("partial = (%q,%q,%q,%q), want (100,unset,unset,unset)", u, g, fg, nr)
+	}
+}
+
+// A volume that references a PVC must be mapped to its claim name; a non-PVC
+// volume (emptyDir) must not fabricate a claim.
+func TestPodItemVolumeToClaim(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"containers":[{"name":"mover","volumeMounts":[
+				{"name":"data","mountPath":"/data","readOnly":false},
+				{"name":"tmp","mountPath":"/tmp","readOnly":false}]}],
+			"volumes":[
+				{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}},
+				{"name":"tmp","emptyDir":{}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	mounts := p.mount()
+	if len(mounts) != 1 {
+		t.Fatalf("expected exactly the PVC claim, got %v", mounts)
+	}
+	m, ok := mounts["data-claim"]
+	if !ok {
+		t.Fatalf("missing data-claim in %v", mounts)
+	}
+	if m.Container != "mover" || m.Path != "/data" || m.ReadOnly {
+		t.Errorf("mount = %+v, want container=mover path=/data read-only=false", m)
+	}
+}
+
+// A pod with only non-PVC volumes has no claim, so it is not a same-claim
+// sibling of anything.
+func TestPodItemNoPVCNoClaim(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"containers":[{"name":"mover","volumeMounts":[{"name":"tmp","mountPath":"/tmp"}]}],
+			"volumes":[{"name":"tmp","emptyDir":{}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if len(p.claims()) != 0 {
+		t.Errorf("expected no claims, got %v", p.claims())
+	}
+}
+
+// A container that is in the running state is not failing; a container whose
+// only state is non-running is failing. Succeeded pods are never failing.
+func TestPodItemFailing(t *testing.T) {
+	failing := podItemFromJSON(t, `{
+		"metadata":{"name":"a","namespace":"ns1"},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}},
+			{"name":"sidecar","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if !failing.failing()["mover"] || !failing.failing()["sidecar"] {
+		t.Errorf("expected both containers failing, got %v", failing.failing())
+	}
+
+	healthy := podItemFromJSON(t, `{
+		"metadata":{"name":"b","namespace":"ns1"},
+		"status":{"phase":"Running","containerStatuses":[
+			{"name":"app","ready":true,"state":{"running":{}}}
+		]}
+	}`)
+	if len(healthy.failing()) != 0 {
+		t.Errorf("expected no failing container in a healthy Running pod, got %v", healthy.failing())
+	}
+
+	succeeded := podItemFromJSON(t, `{
+		"metadata":{"name":"c","namespace":"ns1"},
+		"status":{"phase":"Succeeded","containerStatuses":[
+			{"name":"job","ready":false,"state":{"terminated":{"exitCode":0,"reason":"Completed"}}}
+		]}
+	}`)
+	if len(succeeded.failing()) != 0 {
+		t.Errorf("a Succeeded pod is never failing, got %v", succeeded.failing())
+	}
+}
+
+// identityHarness serves a distinct pod list per namespace so a test can put
+// same-named claims in two namespaces and assert they are not conflated.
+func identityHarness(t *testing.T, byNS map[string]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(p, "/pods"):
+			ns := ""
+			parts := strings.Split(strings.Trim(p, "/"), "/")
+			for i := 0; i+1 < len(parts); i++ {
+				if parts[i] == "namespaces" {
+					ns = parts[i+1]
+				}
+			}
+			if body, ok := byNS[ns]; ok {
+				_, _ = io.WriteString(w, body)
+				return
+			}
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(p, "/events"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+}
+
+// A failed pod the alert names must yield its effective declared identity and
+// PVC mount, and a healthy pod mounting the same claim in the same namespace
+// must appear as comparison context; an unrelated claim must not.
+func TestEnrichPodIdentityAndSameClaimSibling(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true},
+				"containers":[{"name":"mover",
+					"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"restartCount":0,
+				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"app-xyz","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"fsGroup":3000,"runAsNonRoot":true},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":2000},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":true}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}}]}},
+			{"metadata":{"name":"unrelated","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"u","volumeMounts":[{"name":"other","mountPath":"/other"}]}],
+				"volumes":[{"name":"other","persistentVolumeClaim":{"claimName":"other-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"u","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	id, ok := en.PodID["ns1/mover"]
+	if !ok {
+		t.Fatalf("expected an identity line for ns1/mover, got %v", en.PodID)
+	}
+	for _, want := range []string{"runAsUser=4000", "runAsGroup=2000", "fsGroup=3000", "runAsNonRoot=false", "data-claim at /data (read-write)"} {
+		if !strings.Contains(id, want) {
+			t.Errorf("identity %q missing %q", id, want)
+		}
+	}
+	if strings.Contains(id, "stat") {
+		t.Errorf("identity must not claim on-disk ownership/mode: %q", id)
+	}
+
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "app-xyz") {
+			sib = s
+		}
+		if strings.Contains(s, "unrelated") {
+			t.Errorf("unrelated claim must not be a sibling: %v", en.PVCSiblings)
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected app-xyz as a same-claim sibling, got %v", en.PVCSiblings)
+	}
+	if !strings.Contains(sib, "Running") || !strings.Contains(sib, "1/1 ready") {
+		t.Errorf("sibling %q must carry phase and readiness", sib)
+	}
+	// The sibling must carry its own declared identity and mount so the
+	// operator can compare it with the mover's on the same claim. Container
+	// runAsUser overrides the pod; pod fsGroup/runAsNonRoot are inherited.
+	for _, want := range []string{
+		"container app (declared: runAsUser=2000 runAsGroup=unset fsGroup=3000 runAsNonRoot=true)",
+		"data-claim at /data (read-only)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("sibling %q missing %q", sib, want)
+		}
+	}
+}
+
+// A sibling with several containers must only report the container(s) that
+// actually mount the matched claim, so the identity/mount detail does not
+// imply the other containers touch the volume.
+func TestEnrichSiblingDetailOnlyListsMountingContainers(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"app-xyz","namespace":"ns1"},
+			 "spec":{
+				"containers":[
+					{"name":"app","securityContext":{"runAsUser":2000},
+					 "volumeMounts":[{"name":"data","mountPath":"/data"}]},
+					{"name":"sidecar"}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}},
+				{"name":"sidecar","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "app-xyz") {
+			sib = s
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected app-xyz as a same-claim sibling, got %v", en.PVCSiblings)
+	}
+	if !strings.Contains(sib, "container app (declared: runAsUser=2000") {
+		t.Errorf("sibling %q must describe the mounting container app", sib)
+	}
+	if strings.Contains(sib, "sidecar") {
+		t.Errorf("sibling %q must not describe a container that does not mount the claim", sib)
+	}
+}
+
+// A KubeJobFailed alert names a Job via job_name and carries no pod label
+// (#127). The Job's owned failing Pod must still be enriched with its declared
+// identity and same-claim siblings - the exact backup/mover incident this
+// feature exists for.
+func TestEnrichJobFailedPodIdentityAndSiblings(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+			 "spec":{
+				"containers":[{"name":"mover",
+					"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"restartCount":0,
+				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"web-0","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"runAsGroup":4000},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":5000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	id, ok := en.PodID["ns1/backup-0"]
+	if !ok {
+		t.Fatalf("a Job-owned failing pod must carry identity evidence, got %v", en.PodID)
+	}
+	if !strings.Contains(id, "runAsUser=4000") || !strings.Contains(id, "data-claim at /data") {
+		t.Errorf("job pod identity = %q, want declared identity and PVC mount", id)
+	}
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "web-0") {
+			sib = s
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected the same-claim sibling web-0 for the job pod, got %v", en.PVCSiblings)
+	}
+	for _, want := range []string{
+		"container app (declared: runAsUser=5000 runAsGroup=4000 fsGroup=unset runAsNonRoot=false)",
+		"data-claim at /data (read-write)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("job sibling %q missing %q", sib, want)
+		}
+	}
+}
+
+// Claims are namespace-local: a pod in ns2 mounting a claim with the same name
+// as the ns1 target's claim is not a same-claim sibling.
+func TestEnrichSiblingsAreNamespaceScoped(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"ns1-peer","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"p","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"p","ready":true,"state":{"running":{}}}]}}
+		]}`
+	ns2 := `{
+		"items":[
+			{"metadata":{"name":"ns2-peer","namespace":"ns2"},
+			 "spec":{
+				"containers":[{"name":"p","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"p","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1, "ns2": ns2})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1", "ns2"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	var ns1Peer, ns2Peer bool
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "ns1-peer") {
+			ns1Peer = true
+		}
+		if strings.Contains(s, "ns2-peer") {
+			ns2Peer = true
+		}
+	}
+	if !ns1Peer {
+		t.Errorf("expected the same-namespace sibling ns1-peer, got %v", en.PVCSiblings)
+	}
+	if ns2Peer {
+		t.Errorf("a same-named claim in another namespace must not be a sibling: %v", en.PVCSiblings)
+	}
+}
+
+// The sibling list is capped so a group spanning many pods does not become a
+// namespace dump.
+func TestEnrichSiblingCap(t *testing.T) {
+	var items []string
+	items = append(items, `{"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"containers":[{"name":"c","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+		"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+		"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}}`)
+	for i := 0; i < 6; i++ {
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":"peer-%d","namespace":"ns1"},
+			"spec":{"containers":[{"name":"c","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+			"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			"status":{"phase":"Running","containerStatuses":[{"name":"c","ready":true,"state":{"running":{}}}]}}`, i))
+	}
+	srv := identityHarness(t, map[string]string{"ns1": `{"items":[` + strings.Join(items, ",") + `]}`})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	if len(en.PVCSiblings) > sameClaimSibMax {
+		t.Errorf("expected at most %d same-claim siblings, got %d: %v", sameClaimSibMax, len(en.PVCSiblings), en.PVCSiblings)
+	}
+}
+
+// A failing target that declares nothing yields an explicit "unset" identity
+// line rather than a guessed identity, and mounts nothing so it has no claim
+// and no siblings.
+func TestEnrichAllIdentityUnset(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"c","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	id, ok := en.PodID["ns1/mover"]
+	if !ok {
+		t.Fatalf("a failing target must carry an identity line, got %v", en.PodID)
+	}
+	for _, want := range []string{"runAsUser=unset", "runAsGroup=unset", "fsGroup=unset", "runAsNonRoot=unset"} {
+		if !strings.Contains(id, want) {
+			t.Errorf("expected %q in %q", want, id)
+		}
+	}
+	if len(en.PVCSiblings) != 0 {
+		t.Errorf("a target with no claim must have no siblings, got %v", en.PVCSiblings)
+	}
+}
+
+// A healthy target the alert named has no failing container, so it carries no
+// identity line: the section is about the failure, not the pod's existence.
+func TestEnrichHealthyTargetNoIdentity(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{"securityContext":{"runAsUser":1000}},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"c","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	if _, ok := en.PodID["ns1/mover"]; ok {
+		t.Errorf("a healthy target with no failing container must not carry an identity line, got %v", en.PodID)
 	}
 }

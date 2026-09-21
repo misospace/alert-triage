@@ -1184,3 +1184,84 @@ func TestNoSubjectEventNegativeNotSubjectScoped(t *testing.T) {
 		t.Errorf("expected a neutral no-subject event statement:\n%s", got)
 	}
 }
+
+// A resolved subject with a declared identity and a same-claim sibling must
+// render both: identity as direct evidence, sibling as comparison context.
+func TestRenderEvidencePodIDAndSiblings(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "namespace/ns1",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "JobFailed", "namespace": "ns1", "pod": "mover-abc"}}},
+		},
+		Enrichment: Enrichment{
+			SubjectPodObserved: true,
+			PodID: map[string]string{
+				"ns1/mover-abc": "ns1/mover-abc container mover (declared: runAsUser=4000 runAsGroup=2000 fsGroup=3000 runAsNonRoot=false), mounts data-claim at /data (read-write)",
+			},
+			PVCSiblings: []string{
+				"same-claim data-claim: ns1/app-xyz Running (1/1 ready, 1 running)",
+			},
+		},
+	}
+	got := renderEvidence(rpt)
+	for _, want := range []string{
+		"Pod execution identity and PVC mounts",
+		"ns1/mover-abc container mover",
+		"runAsUser=4000",
+		"runAsNonRoot=false",
+		"data-claim at /data (read-write)",
+		"Same-claim siblings (comparison context only)",
+		"same-claim data-claim: ns1/app-xyz Running (1/1 ready, 1 running)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("evidence missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// An unset runAsNonRoot must render as "unset", never as false.
+func TestRenderEvidenceRunAsNonRootUnset(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "namespace/ns1",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "JobFailed", "namespace": "ns1", "pod": "mover"}}},
+		},
+		Enrichment: Enrichment{
+			SubjectPodObserved: true,
+			PodID: map[string]string{
+				"ns1/mover": "ns1/mover container mover (declared: runAsUser=unset runAsGroup=unset fsGroup=unset runAsNonRoot=unset)",
+			},
+		},
+	}
+	got := renderEvidence(rpt)
+	if !strings.Contains(got, "runAsNonRoot=unset") {
+		t.Errorf("unset runAsNonRoot must render as unset:\n%s", got)
+	}
+	if strings.Contains(got, "runAsNonRoot=false") {
+		t.Errorf("unset runAsNonRoot must not be collapsed to false:\n%s", got)
+	}
+}
+
+// When a subject was observed but carries no declared identity or claim, both
+// sections render as explicit negatives (a finding, not silence).
+func TestRenderEvidencePodIDNegatives(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "single/A",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
+		},
+		Enrichment: Enrichment{SubjectPodObserved: true},
+	}
+	got := renderEvidence(rpt)
+	for _, want := range []string{
+		"the resolved subject pod(s) declared no securityContext and mounted no PVC",
+		"no other pod in the namespace mounts a claim the resolved subject pod mounts",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected explicit negative %q in:\n%s", want, got)
+		}
+	}
+}
