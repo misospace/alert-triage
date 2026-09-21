@@ -2126,6 +2126,9 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	if en.BackendState != "ambient" {
 		t.Fatalf("expected state \"ambient\" (no subject resolved, namespace-wide lines returned), got %q", en.BackendState)
 	}
+	if en.BackendScoped {
+		t.Errorf("no subject was resolved, so the backend query was not subject-scoped")
+	}
 	foundAmbient := false
 	for _, a := range en.Ambient {
 		if !strings.Contains(a, "(ambient, namespace-wide)") {
@@ -2138,6 +2141,44 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	}
 	if !foundAmbient {
 		t.Fatalf("expected one ambient-marked backend-log line, got %v", en.Ambient)
+	}
+}
+
+// TestEnrichBackendLogsNoSubjectEmptyNotScoped is the issue #136 review
+// regression for the ambiguous "empty" state: with no resolved subject the
+// namespace-only fallback ran and returned nothing. The query was not
+// subject-scoped, so the rendered evidence must not claim it looked for the
+// subject's lines.
+func TestEnrichBackendLogsNoSubjectEmptyNotScoped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "empty" {
+		t.Fatalf("expected state \"empty\", got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Fatalf("no subject was resolved, so the query must not be marked subject-scoped")
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(got, "for this subject") {
+		t.Errorf("namespace-fallback empty state must not claim a subject inspection:\n%s", got)
+	}
+	if !strings.Contains(got, "returned no lines for the namespace in the window") {
+		t.Errorf("expected the namespace-scoped empty wording:\n%s", got)
 	}
 }
 
@@ -2178,6 +2219,9 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 	}
 	if en.BackendState != "ok" {
 		t.Fatalf("expected state \"ok\", got %q", en.BackendState)
+	}
+	if !en.BackendScoped {
+		t.Errorf("a resolved target pod must mark the backend query subject-scoped")
 	}
 	for _, a := range en.Ambient {
 		if strings.Contains(a, "(ambient, namespace-wide)") {

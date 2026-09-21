@@ -425,7 +425,15 @@ func renderEvidence(r Report) string {
 	case "off":
 		b.WriteString("\nSubject log source: not configured (no LOGS_URL).\n")
 	case "empty":
-		b.WriteString("\nSubject log source: configured, but returned no lines for this subject in the window.\n")
+		// "empty" is ambiguous on its own: the query may have been bounded to
+		// the subject, or fallen back to the namespace when no subject was
+		// resolved. Claiming a subject inspection in the latter case is a
+		// false negative scoped to an object we never queried.
+		if r.Enrichment.BackendScoped {
+			b.WriteString("\nSubject log source: configured, but returned no lines for this subject in the window.\n")
+		} else {
+			b.WriteString("\nLog source: configured, but returned no lines for the namespace in the window.\n")
+		}
 	case "ambient":
 		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
 		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
@@ -442,11 +450,14 @@ func renderEvidence(r Report) string {
 	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
-	negative := "no warning events in the window"
+	// Only a resolved subject graph makes these subject-scoped; without one the
+	// events were routed to Ambient and a subject-scoped negative would claim an
+	// inspection that never happened.
 	if r.Enrichment.EventsScoped {
-		negative = "no warning events on the resolved subject in the window"
+		writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, "no warning events on the resolved subject in the window")
+	} else {
+		b.WriteString("\nNo resolved alert subject, so no subject-scoped events were queried; namespace events are shown in the context tier.\n")
 	}
-	writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, negative)
 	// The chain's names and identity tags come from the objects' own
 	// metadata (ownerReferences and labels are workload-authored), so they
 	// render inside the fence: a forged controller name must read as a
@@ -467,7 +478,7 @@ func renderEvidence(r Report) string {
 
 	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
 	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
-	writeFinding(&b, "Other unhealthy pods in the namespace", r.Enrichment.ContextPods, "no other unhealthy pods in the namespace")
+	writeFinding(&b, "Other unhealthy pods in the namespace (context, not the alert's subject)", r.Enrichment.ContextPods, "no other unhealthy pods in the namespace")
 	if len(r.Enrichment.ContextRestarts) > 0 {
 		writeFinding(&b, "Other recent restarts in the namespace", r.Enrichment.ContextRestarts, "")
 	}

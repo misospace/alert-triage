@@ -304,6 +304,11 @@ type Enrichment struct {
 	// lines were routed to Ambient — the source is configured and answered.
 	BackendLogs  []string
 	BackendState string
+	// BackendScoped records whether the backend-log query was bounded to a
+	// resolved subject pod rather than falling back to the namespace. It keeps
+	// the "empty" state honest: only a subject-scoped query may claim it
+	// returned no lines for the subject (issue #136 review).
+	BackendScoped bool
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -728,6 +733,9 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	if k.logs != nil {
 		var res backendLogResult
 		var err error
+		// The query is subject-scoped exactly when a resolved subject existed;
+		// otherwise fetchBackendLogsResult falls back to the namespace.
+		e.BackendScoped = len(targetPods) > 0
 		res, err = k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
 		if err != nil {
 			e.BackendState = "error"
