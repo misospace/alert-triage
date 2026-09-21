@@ -1108,7 +1108,7 @@ func TestPodLogsSplitBetweenSubjectAndContext(t *testing.T) {
 // context, never as "for the resolved subject" (issue #136 review).
 func TestNamespaceWideMetricsNotSubjectScoped(t *testing.T) {
 	g := Group{Key: "single/KubeJobFailed", Alerts: []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}}}}
-	namespaceWide := Report{Group: g, Metrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}}
+	namespaceWide := Report{Group: g, ContextMetrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}}
 	got := renderEvidence(namespaceWide)
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
@@ -1126,11 +1126,37 @@ func TestNamespaceWideMetricsNotSubjectScoped(t *testing.T) {
 		t.Errorf("namespace-wide metrics described as subject-scoped in the direct tier:\n%s", got)
 	}
 
-	scoped := Report{Group: g, Metrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}, MetricsScoped: true}
+	scoped := Report{Group: g, SubjectMetrics: []string{"ns1 CPUThrottlingHigh cpu 0.4"}}
 	got = renderEvidence(scoped)
 	directIdx = strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx = strings.Index(got, "CONTEXT / BACKGROUND")
 	if mi := strings.Index(got, "CPUThrottlingHigh"); mi < directIdx || mi > contextIdx {
 		t.Errorf("subject-scoped metrics at %d must sit in DIRECT [%d, %d]:\n%s", mi, directIdx, contextIdx, got)
+	}
+}
+
+// When no subject pod was observed (a namespace/application alert, or a named
+// pod absent from the listing), the direct tier must report the absence of an
+// inspection rather than a health negative scoped to a subject it never saw
+// (issue #136 review).
+func TestNoSubjectObservedRendersNeutralNotHealthNegative(t *testing.T) {
+	got := renderEvidence(Report{
+		Group:      Group{Key: "single/KubePodNotReady", Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}}},
+		Enrichment: Enrichment{ContextPods: []string{"ns1/noise Failed (Error)"}},
+	})
+	if !strings.Contains(got, "No subject pod was observed for this alert") {
+		t.Errorf("expected a neutral no-subject statement:\n%s", got)
+	}
+	for _, bad := range []string{
+		"no unhealthy pods on the alert's subjects",
+		"no terminated containers on the alert's subjects",
+	} {
+		if strings.Contains(got, bad) {
+			t.Errorf("health negative %q rendered without an observed subject:\n%s", bad, got)
+		}
+	}
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if i := strings.Index(got, "ns1/noise"); i < contextIdx {
+		t.Errorf("namespace pod must render in the context tier (at %d, context starts %d):\n%s", i, contextIdx, got)
 	}
 }

@@ -327,6 +327,12 @@ type Enrichment struct {
 	// ContextPods is UnhealthyPods minus SubjectPods: namespace-wide pod
 	// failure state not known to concern the alert.
 	ContextPods []string
+	// SubjectPodObserved records whether at least one resolved subject pod was
+	// actually found in the namespace listing. When false, the Subject* fields
+	// are empty because no subject pod was inspected, not because the subject
+	// was healthy; the renderer must say so rather than emit a health negative
+	// scoped to a subject it never saw (issue #136 review).
+	SubjectPodObserved bool
 	// SubjectRestarts and ContextRestarts split RecentRestarts the same way.
 	SubjectRestarts []string
 	ContextRestarts []string
@@ -580,6 +586,13 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				OwnerRefs:   p.Metadata.OwnerReferences,
 			})
 			key := p.Metadata.Namespace + "/" + p.Metadata.Name
+			// Record that a resolved subject was actually seen, before the
+			// Succeeded skip: a completed one-shot pod is still a subject we
+			// inspected, and its absence from the Subject* findings is then a
+			// true negative rather than "nothing was looked at".
+			if targetPods[key] {
+				e.SubjectPodObserved = true
+			}
 			if p.Status.Phase == "Succeeded" {
 				// A completed one-shot job: its container's terminated state is
 				// a clean exit, not failure evidence, so neither a diagnostic

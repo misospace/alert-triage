@@ -19,12 +19,17 @@ type Report struct {
 	PriorSeen  int
 	Narrative  string
 	Triage     Triage
-	Metrics    []string // compact metric summaries from Prometheus backend
-	// MetricsScoped records whether the metrics query was bounded to a
-	// resolved subject pod. When false, the lines are namespace-wide and the
-	// renderer must present them as context, never as subject-scoped evidence
-	// (issue #136 review).
-	MetricsScoped bool
+	// SubjectMetrics are metric summaries whose query was explicitly bounded to
+	// the resolved subject pod (the fixed context metrics, when a pod label was
+	// available). They render in DIRECT SUBJECT EVIDENCE. Alert-rule expression
+	// results are never placed here: the expression is replayed as written and
+	// may aggregate more than the subject (issue #136 review).
+	SubjectMetrics []string
+	// ContextMetrics are metric summaries that may span the namespace or
+	// cluster: alert-rule expression results and fixed context metrics without
+	// a pod label. They render in CONTEXT / BACKGROUND, never as subject
+	// evidence.
+	ContextMetrics []string
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -389,18 +394,31 @@ func renderEvidence(r Report) string {
 	// Only pods that are a resolved alert subject are direct evidence. The
 	// namespace-wide remainder of the same scan renders under CONTEXT, so an
 	// unrelated crashing pod in the same namespace cannot be promoted into the
-	// subject's tier (issue #136 review).
-	writeFinding(&b, "Unhealthy pods", r.Enrichment.SubjectPods, "no unhealthy pods on the alert's subjects")
-	if len(r.Enrichment.SubjectRestarts) > 0 {
-		writeFinding(&b, "Recent restarts", r.Enrichment.SubjectRestarts, "")
+	// subject's tier. When no subject pod was observed at all, a scoped health
+	// negative would falsely imply we inspected it, so say that plainly
+	// instead (issue #136 review).
+	subjectObserved := r.Enrichment.SubjectPodObserved ||
+		len(r.Enrichment.SubjectPods) > 0 ||
+		len(r.Enrichment.SubjectContainerDiagnostics) > 0 ||
+		len(r.Enrichment.SubjectContainerTerminationMessages) > 0 ||
+		len(r.Enrichment.SubjectPodLogs) > 0
+	if subjectObserved {
+		writeFinding(&b, "Unhealthy pods", r.Enrichment.SubjectPods, "no unhealthy pods on the alert's subjects")
+		if len(r.Enrichment.SubjectRestarts) > 0 {
+			writeFinding(&b, "Recent restarts", r.Enrichment.SubjectRestarts, "")
+		}
+		// The structured reading (exit code, reason, finish time) is this
+		// service's own, so it stays outside the fence, like pod phases. The
+		// container's own termination message is quoted separately, inside the
+		// fence, like event text — the split the issue #128 review asked for.
+		writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
+		writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
+		writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
+	} else {
+		// No subject pod resolved or seen: report the absence of an
+		// inspection, not a clean bill of health.
+		b.WriteString("\nNo subject pod was observed for this alert, so there is no subject pod state, container reading or log to report; any namespace pod scan is shown under CONTEXT.\n")
 	}
-	// The structured reading (exit code, reason, finish time) is this
-	// service's own, so it stays outside the fence, like pod phases. The
-	// container's own termination message is quoted separately, inside the
-	// fence, like event text — the split the issue #128 review asked for.
-	writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
-	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
-	writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
 	// Log-backend lines are workload-authored as well. Keep the state finding
 	// outside the fence, but fence the lines and never treat them as API fact.
 	switch r.Enrichment.BackendState {
@@ -438,10 +456,10 @@ func renderEvidence(r Report) string {
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
-	if r.MetricsScoped && len(r.Metrics) > 0 {
+	if len(r.SubjectMetrics) > 0 {
 		b.WriteString("\nMETRICS (queried from metrics backend for the resolved subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
-		for _, line := range r.Metrics {
+		for _, line := range r.SubjectMetrics {
 			fmt.Fprintf(&b, "- %s\n", untrusted(line))
 		}
 		b.WriteString(untrustedEnd + "\n")
@@ -456,13 +474,13 @@ func renderEvidence(r Report) string {
 	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics, "no other terminated containers in the namespace")
 	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages, "no other terminated containers left a message")
 	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
-	// Metrics are only subject-scoped when the query carried a resolved pod
-	// label; otherwise they were namespace-wide and must not be described as
-	// evidence about the subject (issue #136 review).
-	if !r.MetricsScoped && len(r.Metrics) > 0 {
-		b.WriteString("\nMETRICS (queried from metrics backend for the namespace, not necessarily the subject; untrusted label values):\n")
+	// Metric scope is per source: alert-rule expression results and fixed
+	// metrics without a pod label may span the namespace or cluster, so they
+	// render as context and are never described as evidence about the subject.
+	if len(r.ContextMetrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the namespace or alert rule, not necessarily the subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
-		for _, line := range r.Metrics {
+		for _, line := range r.ContextMetrics {
 			fmt.Fprintf(&b, "- %s\n", untrusted(line))
 		}
 		b.WriteString(untrustedEnd + "\n")

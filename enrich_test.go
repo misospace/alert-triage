@@ -1487,6 +1487,44 @@ func TestEnrichSubjectPodProvenanceExcludesUnrelatedNoise(t *testing.T) {
 	}
 }
 
+// TestEnrichAbsentSubjectPodNotObserved covers the other half of the review:
+// an alert names a pod that is absent from the namespace listing. Nothing was
+// inspected, so SubjectPodObserved must stay false and the renderer must say
+// so rather than report the missing pod as healthy.
+func TestEnrichAbsentSubjectPodNotObserved(t *testing.T) {
+	pods := `{"items":[
+		{"metadata":{"name":"other","namespace":"ns1"},
+			"status":{"phase":"Failed",
+				"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+					"state":{"error":{"reason":"Error"}}}]}}
+	]}`
+	srv := jobAPIHarness(t, pods, nil)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "ghost",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.SubjectPodObserved {
+		t.Errorf("absent subject pod must not be recorded as observed")
+	}
+	if len(en.SubjectPods) != 0 {
+		t.Errorf("absent subject must yield no subject pods, got %v", en.SubjectPods)
+	}
+	if !podInList(t, en.ContextPods, "ns1/other") {
+		t.Errorf("unrelated namespace pod should be context, got %v", en.ContextPods)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "No subject pod was observed for this alert") {
+		t.Errorf("renderer should report the missing subject, not a health negative:\n%s", got)
+	}
+}
+
 // TestEnrichJobFailedMissingJob covers a job that is gone (404): enrichment
 // must degrade gracefully — no job in InspectedJobs, no job in the scope
 // string — and must still ship the namespace listing it gathered.

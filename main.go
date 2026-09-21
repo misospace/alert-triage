@@ -542,11 +542,12 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	for i, g := range groups {
 		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg, gh)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
-			// Provenance for the renderer: only a resolved pod label bounds
-			// the fixed context metrics to the subject. Without it the lines
-			// are namespace-wide and belong in the context tier.
-			r.MetricsScoped = g.Label("pod") != ""
+			metrics := prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
+			// Scope is per metric source: only the fixed context metrics can be
+			// pod-bounded, so only they may reach the direct tier. The alert-rule
+			// expression results stay context.
+			r.SubjectMetrics = metrics.Subject
+			r.ContextMetrics = metrics.Context
 		}
 		// Count prior sightings (for the "seen N time(s) recently" footer)
 		// but do NOT record this fire yet: history is only written after
