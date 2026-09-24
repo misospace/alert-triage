@@ -341,6 +341,22 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
 		}
 	}
+	// The topology heading and framing are this service's own reading and stay
+	// outside the fence; the record lines are quoted from cluster objects
+	// (spec.path, spec.components, sourceRef, dependsOn), so they must sit
+	// INSIDE the untrusted fence, not merely pass through untrusted(): the
+	// prompt treats only text between the markers as quoted data that is never
+	// an instruction, and a single-line value with no newline or dash run
+	// survives untrusted() verbatim (issue #134 review, mirrors the commit
+	// message fix).
+	if len(r.Enrichment.KustomizationTopology) > 0 {
+		b.WriteString("KustomizationTopology:\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, rec := range r.Enrichment.KustomizationTopology {
+			fmt.Fprintf(&b, "- %s\n", untrusted(rec))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
 	// Commit relevance is this service's own finding (we fetched the
 	// commit), so the State, path, and revision sit outside the untrusted
 	// fence. The commit message and the file names — written by whoever
@@ -789,6 +805,15 @@ func discordDescription(cfg *Config, r Report) string {
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
+	// The topology records are quoted from cluster objects, so they get the
+	// same untrusted inert-rendering the prompt path (renderEvidence) already
+	// applies: a hostile record must be inert on both render paths, not just
+	// the prompt, or an embedded newline/`---` run forges a new section here.
+	topo := make([]string, len(r.Enrichment.KustomizationTopology))
+	for i, rec := range r.Enrichment.KustomizationTopology {
+		topo[i] = untrusted(rec)
+	}
+	writeDiscordSection(&desc, "Kustomization topology", topo)
 	// Commit relevance for GitHub-backed workloads: an explicit "does not
 	// touch" is the most useful line here, since it tells the model the
 	// observed revision is not a deploy candidate. "touches" is also
