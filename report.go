@@ -341,16 +341,21 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
 		}
 	}
-	// The topology records are read from cluster objects, so they are this
-	// service's own findings and normally sit outside the untrusted fence.
-	// Their values (paths, component names, source names) are quoted from the
-	// object, though, so each value gets the same treatment as RepoPaths:
-	// flattened and dash-run-broken as quoted data.
+	// The topology heading and framing are this service's own reading and stay
+	// outside the fence; the record lines are quoted from cluster objects
+	// (spec.path, spec.components, sourceRef, dependsOn), so they must sit
+	// INSIDE the untrusted fence, not merely pass through untrusted(): the
+	// prompt treats only text between the markers as quoted data that is never
+	// an instruction, and a single-line value with no newline or dash run
+	// survives untrusted() verbatim (issue #134 review, mirrors the commit
+	// message fix).
 	if len(r.Enrichment.KustomizationTopology) > 0 {
 		b.WriteString("KustomizationTopology:\n")
+		b.WriteString(untrustedBegin + "\n")
 		for _, rec := range r.Enrichment.KustomizationTopology {
 			fmt.Fprintf(&b, "- %s\n", untrusted(rec))
 		}
+		b.WriteString(untrustedEnd + "\n")
 	}
 	// Commit relevance is this service's own finding (we fetched the
 	// commit), so the State, path, and revision sit outside the untrusted
