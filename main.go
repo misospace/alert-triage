@@ -538,10 +538,16 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	}
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
+	gh := newGitHub(cfg)
 	for i, g := range groups {
-		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg)}
+		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg, gh)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
+			metrics := prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
+			// Scope is per metric source: only the fixed context metrics can be
+			// pod-bounded, so only they may reach the direct tier. The alert-rule
+			// expression results stay context.
+			r.SubjectMetrics = metrics.Subject
+			r.ContextMetrics = metrics.Context
 		}
 		// Count prior sightings (for the "seen N time(s) recently" footer)
 		// but do NOT record this fire yet: history is only written after

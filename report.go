@@ -19,7 +19,17 @@ type Report struct {
 	PriorSeen  int
 	Narrative  string
 	Triage     Triage
-	Metrics    []string // compact metric summaries from Prometheus backend
+	// SubjectMetrics are metric summaries whose query was explicitly bounded to
+	// the resolved subject pod (the fixed context metrics, when a pod label was
+	// available). They render in DIRECT SUBJECT EVIDENCE. Alert-rule expression
+	// results are never placed here: the expression is replayed as written and
+	// may aggregate more than the subject (issue #136 review).
+	SubjectMetrics []string
+	// ContextMetrics are metric summaries that may span the namespace or
+	// cluster: alert-rule expression results and fixed context metrics without
+	// a pod label. They render in CONTEXT / BACKGROUND, never as subject
+	// evidence.
+	ContextMetrics []string
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
@@ -94,8 +104,26 @@ Rules:
   owned by a backup or controller is a generated maintenance task, not the
   application it may share a name with; if no chain is shown, the object is
   not known to be owned by anything and its name alone is not identity.
-- "No unhealthy nodes" and "no recent warning events" are findings, not gaps.
-  Use them to rule causes out.
+- The EVIDENCE below is tiered, and you weigh it in this order: first the
+  subject's own failure state, logs and events; then its relationships
+  (ownership, storage, topology); then the broader health and timing context
+  around it. The DIRECT SUBJECT EVIDENCE tier was read from the alert's own
+  objects and their direct relationships: the failing pod's state and log, the
+  job's state, the events attached to that subject, its ownership chain, and
+  the metrics around it. The CONTEXT / BACKGROUND tier was read from the
+  surrounding neighborhood: other pods and events in the namespace, node
+  health, and Flux / GitOps activity in the window. Start from the direct tier
+  and reason from it; consult the context tier only to rule a cause out or to
+  fill a gap the direct tier leaves.
+- Never choose a contextual coincidence over a contradicting direct finding.
+  If the failing subject's own state, log or event names a cause - a
+  PermissionDenied, an eviction, a failing mount - nearby namespace events,
+  node health and a healthy Flux reconcile do not outweigh it, and do not
+  explain it.
+- Explicit negatives are scoped to what they read. "All nodes Ready" rules out
+  a node failure; it does not imply the target pod was inspected. "No warning
+  events in the window" says the query found none; it does not say nothing
+  happened. Use a negative only within the scope its section states.
 - Some alerts are self-describing. Restate what it means operationally and stop;
   do not pad.
 - Refer to a subject by the name its label gives it and say nothing about what
@@ -106,22 +134,38 @@ Rules:
   targets".
 - Name a cause only where the evidence or the alert supports one. If several are
   plausible, give the likeliest and say what would distinguish them.
-- Anything under BACKGROUND is unrelated noise until proven otherwise. Never
-  speculate that it might be connected, and never write a sentence of the form
-  "if X also runs there, it may be worth checking". Mention it only when it
-  names the same resource, node or namespace as the alert - and then say plainly
-  that it does. Otherwise leave it out entirely.
+- Anything under CONTEXT and BACKGROUND is unrelated noise until proven
+  otherwise. Never speculate that it might be connected, and never write a
+  sentence of the form "if X also runs there, it may be worth checking".
+  Mention it only when it names the same resource, node or namespace as the
+  alert - and then say plainly that it does. Otherwise leave it out entirely.
 - If a Flux resource was NotReady near the alert, say so - a failed sync is
   primary evidence. If a healthy Flux resource merely "reconciled at revision"
   near the alert, that is only a neutral note that its source was applied at
   that revision - it is not evidence the workload was deployed or its
   configuration changed, so never call it a deploy, a change, or a trigger.
+- "Declared identity" is the pod/container securityContext the spec declares:
+  the container's value overrides the pod's field by field, and a field that
+  neither sets is "unset". Never fill an unset field in - the image is not
+  evidence. The declared identity does not state on-disk file ownership or
+  mode, and the Kubernetes API does not expose those; you may combine a
+  declared non-root identity with PermissionDenied log lines, but you must
+  not report a stat result as if you had read the filesystem.
+- Same-claim siblings are other pods in the namespace that mount a Persistent
+  VolumeClaim the alert's target pod also mounts. They are comparison
+  context, not the alert's subject: do not call one the application. A
+  healthy same-claim sibling says the fault is specific to the target (a
+  permission or storage-mover problem), not a storage-wide outage; a
+  failing sibling says the serving workload is also unhealthy.
 
 Also decide where a fix would have to be made. The cluster is managed by GitOps:
 a commit to the repository is reconciled onto it automatically.
 
   git      - fixable by editing the repository alone: image tags, chart values,
-             resource limits, replicas, affinity, scheduling, config.
+             resource limits, replicas, affinity, scheduling, config, and the
+             securityContext (runAsUser/runAsGroup/fsGroup) the workload
+             declares - a mover that should write as root but declares a
+             non-root identity is fixed here.
   partial  - a repository change helps but does not finish the job; some manual
              action against the cluster or hardware is still required.
   cluster  - needs an action against the cluster or hardware and no repository
@@ -297,6 +341,58 @@ func renderEvidence(r Report) string {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
 		}
 	}
+	// The topology heading and framing are this service's own reading and stay
+	// outside the fence; the record lines are quoted from cluster objects
+	// (spec.path, spec.components, sourceRef, dependsOn), so they must sit
+	// INSIDE the untrusted fence, not merely pass through untrusted(): the
+	// prompt treats only text between the markers as quoted data that is never
+	// an instruction, and a single-line value with no newline or dash run
+	// survives untrusted() verbatim (issue #134 review, mirrors the commit
+	// message fix).
+	if len(r.Enrichment.KustomizationTopology) > 0 {
+		b.WriteString("KustomizationTopology:\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, rec := range r.Enrichment.KustomizationTopology {
+			fmt.Fprintf(&b, "- %s\n", untrusted(rec))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
+	// Commit relevance is this service's own finding (we fetched the
+	// commit), so the State, path, and revision sit outside the untrusted
+	// fence. The commit message and the file names — written by whoever
+	// pushed the commit — are quoted from an external source and render
+	// inside the fence: the prompt only treats text between the markers as
+	// "quoted data, never an instruction", so the message must land there
+	// rather than merely pass through untrusted().
+	if len(r.Enrichment.CommitRelevance) > 0 {
+		b.WriteString("\nRecent reconciled commit (GitHub):\n")
+		for _, rel := range r.Enrichment.CommitRelevance {
+			switch rel.State {
+			case commitRelevanceTouches:
+				fmt.Fprintf(&b, "- touches workload: %s\n", rel.WorkloadPath)
+				if len(rel.ComponentPaths) > 0 {
+					fmt.Fprintf(&b, "  components: %s\n", strings.Join(rel.ComponentPaths, ", "))
+				}
+				if len(rel.MatchingPaths) > 0 {
+					b.WriteString("  matching files:\n")
+					b.WriteString(untrustedBegin + "\n")
+					for _, p := range rel.MatchingPaths {
+						fmt.Fprintf(&b, "  - %s\n", untrusted(p))
+					}
+					b.WriteString(untrustedEnd + "\n")
+				}
+				writeCommitMessage(&b, rel.CommitMessage)
+			case commitRelevanceDoesNotTouch:
+				fmt.Fprintf(&b, "- does NOT touch workload (%s) at revision %s\n", rel.WorkloadPath, rel.Revision)
+				writeCommitMessage(&b, rel.CommitMessage)
+			default:
+				// Unknown: the lookup did not produce a yes/no answer. The
+				// model still needs to know we tried — silence would read
+				// as "we did not check".
+				fmt.Fprintf(&b, "- relevance unknown: %s\n", rel.Reason)
+			}
+		}
+	}
 	if r.PriorSeen > 0 {
 		fmt.Fprintf(&b, "History: this shape has fired %d time(s) recently.\n", r.PriorSeen)
 	} else {
@@ -318,46 +414,72 @@ func renderEvidence(r Report) string {
 	b.WriteString(untrustedEnd + "\n")
 
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
-	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
-	writeFinding(&b, "Unhealthy pods", r.Enrichment.UnhealthyPods, "no unhealthy pods in scope")
-	// The structured reading (exit code, reason, finish time) is this
-	// service's own, so it stays outside the fence, like pod phases. The
-	// container's own termination message is quoted separately, inside the
-	// fence, like event text — the split the issue #128 review asked for.
-	writeFinding(&b, "Container terminations", r.Enrichment.ContainerDiagnostics, "no terminated containers in scope")
-	writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.ContainerTerminationMessages, "no terminated containers left a message")
-	if len(r.Enrichment.PodLogs) > 0 {
-		b.WriteString("\nPod failure logs:\n")
-		b.WriteString(untrustedBegin + "\n")
-		for podKey, log := range r.Enrichment.PodLogs {
-			fmt.Fprintf(&b, "## %s\n", untrusted(podKey))
-			// Identify the container and stream per-entry: a one-shot
-			// Job pod is logged through the *current* stream, a
-			// CrashLoop through the *previous* one, and a multi-container
-			// pod through the container that failed. The section
-			// heading "previous container tail" used to lie about both
-			// cases (issue #128 review).
-			if p := r.Enrichment.PodLogProvenance[podKey]; p.Container != "" {
-				fmt.Fprintf(&b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
-			}
-			b.WriteString(untrusted(log) + "\n")
+	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
+	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
+	b.WriteString("above); the context tier rules causes out and fills gaps - it does not\n")
+	b.WriteString("override what the subject's own state and logs say.\n")
+	b.WriteString("\nDIRECT SUBJECT EVIDENCE (read from the alert's own objects: the failed\n")
+	b.WriteString("job and its pod, their logs and events, and the objects they own)\n")
+	if len(r.Enrichment.InspectedJobs) > 0 {
+		writeFinding(&b, "Inspected jobs", r.Enrichment.InspectedJobs, "")
+	}
+	// Only pods that are a resolved alert subject are direct evidence. The
+	// namespace-wide remainder of the same scan renders under CONTEXT, so an
+	// unrelated crashing pod in the same namespace cannot be promoted into the
+	// subject's tier. When no subject pod was observed at all, a scoped health
+	// negative would falsely imply we inspected it, so say that plainly
+	// instead (issue #136 review).
+	subjectObserved := r.Enrichment.SubjectPodObserved ||
+		len(r.Enrichment.SubjectPods) > 0 ||
+		len(r.Enrichment.SubjectContainerDiagnostics) > 0 ||
+		len(r.Enrichment.SubjectContainerTerminationMessages) > 0 ||
+		len(r.Enrichment.SubjectPodLogs) > 0
+	if subjectObserved {
+		writeFinding(&b, "Unhealthy pods", r.Enrichment.SubjectPods, "no unhealthy pods on the alert's subjects")
+		if len(r.Enrichment.SubjectRestarts) > 0 {
+			writeFinding(&b, "Recent restarts", r.Enrichment.SubjectRestarts, "")
 		}
-		b.WriteString(untrustedEnd + "\n")
+		// The structured reading (exit code, reason, finish time) is this
+		// service's own, so it stays outside the fence, like pod phases. The
+		// container's own termination message is quoted separately, inside the
+		// fence, like event text — the split the issue #128 review asked for.
+		writeFinding(&b, "Container terminations", r.Enrichment.SubjectContainerDiagnostics, "no terminated containers on the alert's subjects")
+		writeUntrustedFinding(&b, "Container termination messages", r.Enrichment.SubjectContainerTerminationMessages, "no terminated containers on the alert's subjects left a message")
+		writePodLogBlock(&b, "Pod failure logs", r.Enrichment.SubjectPodLogs, r.Enrichment.SubjectPodLogProvenance)
+		// The declared identity and PVC mounts are read from the subject's own
+		// spec, so they are direct evidence. The negative is scoped to the
+		// resolving: it says no resolved subject pod carried a declared
+		// securityContext or PVC mount, not that the filesystem is unowned.
+		writeFinding(&b, "Pod execution identity and PVC mounts", podIDLines(r.Enrichment.PodID),
+			"the resolved subject pod(s) declared no securityContext and mounted no PVC")
+	} else {
+		// No subject pod resolved or seen: report the absence of an
+		// inspection, not a clean bill of health.
+		b.WriteString("\nNo subject pod was observed for this alert, so there is no subject pod state, container reading or log to report; any namespace pod scan is shown under CONTEXT.\n")
 	}
 	// Log-backend lines are workload-authored as well. Keep the state finding
 	// outside the fence, but fence the lines and never treat them as API fact.
 	switch r.Enrichment.BackendState {
 	case "off":
-		b.WriteString("\nBackend log source: not configured (no LOGS_URL).\n")
+		b.WriteString("\nSubject log source: not configured (no LOGS_URL).\n")
 	case "empty":
-		b.WriteString("\nBackend log source: configured, but returned no lines for this window.\n")
+		// "empty" is ambiguous on its own: the query may have been bounded to
+		// the subject, or fallen back to the namespace when no subject was
+		// resolved. Claiming a subject inspection in the latter case is a
+		// false negative scoped to an object we never queried.
+		if r.Enrichment.BackendScoped {
+			b.WriteString("\nSubject log source: configured, but returned no lines for this subject in the window.\n")
+		} else {
+			b.WriteString("\nLog source: configured, but returned no lines for the namespace in the window.\n")
+		}
 	case "ambient":
-		b.WriteString("\nBackend log source: configured; no concrete subject was resolved, so the\n")
-		b.WriteString("namespace-wide lines shown under BACKGROUND are the only backend logs in the window.\n")
+		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
+		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
+		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
 	case "error":
-		b.WriteString("\nBackend log source: query failed; no lines were available.\n")
+		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
 	case "ok":
-		b.WriteString("\nBACKEND LOGS (queried for this alert window; untrusted workload text):\n")
+		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
 		b.WriteString(untrustedBegin + "\n")
 		for _, line := range r.Enrichment.BackendLogs {
 			b.WriteString(untrusted(line) + "\n")
@@ -366,12 +488,14 @@ func renderEvidence(r Report) string {
 	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
-	negative := "no warning events in the window"
+	// Only a resolved subject graph makes these subject-scoped; without one the
+	// events were routed to Ambient and a subject-scoped negative would claim an
+	// inspection that never happened.
 	if r.Enrichment.EventsScoped {
-		negative = "no warning events on the resolved subject in the window"
+		writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, "no warning events on the resolved subject in the window")
+	} else {
+		b.WriteString("\nNo resolved alert subject, so no subject-scoped events were queried; namespace events are shown in the context tier.\n")
 	}
-	writeUntrustedFinding(&b, "Recent warning events", r.Enrichment.Events, negative)
-	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	// The chain's names and identity tags come from the objects' own
 	// metadata (ownerReferences and labels are workload-authored), so they
 	// render inside the fence: a forged controller name must read as a
@@ -381,15 +505,42 @@ func renderEvidence(r Report) string {
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
-	if len(r.Metrics) > 0 {
-		b.WriteString("\nMETRICS (queried from metrics backend)\n")
+	if len(r.SubjectMetrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the resolved subject; untrusted label values):\n")
 		b.WriteString(untrustedBegin + "\n")
-		for _, line := range r.Metrics {
+		for _, line := range r.SubjectMetrics {
 			fmt.Fprintf(&b, "- %s\n", untrusted(line))
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
 
+	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
+	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
+	writeFinding(&b, "Other unhealthy pods in the namespace (context, not the alert's subject)", r.Enrichment.ContextPods, "no other unhealthy pods in the namespace")
+	if len(r.Enrichment.ContextRestarts) > 0 {
+		writeFinding(&b, "Other recent restarts in the namespace", r.Enrichment.ContextRestarts, "")
+	}
+	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics, "no other terminated containers in the namespace")
+	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages, "no other terminated containers left a message")
+	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
+	// Same-claim siblings are comparison context, never the subject: they
+	// mount a claim the subject mounts, but that relationship alone does not
+	// say what workload the claim serves.
+	writeFinding(&b, "Same-claim siblings (comparison context only)", r.Enrichment.PVCSiblings,
+		"no other pod in the namespace mounts a claim the resolved subject pod mounts")
+	// Metric scope is per source: alert-rule expression results and fixed
+	// metrics without a pod label may span the namespace or cluster, so they
+	// render as context and are never described as evidence about the subject.
+	if len(r.ContextMetrics) > 0 {
+		b.WriteString("\nMETRICS (queried from metrics backend for the namespace or alert rule, not necessarily the subject; untrusted label values):\n")
+		b.WriteString(untrustedBegin + "\n")
+		for _, line := range r.ContextMetrics {
+			fmt.Fprintf(&b, "- %s\n", untrusted(line))
+		}
+		b.WriteString(untrustedEnd + "\n")
+	}
+	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
 		b.WriteString("This is NOT known to involve the alert above. A homelab always has\n")
@@ -475,6 +626,61 @@ func writeUntrustedFinding(b *strings.Builder, title string, items []string, whe
 		fmt.Fprintf(b, "- %s\n", untrusted(s))
 	}
 	b.WriteString(untrustedEnd + "\n")
+}
+
+// writeCommitMessage quotes the reconciled commit's message. The message is
+// written by whoever pushed the commit, so it is external text and lands
+// inside the untrusted fence; the surrounding state, workload path and
+// revision are this service's own reading and stay outside. untrusted()
+// flattens line structure so the text cannot forge a section or a closing
+// marker.
+func writeCommitMessage(b *strings.Builder, message string) {
+	if message == "" {
+		return
+	}
+	b.WriteString("  message:\n")
+	b.WriteString(untrustedBegin + "\n")
+	fmt.Fprintf(b, "  %s\n", untrusted(message))
+	b.WriteString(untrustedEnd + "\n")
+}
+
+// writePodLogBlock renders a pod-log map inside the untrusted fence. The
+// provenance lookup names the container and stream per entry, so a one-shot
+// Job's current log is not silently mislabelled as a previous-container tail
+// (issue #128 review); state and headings outside the fence stay this
+// service's own reading.
+func writePodLogBlock(b *strings.Builder, title string, logs map[string]string, prov map[string]podLogProvenance) {
+	if len(logs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\n%s:\n", title)
+	b.WriteString(untrustedBegin + "\n")
+	for podKey, log := range logs {
+		fmt.Fprintf(b, "## %s\n", untrusted(podKey))
+		if p := prov[podKey]; p.Container != "" {
+			fmt.Fprintf(b, "container %s, %s stream:\n", untrusted(p.Container), untrusted(p.Stream))
+		}
+		b.WriteString(untrusted(log) + "\n")
+	}
+	b.WriteString(untrustedEnd + "\n")
+}
+
+// podIDLines returns the pod-identity lines in sorted key order so the
+// rendered evidence is deterministic across runs.
+func podIDLines(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, m[k])
+	}
+	return out
 }
 
 func orUnknown(s string) string {
@@ -566,6 +772,8 @@ func discordDescription(cfg *Config, r Report) string {
 	writeDiscordSection(&desc, "Unhealthy pods", r.Enrichment.UnhealthyPods)
 	writeDiscordSection(&desc, "Container terminations", r.Enrichment.ContainerDiagnostics)
 	writeDiscordSection(&desc, "Container termination messages", r.Enrichment.ContainerTerminationMessages)
+	writeDiscordSection(&desc, "Pod identity & PVC mounts", podIDLines(r.Enrichment.PodID))
+	writeDiscordSection(&desc, "Same-claim siblings", r.Enrichment.PVCSiblings)
 	if len(r.Enrichment.PodLogs) > 0 {
 		// Per-entry header carries the container and stream so the chat
 		// does not mislabel a one-shot Job's current log as a previous
@@ -597,6 +805,45 @@ func discordDescription(cfg *Config, r Report) string {
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
+	// The topology records are quoted from cluster objects, so they get the
+	// same untrusted inert-rendering the prompt path (renderEvidence) already
+	// applies: a hostile record must be inert on both render paths, not just
+	// the prompt, or an embedded newline/`---` run forges a new section here.
+	topo := make([]string, len(r.Enrichment.KustomizationTopology))
+	for i, rec := range r.Enrichment.KustomizationTopology {
+		topo[i] = untrusted(rec)
+	}
+	writeDiscordSection(&desc, "Kustomization topology", topo)
+	// Commit relevance for GitHub-backed workloads: an explicit "does not
+	// touch" is the most useful line here, since it tells the model the
+	// observed revision is not a deploy candidate. "touches" is also
+	// useful as the recent-change signal; "unknown" is rendered only when
+	// the lookup was attempted (some relevance evidence is always worth
+	// more than silence).
+	if len(r.Enrichment.CommitRelevance) > 0 {
+		desc.WriteString("\n**Recent reconciled commit (GitHub):**\n")
+		for _, rel := range r.Enrichment.CommitRelevance {
+			switch rel.State {
+			case commitRelevanceTouches:
+				fmt.Fprintf(&desc, "• touches `%s`", rel.WorkloadPath)
+				if len(rel.MatchingPaths) > 0 {
+					fmt.Fprintf(&desc, " — files: %s", strings.Join(rel.MatchingPaths, ", "))
+				}
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&desc, " — %s", rel.CommitMessage)
+				}
+				desc.WriteString("\n")
+			case commitRelevanceDoesNotTouch:
+				fmt.Fprintf(&desc, "• does NOT touch `%s` at revision %s", rel.WorkloadPath, rel.Revision)
+				if rel.CommitMessage != "" {
+					fmt.Fprintf(&desc, " — %s", rel.CommitMessage)
+				}
+				desc.WriteString("\n")
+			default:
+				fmt.Fprintf(&desc, "• relevance unknown: %s\n", rel.Reason)
+			}
+		}
+	}
 
 	// Grafana Explore links: own construction, so it lives outside the
 	// untrusted fence; emitted only when GRAFANA_URL and the relevant

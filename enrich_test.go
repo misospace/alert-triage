@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -356,7 +357,7 @@ func TestEnrichSkipsOnlyWhenBothClustersAreKnownAndDiffer(t *testing.T) {
 			g := Group{Key: "single/A", Cluster: tt.groupCluster, Alerts: []Alert{
 				{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
 			}}
-			got := k.Enrich(context.Background(), g, time.Minute, &Config{})
+			got := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 			skipped := strings.Contains(got.Scope, "cluster state unavailable")
 			if skipped != tt.wantSkipped {
@@ -406,7 +407,7 @@ func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, p := range en.UnhealthyPods {
 		if strings.Contains(p, "job-finished") {
@@ -600,6 +601,349 @@ func TestResolveRepoPathsEmpty(t *testing.T) {
 	if got := k.resolveRepoPaths(context.Background(), []podRef{{Annotations: map[string]string{}}}, cfg); got != nil {
 		t.Fatalf("expected nil when nothing resolves and no fallback configured, got %#v", got)
 	}
+}
+
+// fluxKustomizationAPIHarness serves one Kustomization (by name, when
+// kuzJSON is non-empty) and one GitRepository (when repoJSON is non-empty).
+// A null Kustomization simulates the object being absent.
+func fluxKustomizationAPIHarness(t *testing.T, kuzName, kuzJSON, repoJSON string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/kustomizations/") {
+			if kuzJSON == "" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, kuzJSON)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/gitrepositories/") {
+			if repoJSON == "" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, repoJSON)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+}
+
+func fluxAnnotatedPod(name, ns, kuz, kuzNs string) []podRef {
+	ann := map[string]string{"kustomize.toolkit.fluxcd.io/name": kuz}
+	if kuzNs != "" {
+		ann["kustomize.toolkit.fluxcd.io/namespace"] = kuzNs
+	}
+	return []podRef{{Name: name, Namespace: ns, Annotations: ann}}
+}
+
+// TestResolveKustomizationTopologyWithComponentsAndDependencies is the
+// motivating case: the resolved Kustomization pulls in a reusable component
+// and a dependency, so the topology record must surface all three: the
+// Kustomization name, its source/path, the component paths as declared, and
+// the dependsOn names (with any foreign namespace made explicit).
+func TestResolveKustomizationTopologyWithComponentsAndDependencies(t *testing.T) {
+	srv := fluxKustomizationAPIHarness(t, "web",
+		`{"spec":{"path":"apps/web","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"},
+		 "components":["../base/common"],
+		 "dependsOn":[{"name":"base-common"},{"name":"db","namespace":"databases"}]}}`,
+		`{"spec":{"url":"https://github.com/example/web"}}`)
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("web-0", "apps", "web", ""))
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one topology record, got %#v", got)
+	}
+	rec := got[0]
+	for _, want := range []string{
+		"kustomization apps/web (path: apps/web)",
+		"GitRepository/main (flux-system)",
+		"components: ../base/common",
+		"dependsOn: base-common, databases/db",
+	} {
+		if !strings.Contains(rec, want) {
+			t.Errorf("record missing %q: %s", want, rec)
+		}
+	}
+}
+
+// TestResolveKustomizationTopologyNoComposition covers a Kustomization with
+// no spec.components and no spec.dependsOn: both subsections render as an
+// explicit "none declared" rather than being silently dropped, and the
+// sourceRef without an explicit kind renders under its default kind.
+func TestResolveKustomizationTopologyNoComposition(t *testing.T) {
+	srv := fluxKustomizationAPIHarness(t, "bare",
+		`{"spec":{"path":"apps/bare","sourceRef":{"kind":"GitRepository","name":"main"}}}`,
+		`{"spec":{"url":"https://github.com/example/bare"}}`)
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("bare-0", "apps", "bare", ""))
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one topology record, got %#v", got)
+	}
+	rec := got[0]
+	for _, want := range []string{"kustomization apps/bare (path: apps/bare)", "components: none declared", "dependsOn: none declared"} {
+		if !strings.Contains(rec, want) {
+			t.Errorf("record missing %q: %s", want, rec)
+		}
+	}
+}
+
+// TestResolveKustomizationTopologyFailedLookup is the lookup-failure case:
+// the pod carries the Flux annotations but the Kustomization does not exist
+// (404). The function must return no record at all — not a record with "none"
+// subsections, which would claim the spec was read and found nothing.
+func TestResolveKustomizationTopologyFailedLookup(t *testing.T) {
+	srv := fluxKustomizationAPIHarness(t, "ghost", "", "")
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p", "ns", "ghost", ""))
+	if len(got) != 0 {
+		t.Fatalf("expected no topology record when the Kustomization is missing, got %#v", got)
+	}
+}
+
+// TestResolveKustomizationTopologyScopedToResolvedWorkload asserts the record
+// follows the pod's own Kustomization annotation: other Kustomizations in the
+// namespace are never read, and two pods resolving to the same Kustomization
+// yield one record, not two.
+func TestResolveKustomizationTopologyScopedToResolvedWorkload(t *testing.T) {
+	var kuzGets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/kustomizations/") {
+			name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			kuzGets = append(kuzGets, name)
+			if name == "web" {
+				_, _ = io.WriteString(w, `{"spec":{"path":"apps/web","sourceRef":{"kind":"GitRepository","name":"main"}},"components":null,"dependsOn":null}`)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/gitrepositories/") {
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/web"}}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{
+		{Name: "web-0", Namespace: "apps", Annotations: map[string]string{"kustomize.toolkit.fluxcd.io/name": "web"}},
+		// A second pod resolving to the same Kustomization.
+		{Name: "web-1", Namespace: "apps", Annotations: map[string]string{"kustomize.toolkit.fluxcd.io/name": "web"}},
+		// A third pod whose annotations name a Kustomization that does not
+		// exist in the cluster.
+		{Name: "stray", Namespace: "apps", Annotations: map[string]string{"kustomize.toolkit.fluxcd.io/name": "unrelated"}},
+	}
+	got := k.resolveKustomizationTopology(context.Background(), pods)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one record (deduped), got %#v", got)
+	}
+	if !strings.Contains(got[0], "kustomization apps/web") {
+		t.Fatalf("record must be for the resolved Kustomization, got %q", got[0])
+	}
+	// Only the Kustomizations the pods actually resolved to may be read,
+	// and at most once each (deduped): two pods resolving to "web" cost
+	// one GET, and "unrelated" costs the single failed GET it always will.
+	counts := map[string]int{}
+	for _, n := range kuzGets {
+		counts[n]++
+	}
+	if len(kuzGets) != 2 || counts["web"] != 1 || counts["unrelated"] != 1 {
+		t.Fatalf("kustomization GETs = %v, want web=1 and unrelated=1", kuzGets)
+	}
+}
+
+// TestResolveKustomizationTopologyOciComponent covers a component that is not
+// a relative path: the value is quoted as-is under its own label, so the
+// record never presents it as a path this service resolved or read.
+func TestResolveKustomizationTopologyOciComponent(t *testing.T) {
+	srv := fluxKustomizationAPIHarness(t, "oci",
+		`{"spec":{"path":"apps/oci","sourceRef":{"kind":"GitRepository","name":"main"},"components":["oci://registry.example.com/base"]}}`,
+		`{"spec":{"url":"https://github.com/example/oci"}}`)
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("oci-0", "apps", "oci", ""))
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one topology record, got %#v", got)
+	}
+	if !strings.Contains(got[0], "components: oci://registry.example.com/base") {
+		t.Errorf("component must be rendered verbatim under its own label: %s", got[0])
+	}
+}
+
+// TestResolveKustomizationTopologyRejectsUnsafePaths asserts sanitiser
+// parity with resolveRepoPaths: the same class of value (a path-like field
+// quoted from a cluster object) is dropped on the same hostile character set
+// — NUL, backslash, percent — the survivors render verbatim, and the record
+// is flattened and fence-inert at construction. Unlike resolveRepoPaths, no
+// path.Clean runs here, so a legitimate `..` segment in a surviving
+// component is preserved.
+func TestResolveKustomizationTopologyRejectsUnsafePaths(t *testing.T) {
+	// The JSON is a raw string so the hostile bytes arrive through JSON
+	// escapes: \u0000 decodes to NUL, \\ to a single backslash, % is
+	// literal.
+	srv := fluxKustomizationAPIHarness(t, "web",
+		`{"spec":{"path":"apps\\web","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"},
+		 "components":["../base/common","pods\u0000evil","pods\\..\\..","pods%2F..%2F"],
+		 "dependsOn":[{"name":"base-common"},{"name":"evil\\name","namespace":"apps"}]}}`,
+		`{"spec":{"url":"https://github.com/example/web"}}`)
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("web-0", "apps", "web", ""))
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one topology record, got %#v", got)
+	}
+	rec := got[0]
+	// (b) The safe values survive verbatim, including the `..` segment a
+	// path.Clean (deliberately not applied here) would have collapsed.
+	for _, want := range []string{
+		"components: ../base/common",
+		"dependsOn: base-common",
+	} {
+		if !strings.Contains(rec, want) {
+			t.Errorf("record missing %q: %s", want, rec)
+		}
+	}
+	// (c) The unsafe spec.path renders an explicit refused marker instead of
+	// vanishing: a refused path must not read as an absent one, and the
+	// hostile value itself must not appear.
+	if !strings.Contains(rec, "(path: refused)") {
+		t.Errorf("refused spec.path must render a refused marker: %s", rec)
+	}
+	if strings.Contains(rec, `apps\web`) {
+		t.Errorf("unsafe spec.path value leaked into the record: %s", rec)
+	}
+	// (c,d) Every hostile byte class, the percent-encoding forms
+	// (case-insensitive), a newline, and a triple-dash run are absent.
+	for _, hostile := range []string{"\x00", `\`, "\n", "---"} {
+		if strings.Contains(rec, hostile) {
+			t.Errorf("record carries hostile value %q: %s", hostile, rec)
+		}
+	}
+	if lower := strings.ToLower(rec); strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") {
+		t.Errorf("percent-encoded traversal survived: %s", rec)
+	}
+	if strings.Contains(rec, "pods") {
+		t.Errorf("unsafe component values leaked into the record: %s", rec)
+	}
+	if strings.Contains(rec, "evil") {
+		t.Errorf("unsafe dependency name leaked into the record: %s", rec)
+	}
+}
+
+// TestResolveKustomizationTopologyNoneSafeVersusNoneDeclared pins the
+// explicit negative: a subsection whose declared values were all refused
+// reads "none safe", while an empty spec reads "none declared" — two
+// different findings that a shared "none" would collapse.
+func TestResolveKustomizationTopologyNoneSafeVersusNoneDeclared(t *testing.T) {
+	run := func(t *testing.T, kuzJSON string) string {
+		t.Helper()
+		srv := fluxKustomizationAPIHarness(t, "kuz", kuzJSON,
+			`{"spec":{"url":"https://github.com/example/kuz"}}`)
+		defer srv.Close()
+
+		k := &kube{hc: srv.Client(), base: srv.URL}
+		got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p-0", "apps", "kuz", ""))
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one topology record, got %#v", got)
+		}
+		return got[0]
+	}
+	t.Run("all components unsafe", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"},
+			"components":["pods\u0000evil","pods\\..\\..","pods%2F..%2F"]}}`)
+		if !strings.Contains(rec, "components: none safe") {
+			t.Errorf("record must say none safe when every component was refused: %s", rec)
+		}
+		if strings.Contains(rec, "components: none declared") {
+			t.Errorf("refused components must not read as undeclared: %s", rec)
+		}
+	})
+	t.Run("none declared", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"}}}`)
+		if !strings.Contains(rec, "components: none declared") {
+			t.Errorf("record must say none declared for an empty components list: %s", rec)
+		}
+		if strings.Contains(rec, "components: none safe") {
+			t.Errorf("an empty spec must not read as refused: %s", rec)
+		}
+	})
+	t.Run("all dependencies unsafe", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"},
+			"dependsOn":[{"name":"evil\\name"},{"name":"ok","namespace":"bad\\ns"}]}}`)
+		if !strings.Contains(rec, "dependsOn: none safe") {
+			t.Errorf("record must say none safe when every dependency was refused: %s", rec)
+		}
+		if strings.Contains(rec, "dependsOn: none declared") {
+			t.Errorf("refused dependencies must not read as undeclared: %s", rec)
+		}
+	})
+}
+
+// TestResolveKustomizationTopologyRefusedSingularFields pins the singular
+// half of the refused-value rule: a sourceRef name or a spec.path that
+// fails the safe() check renders an explicit "refused" marker in its
+// fragment, so a refused value is never indistinguishable from an absent
+// one — the same distinction the list subsections already make with
+// "none safe". A safe value keeps its exact composed fragment.
+func TestResolveKustomizationTopologyRefusedSingularFields(t *testing.T) {
+	run := func(t *testing.T, kuzJSON string) string {
+		t.Helper()
+		srv := fluxKustomizationAPIHarness(t, "kuz", kuzJSON,
+			`{"spec":{"url":"https://github.com/example/kuz"}}`)
+		defer srv.Close()
+
+		k := &kube{hc: srv.Client(), base: srv.URL}
+		got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p-0", "apps", "kuz", ""))
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one topology record, got %#v", got)
+		}
+		return got[0]
+	}
+	// The JSON is a raw string so the hostile bytes arrive through JSON
+	// escapes: \u0000 decodes to NUL, \\ to a single backslash.
+	t.Run("refused sourceRef name", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main\u0000evil"}}}`)
+		if !strings.Contains(rec, "source: refused") {
+			t.Errorf("refused sourceRef name must render source: refused: %s", rec)
+		}
+		if strings.Contains(rec, "main") {
+			t.Errorf("refused sourceRef name leaked into the record: %s", rec)
+		}
+		if strings.Contains(rec, "GitRepository/main") {
+			t.Errorf("refused sourceRef must not compose a source fragment: %s", rec)
+		}
+		if strings.Contains(rec, "\x00") {
+			t.Errorf("record carries a NUL byte: %s", rec)
+		}
+	})
+	t.Run("refused spec.path", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps\\web","sourceRef":{"kind":"GitRepository","name":"main"}}}`)
+		if !strings.Contains(rec, "(path: refused)") {
+			t.Errorf("refused spec.path must render (path: refused): %s", rec)
+		}
+		if strings.Contains(rec, `apps\web`) {
+			t.Errorf("refused spec.path value leaked into the record: %s", rec)
+		}
+	})
+	t.Run("safe values render verbatim", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"}}}`)
+		for _, want := range []string{"(path: apps/kuz)", "source: GitRepository/main (flux-system)"} {
+			if !strings.Contains(rec, want) {
+				t.Errorf("record missing %q: %s", want, rec)
+			}
+		}
+	})
 }
 
 // TestResolveNodesPodLabelNoNodeLabel forces the pods-list lookup branch
@@ -1053,7 +1397,7 @@ func TestEnrichConcurrentCallersDoNotRace(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			_ = k.Enrich(context.Background(), mkGroup(), time.Minute, &Config{PodLogConcurrency: 4})
+			_ = k.Enrich(context.Background(), mkGroup(), time.Minute, &Config{PodLogConcurrency: 4}, nil)
 		}()
 	}
 	deadline := time.After(10 * time.Second)
@@ -1198,7 +1542,7 @@ func TestEnrichmentFluxActivityNotChanges(t *testing.T) {
 		Namespaces: []string{"llm"},
 		Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "llm"}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if len(en.FluxActivity) == 0 {
 		t.Fatalf("expected a FluxActivity entry, got %+v", en)
 	}
@@ -1293,7 +1637,7 @@ func TestEnrichJobFailedResolvesOwnedPod(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	// The job is represented in enrichment scope.
 	if len(en.InspectedJobs) != 1 || en.InspectedJobs[0] != "ns1/backup" {
@@ -1343,7 +1687,7 @@ func TestEnrichJobFailedMultipleOwnedPods(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if !podInList(t, en.UnhealthyPods, "ns1/backup-0") {
 		t.Errorf("owned pod ns1/backup-0 missing: %v", en.UnhealthyPods)
@@ -1385,7 +1729,7 @@ func TestEnrichJobFailedUnrelatedPod(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	iOwned, iNoisy := -1, -1
 	for i, p := range en.UnhealthyPods {
@@ -1401,6 +1745,127 @@ func TestEnrichJobFailedUnrelatedPod(t *testing.T) {
 	}
 	if iOwned > iNoisy {
 		t.Errorf("job-owned pod must come before the unrelated pod (iOwned=%d, iNoisy=%d): %v", iOwned, iNoisy, en.UnhealthyPods)
+	}
+}
+
+// TestEnrichSubjectPodProvenanceExcludesUnrelatedNoise is the issue #136
+// review regression. A resolved subject pod (here the Job-owned backup-0) and
+// an unrelated failing pod can both be in the namespace scan. Only the
+// subject's state, diagnostics and termination message may be classified as
+// direct evidence; the unrelated pod must stay in the context tier, or the
+// renderer promotes namespace noise into a tier the prompt says was read from
+// the alert's own object.
+func TestEnrichSubjectPodProvenanceExcludesUnrelatedNoise(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"terminated":{"exitCode":1,"reason":"Error","message":"owned failure"}}}]}},
+			{"metadata":{"name":"noisy","namespace":"ns1",
+				"ownerReferences":[{"kind":"DaemonSet","name":"ds-0","uid":"ds-1"}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+						"state":{"terminated":{"exitCode":1,"reason":"Error","message":"noise failure"}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if !podInList(t, en.SubjectPods, "ns1/backup-0") {
+		t.Errorf("job-owned pod missing from SubjectPods: %v", en.SubjectPods)
+	}
+	if podInList(t, en.SubjectPods, "ns1/noisy") {
+		t.Errorf("unrelated pod promoted to SubjectPods: %v", en.SubjectPods)
+	}
+	if !podInList(t, en.ContextPods, "ns1/noisy") {
+		t.Errorf("unrelated pod missing from ContextPods: %v", en.ContextPods)
+	}
+	if podInList(t, en.ContextPods, "ns1/backup-0") {
+		t.Errorf("subject pod leaked into ContextPods: %v", en.ContextPods)
+	}
+	if !podInList(t, en.SubjectContainerDiagnostics, "ns1/backup-0") || podInList(t, en.SubjectContainerDiagnostics, "ns1/noisy") {
+		t.Errorf("SubjectContainerDiagnostics = %v, want only ns1/backup-0", en.SubjectContainerDiagnostics)
+	}
+	if !podInList(t, en.ContextContainerDiagnostics, "ns1/noisy") || podInList(t, en.ContextContainerDiagnostics, "ns1/backup-0") {
+		t.Errorf("ContextContainerDiagnostics = %v, want only ns1/noisy", en.ContextContainerDiagnostics)
+	}
+	if !podInList(t, en.SubjectContainerTerminationMessages, "owned failure") || podInList(t, en.SubjectContainerTerminationMessages, "noise failure") {
+		t.Errorf("SubjectContainerTerminationMessages = %v, want only the subject message", en.SubjectContainerTerminationMessages)
+	}
+	if !podInList(t, en.ContextContainerTerminationMessages, "noise failure") || podInList(t, en.ContextContainerTerminationMessages, "owned failure") {
+		t.Errorf("ContextContainerTerminationMessages = %v, want only the unrelated message", en.ContextContainerTerminationMessages)
+	}
+
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
+	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
+	if directIdx < 0 || contextIdx < 0 || directIdx > contextIdx {
+		t.Fatalf("missing or misordered tier headings:\n%s", got)
+	}
+	if i := strings.Index(got, "owned failure"); i < directIdx || i > contextIdx {
+		t.Errorf("subject termination message at %d must sit in DIRECT [%d, %d]:\n%s", i, directIdx, contextIdx, got)
+	}
+	ni := strings.Index(got, "noise failure")
+	if ni < 0 {
+		t.Fatalf("unrelated message not rendered at all:\n%s", got)
+	}
+	if ni < contextIdx {
+		t.Errorf("unrelated termination message at %d must not appear in DIRECT (context starts at %d):\n%s", ni, contextIdx, got)
+	}
+	if i := strings.Index(got, "ns1/noisy"); i >= 0 && i < contextIdx {
+		t.Errorf("unrelated pod at %d appeared before the context tier (%d):\n%s", i, contextIdx, got)
+	}
+}
+
+// TestEnrichAbsentSubjectPodNotObserved covers the other half of the review:
+// an alert names a pod that is absent from the namespace listing. Nothing was
+// inspected, so SubjectPodObserved must stay false and the renderer must say
+// so rather than report the missing pod as healthy.
+func TestEnrichAbsentSubjectPodNotObserved(t *testing.T) {
+	pods := `{"items":[
+		{"metadata":{"name":"other","namespace":"ns1"},
+			"status":{"phase":"Failed",
+				"containerStatuses":[{"name":"c","ready":false,"restartCount":0,
+					"state":{"error":{"reason":"Error"}}}]}}
+	]}`
+	srv := jobAPIHarness(t, pods, nil)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "ghost",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.SubjectPodObserved {
+		t.Errorf("absent subject pod must not be recorded as observed")
+	}
+	if len(en.SubjectPods) != 0 {
+		t.Errorf("absent subject must yield no subject pods, got %v", en.SubjectPods)
+	}
+	if !podInList(t, en.ContextPods, "ns1/other") {
+		t.Errorf("unrelated namespace pod should be context, got %v", en.ContextPods)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "No subject pod was observed for this alert") {
+		t.Errorf("renderer should report the missing subject, not a health negative:\n%s", got)
 	}
 }
 
@@ -1427,7 +1892,7 @@ func TestEnrichJobFailedMissingJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.InspectedJobs) != 0 {
 		t.Fatalf("missing job should not be recorded as inspected, got %v", en.InspectedJobs)
@@ -1482,7 +1947,7 @@ func TestEnrichPodLabelUnchanged(t *testing.T) {
 			"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "web-0",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if jobHits != 0 {
 		t.Fatalf("a pod-labelled alert with no job_name must not fetch any job, got %d job hit(s)", jobHits)
@@ -1541,7 +2006,7 @@ func TestEnrichJobFailedMultipleJobs(t *testing.T) {
 			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.InspectedJobs) != 2 || en.InspectedJobs[0] != "ns1/a" || en.InspectedJobs[1] != "ns1/b" {
 		t.Fatalf("InspectedJobs not sorted, got %v", en.InspectedJobs)
@@ -1575,7 +2040,7 @@ func TestEnrichJobFailedMultipleJobsOwnership(t *testing.T) {
 		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "a"}},
 		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "b"}},
 	}}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, want := range []string{
 		"Job/ns1/a -> Backup/nightly-a",
@@ -1659,7 +2124,7 @@ func TestEnrichJobFailedControllerOwnedJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.Ownership) != 2 {
 		t.Fatalf("Ownership = %v, want 2 entries (job and its pod)", en.Ownership)
@@ -1704,7 +2169,7 @@ func TestEnrichJobFailedOwnerlessJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.Ownership) != 2 {
 		t.Fatalf("Ownership = %v, want 2 entries", en.Ownership)
@@ -1754,7 +2219,7 @@ func TestEnrichJobFailedPodOwnedByResolvedJob(t *testing.T) {
 			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
 		}}},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	for _, s := range en.Ownership {
 		if strings.Contains(s, "Pod/ns1/other-0") {
@@ -1896,7 +2361,7 @@ func TestEnrichScopesResolvedJobAndOwnedPodEvents(t *testing.T) {
 			{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	if !en.EventsScoped {
 		t.Fatal("resolved job should scope events")
@@ -1938,7 +2403,7 @@ func TestEnrichNoSubjectEventsAreAmbient(t *testing.T) {
 
 	k := &kube{base: srv.URL, hc: srv.Client()}
 	g := Group{Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}}}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if en.EventsScoped || len(en.Events) != 0 {
 		t.Fatalf("no resolved subject must not have primary events: scoped=%v events=%v", en.EventsScoped, en.Events)
 	}
@@ -1995,7 +2460,7 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.BackendLogs) != 0 {
 		t.Fatalf("namespace-wide logs must not enter primary evidence without a subject, got %v", en.BackendLogs)
@@ -2004,6 +2469,9 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	// lines are the Ambient entries below. The state must say so.
 	if en.BackendState != "ambient" {
 		t.Fatalf("expected state \"ambient\" (no subject resolved, namespace-wide lines returned), got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Errorf("no subject was resolved, so the backend query was not subject-scoped")
 	}
 	foundAmbient := false
 	for _, a := range en.Ambient {
@@ -2017,6 +2485,44 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 	}
 	if !foundAmbient {
 		t.Fatalf("expected one ambient-marked backend-log line, got %v", en.Ambient)
+	}
+}
+
+// TestEnrichBackendLogsNoSubjectEmptyNotScoped is the issue #136 review
+// regression for the ambiguous "empty" state: with no resolved subject the
+// namespace-only fallback ran and returned nothing. The query was not
+// subject-scoped, so the rendered evidence must not claim it looked for the
+// subject's lines.
+func TestEnrichBackendLogsNoSubjectEmptyNotScoped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "empty" {
+		t.Fatalf("expected state \"empty\", got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Fatalf("no subject was resolved, so the query must not be marked subject-scoped")
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(got, "for this subject") {
+		t.Errorf("namespace-fallback empty state must not claim a subject inspection:\n%s", got)
+	}
+	if !strings.Contains(got, "returned no lines for the namespace in the window") {
+		t.Errorf("expected the namespace-scoped empty wording:\n%s", got)
 	}
 }
 
@@ -2050,13 +2556,16 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "p1"}},
 		},
 	}
-	en := k.Enrich(context.Background(), g, time.Minute, &Config{})
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
 
 	if len(en.BackendLogs) != 1 || !strings.Contains(en.BackendLogs[0], "target failure line") {
 		t.Fatalf("expected the target pod's line as the only primary line, got %v", en.BackendLogs)
 	}
 	if en.BackendState != "ok" {
 		t.Fatalf("expected state \"ok\", got %q", en.BackendState)
+	}
+	if !en.BackendScoped {
+		t.Errorf("a resolved target pod must mark the backend query subject-scoped")
 	}
 	for _, a := range en.Ambient {
 		if strings.Contains(a, "(ambient, namespace-wide)") {
@@ -2087,7 +2596,7 @@ func TestEnrich_oneShotTerminatedContainerFetchesCurrentLog(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	if len(en.UnhealthyPods) == 0 {
 		t.Fatalf("expected a failed one-shot pod to be listed unhealthy, got none")
@@ -2136,6 +2645,13 @@ func TestRender_oneShotContainerEvidenceLabelsCurrentStream(t *testing.T) {
 			"ns1/backup-1": {Container: "backup", Stream: "current"},
 		},
 		ContainerDiagnostics: []string{"ns1/backup-1: container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z — checksum mismatch"},
+		// The alert names ns1/backup-1, so the same evidence is subject-scoped
+		// and renders in the direct tier; the fields above serve Discord.
+		SubjectPodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/backup-1": {Container: "backup", Stream: "current"},
+		},
+		SubjectContainerDiagnostics: []string{"ns1/backup-1: container backup terminated exit=1 reason=Error at 2026-01-02T03:04:05Z — checksum mismatch"},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 
@@ -2182,6 +2698,13 @@ func TestRender_restartedContainerEvidenceLabelsPreviousStream(t *testing.T) {
 			"ns1/flaky-1": {Container: "app", Stream: "previous"},
 		},
 		ContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
+		// Subject-scoped mirror for renderEvidence; the fields above serve
+		// Discord.
+		SubjectPodLogs: map[string]string{"ns1/flaky-1": "panic: nil"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/flaky-1": {Container: "app", Stream: "previous"},
+		},
+		SubjectContainerDiagnostics: []string{"ns1/flaky-1: container app terminated exit=1 reason=Error at 2026-01-02T03:04:05Z"},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 	if !strings.Contains(body, "container app, previous stream") {
@@ -2217,6 +2740,10 @@ func TestRender_emptyContainerProvenanceIsNotVisible(t *testing.T) {
 			// Container is empty: the renderers must not surface it.
 			"ns1/backup-1": {Container: "", Stream: "current"},
 		},
+		SubjectPodLogs: map[string]string{"ns1/backup-1": "checksum mismatch"},
+		SubjectPodLogProvenance: map[string]podLogProvenance{
+			"ns1/backup-1": {Container: "", Stream: "current"},
+		},
 	}
 	body := renderEvidence(Report{Group: g, Enrichment: en})
 	// The pod key and the log must still reach the model...
@@ -2227,8 +2754,10 @@ func TestRender_emptyContainerProvenanceIsNotVisible(t *testing.T) {
 		t.Fatalf("rendered evidence missing the log body:\n%s", body)
 	}
 	// ...and the container/stream provenance header must not, because the
-	// provenance names no container.
-	if strings.Contains(body, "container ") {
+	// provenance names no container. Match the malformed header form
+	// ("container <name>, <stream> stream:") rather than the word alone, since
+	// the tier headings legitimately say "container terminations".
+	if strings.Contains(body, "container ,") || strings.Contains(body, "container  ") {
 		t.Errorf("rendered evidence leaked a container provenance header for an empty-container spec:\n%s", body)
 	}
 	if strings.Contains(body, "stream:") {
@@ -2267,7 +2796,7 @@ func TestEnrich_restartedContainerUsesPreviousLog(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodRestart", "namespace": "ns1", "pod": "flaky-1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	found := false
 	for _, d := range en.ContainerDiagnostics {
@@ -2324,7 +2853,7 @@ func TestEnrich_succeededContainerIsSkipped(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodCompleted", "namespace": "ns1", "pod": "done-1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	for _, p := range en.UnhealthyPods {
 		if strings.Contains(p, "done-1") {
@@ -2375,7 +2904,7 @@ func TestEnrich_multiContainerLogsFailingContainer(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "multi-1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	if gotContainer != "sidecar" {
 		t.Errorf("expected the failing container (sidecar) to be logged, got %q", gotContainer)
@@ -2424,7 +2953,7 @@ func TestEnrich_logFailureIsNonFatal(t *testing.T) {
 		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodFailed", "namespace": "ns1", "pod": "backup-1"}}},
 		Namespaces: []string{"ns1"},
 	}
-	en := k.Enrich(context.Background(), g, time.Hour, &Config{})
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 
 	found := false
 	for _, d := range en.ContainerDiagnostics {
@@ -2467,4 +2996,935 @@ func queryPrevious(rawQuery string) string {
 		}
 	}
 	return ""
+}
+
+// TestResolveCommitRelevanceFluxAndGitHub is the end-to-end test for issue
+// #135: a pod with the Flux kustomize annotations, a Kustomization with a
+// github.com GitRepository, and a GitHub commit whose files DO touch the
+// workload path must produce a CommitRelevance with State == "touches".
+// The test wires up three servers — the kube API, the github.com API —
+// and asserts the renderer surfaces the matching files (inside the
+// untrusted fence) and the commit message.
+func TestResolveCommitRelevanceFluxAndGitHub(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	var kubeHits, ghHits atomic.Int32
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kubeHits.Add(1)
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ghHits.Add(1)
+		// Path: /repos/owner/repo/commits/<sha>
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump image tag"},"files":[{"filename":"apps/payments/kustomization.yaml"},{"filename":"apps/payments/deployment.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if rel.WorkloadPath != "apps/payments" {
+		t.Errorf("workload path = %q, want %q", rel.WorkloadPath, "apps/payments")
+	}
+	if rel.Revision != "refs/heads/main@sha1:"+validSHA {
+		t.Errorf("revision = %q", rel.Revision)
+	}
+	if len(rel.MatchingPaths) != 2 {
+		t.Errorf("matching paths = %v, want 2 entries", rel.MatchingPaths)
+	}
+	if rel.CommitMessage != "bump image tag" {
+		t.Errorf("commit message = %q, want %q", rel.CommitMessage, "bump image tag")
+	}
+	if kubeHits.Load() == 0 || ghHits.Load() == 0 {
+		t.Errorf("expected both kube and github hits, got kube=%d github=%d", kubeHits.Load(), ghHits.Load())
+	}
+
+	// And the renderer must fence the matching files (they are quoted from
+	// a third-party commit) while leaving the State line outside the fence.
+	en := Enrichment{CommitRelevance: got}
+	evidence := renderEvidence(Report{Enrichment: en})
+	if !strings.Contains(evidence, "Recent reconciled commit (GitHub):") {
+		t.Errorf("evidence missing header:\n%s", evidence)
+	}
+	if !strings.Contains(evidence, "touches workload: apps/payments") {
+		t.Errorf("evidence missing state line:\n%s", evidence)
+	}
+	if strings.Count(evidence, untrustedBegin) < 2 {
+		// one for alerts, one for matching files
+		t.Errorf("expected matching files inside untrusted fence:\n%s", evidence)
+	}
+}
+
+// TestResolveCommitRelevanceDoesNotTouch covers the motivating case for
+// #135 end-to-end: the commit the Kustomization is reconciled at only
+// touches an unrelated workload, so the digest must say so explicitly
+// rather than hinting at a deploy.
+func TestResolveCommitRelevanceDoesNotTouch(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		// A commit that touches an unrelated path.
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump orders image"},"files":[{"filename":"apps/orders/kustomization.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceDoesNotTouch {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceDoesNotTouch, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 0 {
+		t.Errorf("expected no matching paths, got %v", rel.MatchingPaths)
+	}
+	if rel.CommitMessage != "bump orders image" {
+		t.Errorf("commit message = %q, want %q", rel.CommitMessage, "bump orders image")
+	}
+
+	// The renderer must say "does NOT touch" — never phrase it as a
+	// likely trigger.
+	en := Enrichment{CommitRelevance: got}
+	evidence := renderEvidence(Report{Enrichment: en})
+	if !strings.Contains(evidence, "does NOT touch workload") {
+		t.Errorf("evidence should explicitly say 'does NOT touch', got:\n%s", evidence)
+	}
+	joined := strings.ToLower(evidence)
+	for _, w := range []string{"trigger", "deploy", "rolled out"} {
+		if strings.Contains(joined, w) {
+			t.Errorf("evidence must not call a non-touching commit a %q, got:\n%s", w, evidence)
+		}
+	}
+}
+
+// TestResolveCommitRelevanceComponentRelativeToPath is the integration
+// regression for the Flux Kustomization components contract: spec.components
+// are relative to the Kustomization's spec.path, not to the repo root. A
+// component "../shared" under path "apps/payments/prod" resolves to
+// "apps/payments/shared", and a commit touching that resolved path must be
+// classified as "touches" the workload.
+func TestResolveCommitRelevanceComponentRelativeToPath(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments/prod","sourceRef":{"name":"payments","kind":"GitRepository"},"components":["../shared"]},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		// The commit touches only the shared component's directory, which
+		// is a sibling of the workload path: resolved it is
+		// apps/payments/shared, not "shared" and not
+		// apps/payments/prod/shared.
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"tune shared config"},"files":[{"filename":"apps/payments/shared/tuning.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.ComponentPaths) != 1 || rel.ComponentPaths[0] != "apps/payments/shared" {
+		t.Fatalf("component paths = %v, want [apps/payments/shared]", rel.ComponentPaths)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/shared/tuning.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/payments/shared/tuning.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestResolveCommitRelevanceNonGitHubRepo: a workload whose GitRepository
+// is hosted outside GitHub must degrade to State == "unknown" so the
+// digest never claims a non-GitHub lookup produced a result.
+func TestResolveCommitRelevanceNonGitHubRepo(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://gitlab.example.com/owner/repo"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	if got[0].State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q (reason=%q)", got[0].State, commitRelevanceUnknown, got[0].Reason)
+	}
+	if !strings.Contains(strings.ToLower(got[0].Reason), "github") {
+		t.Errorf("unknown reason should mention the host check, got %q", got[0].Reason)
+	}
+}
+
+// TestEnrichWiringGitHubEndToEnd exercises the full Enrich path: pass
+// a gitHubClient in, get a CommitRelevance out, with the kube API and
+// the GitHub API both stubbed.
+func TestEnrichWiringGitHubEndToEnd(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"name":"payments","kind":"GitRepository"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/payments"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"kustomize.toolkit.fluxcd.io/name":"payments","kustomize.toolkit.fluxcd.io/namespace":"flux-system"}},"spec":{"nodeName":"n1"},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump image"},"files":[{"filename":"apps/payments/kustomization.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	g := Group{
+		Key:        "KubePodCrashLooping",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubePodCrashLooping", "namespace": "ns-a", "pod": "p"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, gh)
+	if len(en.CommitRelevance) != 1 {
+		t.Fatalf("expected 1 CommitRelevance from Enrich, got %d (enrichment=%+v)", len(en.CommitRelevance), en)
+	}
+	if en.CommitRelevance[0].State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q", en.CommitRelevance[0].State, commitRelevanceTouches)
+	}
+}
+
+// TestEnrichNoGitHubClientLeavesRelevanceEmpty verifies that the common
+// case (GITHUB_REPO/GITHUB_TOKEN unset) leaves CommitRelevance empty so
+// the renderer does not pretend a check happened.
+func TestEnrichNoGitHubClientLeavesRelevanceEmpty(t *testing.T) {
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pod listing returns a pod with Flux annotations.
+		if strings.HasSuffix(r.URL.Path, "/pods") {
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"kustomize.toolkit.fluxcd.io/name":"payments","kustomize.toolkit.fluxcd.io/namespace":"flux-system"}},"spec":{"nodeName":"n1"},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	g := Group{
+		Key:        "KubePodCrashLooping",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubePodCrashLooping", "namespace": "ns-a", "pod": "p"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
+	if len(en.CommitRelevance) != 0 {
+		t.Fatalf("expected CommitRelevance to be empty without gh, got %d entries: %+v", len(en.CommitRelevance), en.CommitRelevance)
+	}
+}
+
+// --- Declared execution identity and PVC relationships (issue #132) ---
+
+// podItemFromJSON decodes a single-item pod list into one podItem, for tests
+// that only need one pod.
+func podItemFromJSON(t *testing.T, raw string) podItem {
+	t.Helper()
+	var list podList
+	if err := json.Unmarshal([]byte(`{"items":[`+raw+`]}`), &list); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(list.Items))
+	}
+	return list.Items[0]
+}
+
+// A pod that declares its execution identity at the pod level (not the
+// container level) must have those fields captured, so a permission hypothesis
+// can be grounded in what the pod declared.
+func TestPodItemPodLevelSecurityContext(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true}},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"restartCount":2,
+			 "state":{"waiting":{"reason":"CrashLoopBackOff"}}}
+		]}
+	}`)
+	if p.Spec.Security == nil {
+		t.Fatal("expected a pod-level securityContext, got nil")
+	}
+	u, g, fg, nr := p.Spec.Security.format()
+	if u != "1000" || g != "2000" || fg != "3000" || nr != "true" {
+		t.Errorf("pod securityContext = (%q,%q,%q,%q), want (1000,2000,3000,true)", u, g, fg, nr)
+	}
+}
+
+// The container securityContext and volumeMounts live under spec.containers,
+// not status.containerStatuses: this is the exact shape the apiserver returns,
+// and the one the feature must read.
+func TestPodItemContainerOverridesPodIdentity(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true},
+			"containers":[{"name":"mover",
+				"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+				"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+			"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"restartCount":1,
+			 "state":{"waiting":{"reason":"CrashLoopBackOff"}}}
+		]}
+	}`)
+	cs := p.containerSpec("mover")
+	if cs == nil {
+		t.Fatal("expected the spec container mover to be captured from spec.containers")
+	}
+	eff := cs.effective(p.Spec.Security)
+	u, g, fg, nr := eff.format()
+	// runAsUser/RunAsNonRoot overridden by the container, runAsGroup/fsGroup
+	// inherited from the pod.
+	if u != "4000" || g != "2000" || fg != "3000" || nr != "false" {
+		t.Errorf("effective = (%q,%q,%q,%q), want (4000,2000,3000,false)", u, g, fg, nr)
+	}
+}
+
+// When neither the pod nor the container declares anything, every field reads
+// "unset" - it must not be guessed as root from the image.
+func TestPodItemAllIdentityUnset(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,
+			 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if p.Spec.Security != nil {
+		t.Fatalf("expected no pod securityContext, got %v", *p.Spec.Security)
+	}
+	eff := p.containerSpec("mover").effective(p.Spec.Security)
+	u, g, fg, nr := eff.format()
+	if u != "unset" || g != "unset" || fg != "unset" || nr != "unset" {
+		t.Errorf("unset pod = (%q,%q,%q,%q), want (unset,unset,unset,unset)", u, g, fg, nr)
+	}
+}
+
+// runAsNonRoot must keep its three states: an explicit false, an explicit true,
+// and an absent value that stays unset rather than collapsing to false.
+func TestPodItemRunAsNonRootThreeState(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"unset", `{"runAsUser":100}`, "unset"},
+		{"true", `{"runAsNonRoot":true}`, "true"},
+		{"false", `{"runAsNonRoot":false}`, "false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := podItemFromJSON(t, `{
+				"metadata":{"name":"mover","namespace":"ns1"},
+				"spec":{"containers":[{"name":"mover","securityContext":`+tc.json+`}]},
+				"status":{"phase":"Failed","containerStatuses":[
+					{"name":"mover","ready":false,"state":{"waiting":{"reason":"Error"}}}
+				]}
+			}`)
+			eff := p.containerSpec("mover").effective(nil)
+			_, _, _, nr := eff.format()
+			if nr != tc.want {
+				t.Errorf("runAsNonRoot = %q, want %q", nr, tc.want)
+			}
+		})
+	}
+}
+
+// A container securityContext present but with a single field must still leave
+// the unset fields unset rather than defaulting them.
+func TestPodItemPartialContainerIdentity(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"containers":[{"name":"mover",
+			"securityContext":{"runAsUser":100}}]},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"waiting":{"reason":"Error"}}}
+		]}
+	}`)
+	eff := p.containerSpec("mover").effective(nil)
+	u, g, fg, nr := eff.format()
+	if u != "100" || g != "unset" || fg != "unset" || nr != "unset" {
+		t.Errorf("partial = (%q,%q,%q,%q), want (100,unset,unset,unset)", u, g, fg, nr)
+	}
+}
+
+// A volume that references a PVC must be mapped to its claim name; a non-PVC
+// volume (emptyDir) must not fabricate a claim.
+func TestPodItemVolumeToClaim(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"containers":[{"name":"mover","volumeMounts":[
+				{"name":"data","mountPath":"/data","readOnly":false},
+				{"name":"tmp","mountPath":"/tmp","readOnly":false}]}],
+			"volumes":[
+				{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}},
+				{"name":"tmp","emptyDir":{}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	mounts := p.mount()
+	if len(mounts) != 1 {
+		t.Fatalf("expected exactly the PVC claim, got %v", mounts)
+	}
+	m, ok := mounts["data-claim"]
+	if !ok {
+		t.Fatalf("missing data-claim in %v", mounts)
+	}
+	if m.Container != "mover" || m.Path != "/data" || m.ReadOnly {
+		t.Errorf("mount = %+v, want container=mover path=/data read-only=false", m)
+	}
+}
+
+// A pod with only non-PVC volumes has no claim, so it is not a same-claim
+// sibling of anything.
+func TestPodItemNoPVCNoClaim(t *testing.T) {
+	p := podItemFromJSON(t, `{
+		"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{
+			"containers":[{"name":"mover","volumeMounts":[{"name":"tmp","mountPath":"/tmp"}]}],
+			"volumes":[{"name":"tmp","emptyDir":{}}]
+		},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if len(p.claims()) != 0 {
+		t.Errorf("expected no claims, got %v", p.claims())
+	}
+}
+
+// A container that is in the running state is not failing; a container whose
+// only state is non-running is failing. Succeeded pods are never failing.
+func TestPodItemFailing(t *testing.T) {
+	failing := podItemFromJSON(t, `{
+		"metadata":{"name":"a","namespace":"ns1"},
+		"status":{"phase":"Failed","containerStatuses":[
+			{"name":"mover","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}},
+			{"name":"sidecar","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}
+		]}
+	}`)
+	if !failing.failing()["mover"] || !failing.failing()["sidecar"] {
+		t.Errorf("expected both containers failing, got %v", failing.failing())
+	}
+
+	healthy := podItemFromJSON(t, `{
+		"metadata":{"name":"b","namespace":"ns1"},
+		"status":{"phase":"Running","containerStatuses":[
+			{"name":"app","ready":true,"state":{"running":{}}}
+		]}
+	}`)
+	if len(healthy.failing()) != 0 {
+		t.Errorf("expected no failing container in a healthy Running pod, got %v", healthy.failing())
+	}
+
+	succeeded := podItemFromJSON(t, `{
+		"metadata":{"name":"c","namespace":"ns1"},
+		"status":{"phase":"Succeeded","containerStatuses":[
+			{"name":"job","ready":false,"state":{"terminated":{"exitCode":0,"reason":"Completed"}}}
+		]}
+	}`)
+	if len(succeeded.failing()) != 0 {
+		t.Errorf("a Succeeded pod is never failing, got %v", succeeded.failing())
+	}
+}
+
+// identityHarness serves a distinct pod list per namespace so a test can put
+// same-named claims in two namespaces and assert they are not conflated.
+func identityHarness(t *testing.T, byNS map[string]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(p, "/pods"):
+			ns := ""
+			parts := strings.Split(strings.Trim(p, "/"), "/")
+			for i := 0; i+1 < len(parts); i++ {
+				if parts[i] == "namespaces" {
+					ns = parts[i+1]
+				}
+			}
+			if body, ok := byNS[ns]; ok {
+				_, _ = io.WriteString(w, body)
+				return
+			}
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(p, "/events"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+}
+
+// A failed pod the alert names must yield its effective declared identity and
+// PVC mount, and a healthy pod mounting the same claim in the same namespace
+// must appear as comparison context; an unrelated claim must not.
+func TestEnrichPodIdentityAndSameClaimSibling(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"runAsUser":1000,"runAsGroup":2000,"fsGroup":3000,"runAsNonRoot":true},
+				"containers":[{"name":"mover",
+					"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"restartCount":0,
+				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"app-xyz","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"fsGroup":3000,"runAsNonRoot":true},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":2000},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":true}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}}]}},
+			{"metadata":{"name":"unrelated","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"u","volumeMounts":[{"name":"other","mountPath":"/other"}]}],
+				"volumes":[{"name":"other","persistentVolumeClaim":{"claimName":"other-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"u","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	id, ok := en.PodID["ns1/mover"]
+	if !ok {
+		t.Fatalf("expected an identity line for ns1/mover, got %v", en.PodID)
+	}
+	for _, want := range []string{"runAsUser=4000", "runAsGroup=2000", "fsGroup=3000", "runAsNonRoot=false", "data-claim at /data (read-write)"} {
+		if !strings.Contains(id, want) {
+			t.Errorf("identity %q missing %q", id, want)
+		}
+	}
+	if strings.Contains(id, "stat") {
+		t.Errorf("identity must not claim on-disk ownership/mode: %q", id)
+	}
+
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "app-xyz") {
+			sib = s
+		}
+		if strings.Contains(s, "unrelated") {
+			t.Errorf("unrelated claim must not be a sibling: %v", en.PVCSiblings)
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected app-xyz as a same-claim sibling, got %v", en.PVCSiblings)
+	}
+	if !strings.Contains(sib, "Running") || !strings.Contains(sib, "1/1 ready") {
+		t.Errorf("sibling %q must carry phase and readiness", sib)
+	}
+	// The sibling must carry its own declared identity and mount so the
+	// operator can compare it with the mover's on the same claim. Container
+	// runAsUser overrides the pod; pod fsGroup/runAsNonRoot are inherited.
+	for _, want := range []string{
+		"container app (declared: runAsUser=2000 runAsGroup=unset fsGroup=3000 runAsNonRoot=true)",
+		"data-claim at /data (read-only)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("sibling %q missing %q", sib, want)
+		}
+	}
+}
+
+// A sibling with several containers must only report the container(s) that
+// actually mount the matched claim, so the identity/mount detail does not
+// imply the other containers touch the volume.
+func TestEnrichSiblingDetailOnlyListsMountingContainers(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"app-xyz","namespace":"ns1"},
+			 "spec":{
+				"containers":[
+					{"name":"app","securityContext":{"runAsUser":2000},
+					 "volumeMounts":[{"name":"data","mountPath":"/data"}]},
+					{"name":"sidecar"}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}},
+				{"name":"sidecar","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "app-xyz") {
+			sib = s
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected app-xyz as a same-claim sibling, got %v", en.PVCSiblings)
+	}
+	if !strings.Contains(sib, "container app (declared: runAsUser=2000") {
+		t.Errorf("sibling %q must describe the mounting container app", sib)
+	}
+	if strings.Contains(sib, "sidecar") {
+		t.Errorf("sibling %q must not describe a container that does not mount the claim", sib)
+	}
+}
+
+// A KubeJobFailed alert names a Job via job_name and carries no pod label
+// (#127). The Job's owned failing Pod must still be enriched with its declared
+// identity and same-claim siblings - the exact backup/mover incident this
+// feature exists for.
+func TestEnrichJobFailedPodIdentityAndSiblings(t *testing.T) {
+	pods := `{
+		"items":[
+			{"metadata":{"name":"backup-0","namespace":"ns1",
+				"ownerReferences":[{"kind":"Job","name":"backup","uid":"job-uid-1"}]},
+			 "spec":{
+				"containers":[{"name":"mover",
+					"securityContext":{"runAsUser":4000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"restartCount":0,
+				 "state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"web-0","namespace":"ns1"},
+			 "spec":{
+				"securityContext":{"runAsGroup":4000},
+				"containers":[{"name":"app",
+					"securityContext":{"runAsUser":5000,"runAsNonRoot":false},
+					"volumeMounts":[{"name":"data","mountPath":"/data","readOnly":false}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data-claim"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"app","ready":true,"state":{"running":{}}}]}}
+		]}`
+	jobs := map[string]jobSpec{
+		"backup": {json: `{"metadata":{"name":"backup","namespace":"ns1","uid":"job-uid-1"},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup"}}}}}`},
+	}
+	srv := jobAPIHarness(t, pods, jobs)
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	id, ok := en.PodID["ns1/backup-0"]
+	if !ok {
+		t.Fatalf("a Job-owned failing pod must carry identity evidence, got %v", en.PodID)
+	}
+	if !strings.Contains(id, "runAsUser=4000") || !strings.Contains(id, "data-claim at /data") {
+		t.Errorf("job pod identity = %q, want declared identity and PVC mount", id)
+	}
+	var sib string
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "web-0") {
+			sib = s
+		}
+	}
+	if sib == "" {
+		t.Fatalf("expected the same-claim sibling web-0 for the job pod, got %v", en.PVCSiblings)
+	}
+	for _, want := range []string{
+		"container app (declared: runAsUser=5000 runAsGroup=4000 fsGroup=unset runAsNonRoot=false)",
+		"data-claim at /data (read-write)",
+	} {
+		if !strings.Contains(sib, want) {
+			t.Errorf("job sibling %q missing %q", sib, want)
+		}
+	}
+}
+
+// Claims are namespace-local: a pod in ns2 mounting a claim with the same name
+// as the ns1 target's claim is not a same-claim sibling.
+func TestEnrichSiblingsAreNamespaceScoped(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"mover","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}},
+			{"metadata":{"name":"ns1-peer","namespace":"ns1"},
+			 "spec":{
+				"containers":[{"name":"p","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"p","ready":true,"state":{"running":{}}}]}}
+		]}`
+	ns2 := `{
+		"items":[
+			{"metadata":{"name":"ns2-peer","namespace":"ns2"},
+			 "spec":{
+				"containers":[{"name":"p","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+				"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"p","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1, "ns2": ns2})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1", "ns2"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	var ns1Peer, ns2Peer bool
+	for _, s := range en.PVCSiblings {
+		if strings.Contains(s, "ns1-peer") {
+			ns1Peer = true
+		}
+		if strings.Contains(s, "ns2-peer") {
+			ns2Peer = true
+		}
+	}
+	if !ns1Peer {
+		t.Errorf("expected the same-namespace sibling ns1-peer, got %v", en.PVCSiblings)
+	}
+	if ns2Peer {
+		t.Errorf("a same-named claim in another namespace must not be a sibling: %v", en.PVCSiblings)
+	}
+}
+
+// The sibling list is capped so a group spanning many pods does not become a
+// namespace dump.
+func TestEnrichSiblingCap(t *testing.T) {
+	var items []string
+	items = append(items, `{"metadata":{"name":"mover","namespace":"ns1"},
+		"spec":{"containers":[{"name":"c","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+		"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+		"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}}`)
+	for i := 0; i < 6; i++ {
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":"peer-%d","namespace":"ns1"},
+			"spec":{"containers":[{"name":"c","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+			"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"shared"}}]},
+			"status":{"phase":"Running","containerStatuses":[{"name":"c","ready":true,"state":{"running":{}}}]}}`, i))
+	}
+	srv := identityHarness(t, map[string]string{"ns1": `{"items":[` + strings.Join(items, ",") + `]}`})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	if len(en.PVCSiblings) > sameClaimSibMax {
+		t.Errorf("expected at most %d same-claim siblings, got %d: %v", sameClaimSibMax, len(en.PVCSiblings), en.PVCSiblings)
+	}
+}
+
+// A failing target that declares nothing yields an explicit "unset" identity
+// line rather than a guessed identity, and mounts nothing so it has no claim
+// and no siblings.
+func TestEnrichAllIdentityUnset(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "status":{"phase":"Failed","containerStatuses":[
+				{"name":"c","ready":false,"state":{"terminated":{"exitCode":1,"reason":"Error"}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	id, ok := en.PodID["ns1/mover"]
+	if !ok {
+		t.Fatalf("a failing target must carry an identity line, got %v", en.PodID)
+	}
+	for _, want := range []string{"runAsUser=unset", "runAsGroup=unset", "fsGroup=unset", "runAsNonRoot=unset"} {
+		if !strings.Contains(id, want) {
+			t.Errorf("expected %q in %q", want, id)
+		}
+	}
+	if len(en.PVCSiblings) != 0 {
+		t.Errorf("a target with no claim must have no siblings, got %v", en.PVCSiblings)
+	}
+}
+
+// A healthy target the alert named has no failing container, so it carries no
+// identity line: the section is about the failure, not the pod's existence.
+func TestEnrichHealthyTargetNoIdentity(t *testing.T) {
+	ns1 := `{
+		"items":[
+			{"metadata":{"name":"mover","namespace":"ns1"},
+			 "spec":{"securityContext":{"runAsUser":1000}},
+			 "status":{"phase":"Running","containerStatuses":[
+				{"name":"c","ready":true,"state":{"running":{}}}]}}
+		]}`
+	srv := identityHarness(t, map[string]string{"ns1": ns1})
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubePodCrashLooping", "namespace": "ns1", "pod": "mover",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	if _, ok := en.PodID["ns1/mover"]; ok {
+		t.Errorf("a healthy target with no failing container must not carry an identity line, got %v", en.PodID)
+	}
 }
