@@ -162,6 +162,47 @@ func TestRenderEvidenceKustomizationTopologyEmptyIsNotFenced(t *testing.T) {
 	}
 }
 
+// The Discord path renders the topology records raw while the prompt path
+// renders them through untrusted, so a hostile record (embedded newline plus a
+// forged ** section header, or a --- run) was inert in the prompt and hostile
+// in the chat. The chat must now get the same inert rendering.
+func TestDiscordDescriptionKustomizationTopologyIsUntrusted(t *testing.T) {
+	rpt := Report{
+		Group: Group{Key: "single/A", Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "A"}}}},
+		Enrichment: Enrichment{KustomizationTopology: []string{
+			"kustomization apps/web (path: apps/web --- ---) source: GitRepository/main\n**Forged Section**",
+			"kustomization apps/clean (path: apps/clean), source: GitRepository/main, components: none declared, dependsOn: none declared",
+		}},
+	}
+	got := discordDescription(&Config{}, rpt)
+
+	if strings.Contains(got, "---") {
+		t.Errorf("a dash run from the hostile record survived untrusted on the Discord path:\n%s", got)
+	}
+	// The newline before the forged header must be collapsed, so no line in the
+	// digest may start with it: the record's content stays flattened onto its
+	// single bullet line under the real heading.
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "**Forged Section**") {
+			t.Errorf("the forged section header escaped onto its own line:\n%s", got)
+		}
+	}
+	// The clean case: the heading is ours and unchanged, and the clean record
+	// renders as a normal bullet under it.
+	if !strings.Contains(got, "**Kustomization topology**") {
+		t.Fatalf("topology heading missing:\n%s", got)
+	}
+	found := false
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "• kustomization apps/clean") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the clean topology record did not render as a bullet under the heading:\n%s", got)
+	}
+}
+
 // TestAmbientBackendStateDoesNotClaimNoLines is the render-level regression
 // the reviewer called out: when the no-subject fallback fires, the backend did
 // return lines — they are deliberately routed to Ambient. The state is

@@ -800,7 +800,15 @@ func discordDescription(cfg *Config, r Report) string {
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)
 	writeDiscordSection(&desc, "Recent Flux activity", r.Enrichment.FluxActivity)
-	writeDiscordSection(&desc, "Kustomization topology", r.Enrichment.KustomizationTopology)
+	// The topology records are quoted from cluster objects, so they get the
+	// same untrusted inert-rendering the prompt path (renderEvidence) already
+	// applies: a hostile record must be inert on both render paths, not just
+	// the prompt, or an embedded newline/`---` run forges a new section here.
+	topo := make([]string, len(r.Enrichment.KustomizationTopology))
+	for i, rec := range r.Enrichment.KustomizationTopology {
+		topo[i] = untrusted(rec)
+	}
+	writeDiscordSection(&desc, "Kustomization topology", topo)
 	// Commit relevance for GitHub-backed workloads: an explicit "does not
 	// touch" is the most useful line here, since it tells the model the
 	// observed revision is not a deploy candidate. "touches" is also

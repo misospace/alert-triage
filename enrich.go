@@ -2182,14 +2182,29 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 //     contents of the files they name are not read, so the record never
 //     claims to have. A component that is not a relative path (an
 //     OCI-style reference) is rendered as-is under its own label.
-//   - dependsOn entries are read verbatim. The object is cluster-state read
-//     by this service, not text emitted by the workload, so the values
-//     normally carry this service's trust. The render still passes each
-//     value through untrusted() — the same treatment as RepoPaths — so a
-//     compromised object cannot forge a fence or a new section out of them.
+//   - Path-like values (spec.path, each component, each dependsOn name and
+//     namespace, the sourceRef name and namespace) that carry NUL,
+//     backslash, or percent are refused before rendering — the same
+//     rejection set resolveRepoPaths applies to the same class of value.
+//     A refused singular field (spec.path, the sourceRef name) renders an
+//     explicit "refused" marker so it never reads as an absent one; refused
+//     list entries are dropped, leaving their subsection saying "none safe".
+//     No path.Clean here, unlike resolveRepoPaths: components legitimately
+//     carry `..` segments (`../base/common`) and OCI references that a
+//     Unix-style cleaner would mangle, so only the hostile character
+//     classes are refused and the value is never rewritten.
+//   - A subsection whose declared values were all refused renders "none
+//     safe", not "none declared": declaring nothing and declaring only
+//     refused values are different findings.
+//   - The assembled record passes untrusted() at construction, so the
+//     prompt and Discord render paths inherit flattened, dash-run-broken
+//     text from a single enforcement point and a hostile value can never
+//     forge a line or a fence out of it.
 func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) []string {
 	seen := map[string]bool{}
 	var out []string
+	// Parity with the resolveRepoPaths rejection rule: refuse, do not rewrite.
+	safe := func(v string) bool { return !strings.ContainsAny(v, "\x00\\%") }
 	for _, p := range pods {
 		kustom := p.Annotations["kustomize.toolkit.fluxcd.io/name"]
 		if kustom == "" {
@@ -2209,18 +2224,28 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 			continue
 		}
 		var src string
-		if spec.SourceRef.Name != "" {
+		switch {
+		case spec.SourceRef.Name == "":
+		case !safe(spec.SourceRef.Name):
+			// A refused name must not read as an absent one.
+			src = "refused"
+		default:
 			src = spec.SourceRef.Name
-			if spec.SourceRef.Kind != "" {
+			if spec.SourceRef.Kind != "" && safe(spec.SourceRef.Kind) {
 				src = spec.SourceRef.Kind + "/" + src
 			}
-			if spec.SourceRef.Namespace != "" {
+			if spec.SourceRef.Namespace != "" && safe(spec.SourceRef.Namespace) {
 				src += " (" + spec.SourceRef.Namespace + ")"
 			}
 		}
 		var rec []string
 		head := "kustomization " + ns + "/" + kustom
-		if spec.Path != "" {
+		switch {
+		case spec.Path == "":
+		case !safe(spec.Path):
+			// A refused path must not read as an absent one.
+			head += " (path: refused)"
+		default:
 			head += " (path: " + spec.Path + ")"
 		}
 		if src != "" {
@@ -2228,24 +2253,43 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 		}
 		rec = append(rec, head)
 		if len(spec.Components) > 0 {
-			rec = append(rec, "components: "+strings.Join(spec.Components, ", "))
+			var comps []string
+			for _, c := range spec.Components {
+				if safe(c) {
+					comps = append(comps, c)
+				}
+			}
+			if len(comps) > 0 {
+				rec = append(rec, "components: "+strings.Join(comps, ", "))
+			} else {
+				// "none safe", not "none declared": an empty spec and a spec
+				// of only refused values are different findings.
+				rec = append(rec, "components: none safe")
+			}
 		} else {
 			rec = append(rec, "components: none declared")
 		}
 		if len(spec.DependsOn) > 0 {
 			var deps []string
 			for _, d := range spec.DependsOn {
+				if !safe(d.Name) || !safe(d.Namespace) {
+					continue
+				}
 				if d.Namespace != "" && d.Namespace != ns {
 					deps = append(deps, d.Namespace+"/"+d.Name)
 				} else {
 					deps = append(deps, d.Name)
 				}
 			}
-			rec = append(rec, "dependsOn: "+strings.Join(deps, ", "))
+			if len(deps) > 0 {
+				rec = append(rec, "dependsOn: "+strings.Join(deps, ", "))
+			} else {
+				rec = append(rec, "dependsOn: none safe")
+			}
 		} else {
 			rec = append(rec, "dependsOn: none declared")
 		}
-		out = append(out, strings.Join(rec, "; "))
+		out = append(out, untrusted(strings.Join(rec, "; ")))
 	}
 	return out
 }

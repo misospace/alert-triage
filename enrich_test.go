@@ -780,6 +780,172 @@ func TestResolveKustomizationTopologyOciComponent(t *testing.T) {
 	}
 }
 
+// TestResolveKustomizationTopologyRejectsUnsafePaths asserts sanitiser
+// parity with resolveRepoPaths: the same class of value (a path-like field
+// quoted from a cluster object) is dropped on the same hostile character set
+// — NUL, backslash, percent — the survivors render verbatim, and the record
+// is flattened and fence-inert at construction. Unlike resolveRepoPaths, no
+// path.Clean runs here, so a legitimate `..` segment in a surviving
+// component is preserved.
+func TestResolveKustomizationTopologyRejectsUnsafePaths(t *testing.T) {
+	// The JSON is a raw string so the hostile bytes arrive through JSON
+	// escapes: \u0000 decodes to NUL, \\ to a single backslash, % is
+	// literal.
+	srv := fluxKustomizationAPIHarness(t, "web",
+		`{"spec":{"path":"apps\\web","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"},
+		 "components":["../base/common","pods\u0000evil","pods\\..\\..","pods%2F..%2F"],
+		 "dependsOn":[{"name":"base-common"},{"name":"evil\\name","namespace":"apps"}]}}`,
+		`{"spec":{"url":"https://github.com/example/web"}}`)
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("web-0", "apps", "web", ""))
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one topology record, got %#v", got)
+	}
+	rec := got[0]
+	// (b) The safe values survive verbatim, including the `..` segment a
+	// path.Clean (deliberately not applied here) would have collapsed.
+	for _, want := range []string{
+		"components: ../base/common",
+		"dependsOn: base-common",
+	} {
+		if !strings.Contains(rec, want) {
+			t.Errorf("record missing %q: %s", want, rec)
+		}
+	}
+	// (c) The unsafe spec.path renders an explicit refused marker instead of
+	// vanishing: a refused path must not read as an absent one, and the
+	// hostile value itself must not appear.
+	if !strings.Contains(rec, "(path: refused)") {
+		t.Errorf("refused spec.path must render a refused marker: %s", rec)
+	}
+	if strings.Contains(rec, `apps\web`) {
+		t.Errorf("unsafe spec.path value leaked into the record: %s", rec)
+	}
+	// (c,d) Every hostile byte class, the percent-encoding forms
+	// (case-insensitive), a newline, and a triple-dash run are absent.
+	for _, hostile := range []string{"\x00", `\`, "\n", "---"} {
+		if strings.Contains(rec, hostile) {
+			t.Errorf("record carries hostile value %q: %s", hostile, rec)
+		}
+	}
+	if lower := strings.ToLower(rec); strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") {
+		t.Errorf("percent-encoded traversal survived: %s", rec)
+	}
+	if strings.Contains(rec, "pods") {
+		t.Errorf("unsafe component values leaked into the record: %s", rec)
+	}
+	if strings.Contains(rec, "evil") {
+		t.Errorf("unsafe dependency name leaked into the record: %s", rec)
+	}
+}
+
+// TestResolveKustomizationTopologyNoneSafeVersusNoneDeclared pins the
+// explicit negative: a subsection whose declared values were all refused
+// reads "none safe", while an empty spec reads "none declared" — two
+// different findings that a shared "none" would collapse.
+func TestResolveKustomizationTopologyNoneSafeVersusNoneDeclared(t *testing.T) {
+	run := func(t *testing.T, kuzJSON string) string {
+		t.Helper()
+		srv := fluxKustomizationAPIHarness(t, "kuz", kuzJSON,
+			`{"spec":{"url":"https://github.com/example/kuz"}}`)
+		defer srv.Close()
+
+		k := &kube{hc: srv.Client(), base: srv.URL}
+		got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p-0", "apps", "kuz", ""))
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one topology record, got %#v", got)
+		}
+		return got[0]
+	}
+	t.Run("all components unsafe", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"},
+			"components":["pods\u0000evil","pods\\..\\..","pods%2F..%2F"]}}`)
+		if !strings.Contains(rec, "components: none safe") {
+			t.Errorf("record must say none safe when every component was refused: %s", rec)
+		}
+		if strings.Contains(rec, "components: none declared") {
+			t.Errorf("refused components must not read as undeclared: %s", rec)
+		}
+	})
+	t.Run("none declared", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"}}}`)
+		if !strings.Contains(rec, "components: none declared") {
+			t.Errorf("record must say none declared for an empty components list: %s", rec)
+		}
+		if strings.Contains(rec, "components: none safe") {
+			t.Errorf("an empty spec must not read as refused: %s", rec)
+		}
+	})
+	t.Run("all dependencies unsafe", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main"},
+			"dependsOn":[{"name":"evil\\name"},{"name":"ok","namespace":"bad\\ns"}]}}`)
+		if !strings.Contains(rec, "dependsOn: none safe") {
+			t.Errorf("record must say none safe when every dependency was refused: %s", rec)
+		}
+		if strings.Contains(rec, "dependsOn: none declared") {
+			t.Errorf("refused dependencies must not read as undeclared: %s", rec)
+		}
+	})
+}
+
+// TestResolveKustomizationTopologyRefusedSingularFields pins the singular
+// half of the refused-value rule: a sourceRef name or a spec.path that
+// fails the safe() check renders an explicit "refused" marker in its
+// fragment, so a refused value is never indistinguishable from an absent
+// one — the same distinction the list subsections already make with
+// "none safe". A safe value keeps its exact composed fragment.
+func TestResolveKustomizationTopologyRefusedSingularFields(t *testing.T) {
+	run := func(t *testing.T, kuzJSON string) string {
+		t.Helper()
+		srv := fluxKustomizationAPIHarness(t, "kuz", kuzJSON,
+			`{"spec":{"url":"https://github.com/example/kuz"}}`)
+		defer srv.Close()
+
+		k := &kube{hc: srv.Client(), base: srv.URL}
+		got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p-0", "apps", "kuz", ""))
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one topology record, got %#v", got)
+		}
+		return got[0]
+	}
+	// The JSON is a raw string so the hostile bytes arrive through JSON
+	// escapes: \u0000 decodes to NUL, \\ to a single backslash.
+	t.Run("refused sourceRef name", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main\u0000evil"}}}`)
+		if !strings.Contains(rec, "source: refused") {
+			t.Errorf("refused sourceRef name must render source: refused: %s", rec)
+		}
+		if strings.Contains(rec, "main") {
+			t.Errorf("refused sourceRef name leaked into the record: %s", rec)
+		}
+		if strings.Contains(rec, "GitRepository/main") {
+			t.Errorf("refused sourceRef must not compose a source fragment: %s", rec)
+		}
+		if strings.Contains(rec, "\x00") {
+			t.Errorf("record carries a NUL byte: %s", rec)
+		}
+	})
+	t.Run("refused spec.path", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps\\web","sourceRef":{"kind":"GitRepository","name":"main"}}}`)
+		if !strings.Contains(rec, "(path: refused)") {
+			t.Errorf("refused spec.path must render (path: refused): %s", rec)
+		}
+		if strings.Contains(rec, `apps\web`) {
+			t.Errorf("refused spec.path value leaked into the record: %s", rec)
+		}
+	})
+	t.Run("safe values render verbatim", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"}}}`)
+		for _, want := range []string{"(path: apps/kuz)", "source: GitRepository/main (flux-system)"} {
+			if !strings.Contains(rec, want) {
+				t.Errorf("record missing %q: %s", want, rec)
+			}
+		}
+	})
+}
+
 // TestResolveNodesPodLabelNoNodeLabel forces the pods-list lookup branch
 // of ResolveNodes: the alert has a pod label but no node label, so the
 // function must query the pods API to find the node.
