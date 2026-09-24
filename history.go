@@ -135,38 +135,84 @@ func (h *History) appendLine(s sighting) {
 	}
 }
 
-// Compact rewrites the file without expired records. Called periodically so the
-// file cannot grow without bound.
+// compactRewriteDelay is a hook tests use to slow the temp-file write
+// in Compact so they can observe PriorSeen and Record running
+// concurrently with the rename. It is nil in production.
+var compactRewriteDelay func()
+
+// Compact rewrites the file without expired records. Called periodically
+// so the file cannot grow without bound.
+//
+// The on-disk rewrite and rename run without holding h.mu so concurrent
+// PriorSeen and Record callers do not stall on a slow filesystem; only
+// the in-memory snapshot and the swap back into h.entries are guarded.
+// A Record running mid-Compact appends to h.path (not the .tmp path), so
+// the temp file is never half-written from another caller's view: the
+// append either lands in the pre-rename file (lost on rename) or in the
+// post-rename file (kept).
 func (h *History) Compact() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.path == "" {
 		return nil
 	}
 
-	cutoff := time.Now().Add(-h.retain)
-	kept := h.entries[:0]
+	// Snapshot the in-window entries under the lock and release it. The
+	// copy lives in a fresh backing array so a concurrent Record that
+	// reuses h.entries' storage cannot trample the snapshot.
+	h.mu.Lock()
+	snapshotCutoff := time.Now().Add(-h.retain)
+	snapshot := make([]sighting, 0, len(h.entries))
 	for _, e := range h.entries {
-		if e.At.After(cutoff) {
-			kept = append(kept, e)
+		if e.At.After(snapshotCutoff) {
+			snapshot = append(snapshot, e)
 		}
 	}
-	h.entries = kept
+	h.mu.Unlock()
 
+	// Write the snapshot to a temp file and rename it into place. No
+	// lock is held during this window: a slow filesystem here cannot
+	// stall the flush loop's PriorSeen/Record calls.
 	tmp := h.path + ".tmp"
-	f, err := os.Create(tmp)
+	if err := writeHistoryFile(tmp, snapshot); err != nil {
+		return err
+	}
+	if compactRewriteDelay != nil {
+		compactRewriteDelay()
+	}
+	if err := os.Rename(tmp, h.path); err != nil {
+		return err
+	}
+
+	// Swap the in-memory state under the lock so PriorSeen and Record
+	// see a consistent view. Any entries a concurrent Record added
+	// during the rewrite are kept here (Record's appendLine also wrote
+	// them to h.path, either pre-rename as a lost write or post-rename
+	// as a kept write).
+	h.mu.Lock()
+	swapCutoff := time.Now().Add(-h.retain)
+	pruned := h.entries[:0]
+	for _, e := range h.entries {
+		if e.At.After(swapCutoff) {
+			pruned = append(pruned, e)
+		}
+	}
+	h.entries = pruned
+	h.mu.Unlock()
+	return nil
+}
+
+// writeHistoryFile encodes entries as JSONL into path. The caller is
+// responsible for the atomic rename into the final location.
+func writeHistoryFile(path string, entries []sighting) error {
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	enc := json.NewEncoder(f)
-	for _, e := range h.entries {
+	for _, e := range entries {
 		if err := enc.Encode(e); err != nil {
 			f.Close()
 			return err
 		}
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, h.path)
+	return f.Close()
 }

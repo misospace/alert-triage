@@ -217,19 +217,32 @@ func (p *Prometheus) FetchRules(ctx context.Context) (map[string]string, error) 
 	return p.fetchRules(ctx)
 }
 
+// MetricEvidence separates metric summaries by scope so the renderer can keep
+// DIRECT SUBJECT EVIDENCE truthful. Subject holds summaries whose query was
+// explicitly bounded to the resolved subject pod: only the fixed context
+// metrics narrow on pod, and only when a common pod label was available.
+// Context holds everything else. An alert-rule expression is replayed exactly
+// as written and may aggregate a namespace, workload, service or cluster, so
+// its result is never assumed subject-scoped; a fixed context metric without a
+// pod label is namespace-wide too.
+type MetricEvidence struct {
+	Subject []string
+	Context []string
+}
+
 // EnrichMetricsWithRules queries the Prometheus backend for evidence about the
 // group's alerts using a caller-supplied rules map, so a flush that enriches
 // several groups fetches /api/v1/rules once and reuses it. Returns compact
-// one-liner summaries. Nil is returned when no metrics backend is configured;
-// a non-nil slice with error lines distinguishes an unreachable backend from
-// "not configured". A non-nil rulesErr (from a failed FetchRules) yields the
-// single "metrics backend error" line.
-func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) []string {
+// one-liner summaries split by scope (see MetricEvidence). Nil slices are
+// returned when no metrics backend is configured; a non-nil Context line
+// distinguishes an unreachable backend from "not configured". A non-nil
+// rulesErr (from a failed FetchRules) yields the single "metrics backend error"
+// line.
+func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) MetricEvidence {
+	var out MetricEvidence
 	if !p.isConfigured() {
-		return nil
+		return out
 	}
-
-	var lines []string
 
 	// Collect unique alert names from the group.
 	alertNames := make(map[string]bool)
@@ -240,8 +253,8 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	}
 
 	if rulesErr != nil {
-		lines = append(lines, fmt.Sprintf("metrics backend error: %v", rulesErr))
-		return lines
+		out.Context = append(out.Context, fmt.Sprintf("metrics backend error: %v", rulesErr))
+		return out
 	}
 
 	now := time.Now()
@@ -254,7 +267,9 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 		step = 5 * time.Minute
 	}
 
-	// Query the expression for each alert name we found in rules.
+	// Query the expression for each alert name we found in rules. The
+	// expression is replayed as written, so its result may span more than the
+	// resolved subject; it stays context rather than being promoted to DIRECT.
 	sortedNames := make([]string, 0, len(alertNames))
 	for name := range alertNames {
 		sortedNames = append(sortedNames, name)
@@ -264,35 +279,42 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	for _, name := range sortedNames {
 		expr, ok := rules[name]
 		if !ok {
-			lines = append(lines, fmt.Sprintf("no rule expression found for alert %s", name))
+			out.Context = append(out.Context, fmt.Sprintf("no rule expression found for alert %s", name))
 			continue
 		}
 
 		summaries, err := p.queryRange(ctx, expr, start, now, step)
 		if err != nil {
-			lines = append(lines, fmt.Sprintf("query error for %s: %v", name, err))
+			out.Context = append(out.Context, fmt.Sprintf("query error for %s: %v", name, err))
 			continue
 		}
 		if len(summaries) == 0 {
-			lines = append(lines, fmt.Sprintf("%s: no data in range", name))
+			out.Context = append(out.Context, fmt.Sprintf("%s: no data in range", name))
 			continue
 		}
 
 		for _, s := range summaries {
 			line := fmt.Sprintf("%s %s", name, s.render())
-			lines = append(lines, line)
+			out.Context = append(out.Context, line)
 		}
 	}
 
-	// Query fixed context metrics if namespace label exists on any alert.
+	// Query fixed context metrics if a namespace label exists on any alert.
+	// These are the only queries that can be bounded to the resolved subject:
+	// with a pod label they render as direct evidence, without one they are
+	// namespace-wide and belong in context.
 	ns := g.Label("namespace")
 	pod := g.Label("pod")
 	if ns != "" {
 		contextMetrics := p.queryContextMetrics(ctx, ns, pod, start, now, step)
-		lines = append(lines, contextMetrics...)
+		if pod != "" {
+			out.Subject = append(out.Subject, contextMetrics...)
+		} else {
+			out.Context = append(out.Context, contextMetrics...)
+		}
 	}
 
-	return lines
+	return out
 }
 
 // queryContextMetrics queries a fixed set of operational metrics for the given
@@ -301,23 +323,7 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, start, end time.Time, step time.Duration) []string {
 	var lines []string
 
-	labelFilter := fmt.Sprintf(`namespace="%s"`, escapeLabelValue(ns))
-	if pod != "" {
-		labelFilter += fmt.Sprintf(`,pod="%s"`, escapeLabelValue(pod))
-	}
-
-	type metricQuery struct {
-		name string
-		expr string
-	}
-
-	queries := []metricQuery{
-		{"container_restarts", fmt.Sprintf(`kube_pod_container_status_restarts_total{%s}`, labelFilter)},
-		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / ignoring(container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
-		{"cpu_throttle_ratio", fmt.Sprintf(`rate(container_cpu_throttled_seconds_total{%s}[5m])`, labelFilter)},
-	}
-
-	for _, q := range queries {
+	for _, q := range contextMetricQueries(ns, pod) {
 		summaries, err := p.queryRange(ctx, q.expr, start, end, step)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("%s: query error: %v", q.name, err))
@@ -335,9 +341,36 @@ func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, st
 	return lines
 }
 
-// escapeLabelValue escapes double quotes in a label value for safe embedding
-// in PromQL string literals.
+// contextMetricQueries builds the fixed context-metric expressions for the
+// given namespace and optional pod, escaping label values for PromQL string
+// literals. Kept pure (no I/O) so the escaping can be asserted without a
+// live backend.
+func contextMetricQueries(ns, pod string) []struct {
+	name string
+	expr string
+} {
+	labelFilter := fmt.Sprintf(`namespace="%s"`, escapeLabelValue(ns))
+	if pod != "" {
+		labelFilter += fmt.Sprintf(`,pod="%s"`, escapeLabelValue(pod))
+	}
+
+	return []struct {
+		name string
+		expr string
+	}{
+		{"container_restarts", fmt.Sprintf(`kube_pod_container_status_restarts_total{%s}`, labelFilter)},
+		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / ignoring(container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
+		{"cpu_throttle_ratio", fmt.Sprintf(`rate(container_cpu_throttled_seconds_total{%s}[5m])`, labelFilter)},
+	}
+}
+
+// escapeLabelValue escapes backslashes and double quotes in a label value
+// for safe embedding in PromQL string literals. The backslash pass runs first:
+// escaping quotes first would let its pass double the backslashes it inserted,
+// and an unescaped backslash is read by the backend as the start of an escape
+// sequence, breaking the query.
 func escapeLabelValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
 	return strings.ReplaceAll(v, `"`, `\"`)
 }
 

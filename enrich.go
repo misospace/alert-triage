@@ -13,7 +13,9 @@ import (
 	pathpkg "path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +24,14 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 // kube is a minimal read-only Kubernetes client. client-go would pull in a very
 // large dependency tree for what amounts to four GETs, so this talks to the
 // apiserver directly with the in-cluster ServiceAccount credentials.
+//
+// logConcurrency used to live on this struct and was rewritten by every
+// Enrich call. The shared-write/read pattern races when shutdown's
+// drainBuffer runs while a canceled runFlushLoop process is still
+// unwinding — both paths invoke Enrich on the same *kube and the
+// goroutines spawned by fetchPodLogs read k.logConcurrency under no
+// synchronisation. The value now lives only on the per-call path so it
+// never needs to be written here.
 type kube struct {
 	base    string
 	token   string
@@ -82,35 +92,291 @@ func (k *kube) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// podList is the pod collection for a namespace, carrying everything a
+// permission or storage hypothesis can be grounded in: the declared execution
+// identity (pod- and container-level securityContext) and which
+// PersistentVolumeClaims each container mounts. Only read access to pod
+// metadata is used; this is spec/status as the API served it — the API does
+// not expose on-disk file ownership or mode, and nothing here claims to.
 type podList struct {
-	Items []struct {
-		Metadata struct {
-			Name            string            `json:"name"`
-			Namespace       string            `json:"namespace"`
-			Labels          map[string]string `json:"labels"`
-			Annotations     map[string]string `json:"annotations"`
-			OwnerReferences []ownerRef        `json:"ownerReferences"`
-		} `json:"metadata"`
-		Spec struct {
-			NodeName string `json:"nodeName"`
-		} `json:"spec"`
-		Status struct {
-			Phase             string `json:"phase"`
-			ContainerStatuses []struct {
-				Name         string `json:"name"`
-				RestartCount int    `json:"restartCount"`
-				Ready        bool   `json:"ready"`
-				State        map[string]struct {
-					Reason string `json:"reason"`
-				} `json:"state"`
-				LastTerminationState struct {
-					Terminated struct {
-						FinishedAt time.Time `json:"finishedAt"`
-					} `json:"terminated"`
-				} `json:"lastState"`
-			} `json:"containerStatuses"`
-		} `json:"status"`
-	} `json:"items"`
+	Items []podItem `json:"items"`
+}
+
+// podItem is one pod as the apiserver returns it. The declared identity and
+// mounts live under spec (spec.securityContext, spec.containers[].securityContext
+// and spec.containers[].volumeMounts), while runtime state lives under
+// status.containerStatuses; reading either from the other yields an empty shape
+// the API never returns.
+type podItem struct {
+	Metadata struct {
+		Name            string            `json:"name"`
+		Namespace       string            `json:"namespace"`
+		Labels          map[string]string `json:"labels"`
+		Annotations     map[string]string `json:"annotations"`
+		OwnerReferences []ownerRef        `json:"ownerReferences"`
+	} `json:"metadata"`
+	Spec struct {
+		NodeName   string          `json:"nodeName"`
+		Security   *containerID    `json:"securityContext"`
+		Containers []containerSpec `json:"containers"`
+		Volumes    []podVolumeItem `json:"volumes"`
+	} `json:"spec"`
+	Status struct {
+		Phase             string            `json:"phase"`
+		ContainerStatuses []containerStatus `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+// containerSpec is the declared half of a container: its name, the
+// securityContext the spec declares, and the volumeMounts it references. The
+// runtime half stays in containerStatus.
+type containerSpec struct {
+	Name         string            `json:"name"`
+	Security     *containerID      `json:"securityContext"`
+	VolumeMounts []volumeMountItem `json:"volumeMounts"`
+}
+
+// podVolumeItem maps a volume name to its PVC claim, the only volume kind that
+// matters for permission hypotheses. Non-PVC volumes carry no claim and are
+// dropped, so a pod with only emptyDir mounts has an empty map, not a claim
+// that was guessed.
+type podVolumeItem struct {
+	Name string `json:"name"`
+	PVC  *struct {
+		ClaimName string `json:"claimName"`
+	} `json:"persistentVolumeClaim"`
+}
+
+// volumeMountItem is one spec.containers[].volumeMounts entry: the volume name
+// (matched against the pod's volumes) and where it lands.
+type volumeMountItem struct {
+	VolumeName string `json:"name"`
+	MountPath  string `json:"mountPath"`
+	ReadOnly   bool   `json:"readOnly"`
+}
+
+// containerID holds the declared execution identity fields relevant to file
+// access. Fields are pointer-typed so an absent value reads as "unset" rather
+// than 0 (root) — a pod that never declared runAsUser must not be reported as
+// running as root.
+type containerID struct {
+	RunAsUser    *int64 `json:"runAsUser"`
+	RunAsGroup   *int64 `json:"runAsGroup"`
+	FSGroup      *int64 `json:"fsGroup"`
+	RunAsNonRoot *bool  `json:"runAsNonRoot"`
+}
+
+func idInt(v *int64) string {
+	if v == nil {
+		return "unset"
+	}
+	return itoa(int(*v))
+}
+
+// idBool keeps the three-state value of a pointer bool: unset, true, false.
+// Collapsing unset to "false" would invent a declared value the spec never set.
+func idBool(v *bool) string {
+	if v == nil {
+		return "unset"
+	}
+	if *v {
+		return "true"
+	}
+	return "false"
+}
+
+func (c *containerID) format() (runAsUser, runAsGroup, fsGroup, runAsNonRoot string) {
+	if c == nil {
+		return "unset", "unset", "unset", "unset"
+	}
+	return idInt(c.RunAsUser), idInt(c.RunAsGroup), idInt(c.FSGroup), idBool(c.RunAsNonRoot)
+}
+
+// effective returns the identity a container actually declares, following the
+// Kubernetes precedence: the container's securityContext overrides the pod's
+// field by field, and a field neither sets stays unset. It is the declared
+// identity only — the API says nothing about what the image runs as when no
+// value is set, so nothing is guessed. A nil container (the spec container the
+// alert named was not found) still yields the pod-level identity.
+func (c *containerSpec) effective(pod *containerID) containerID {
+	e := containerID{}
+	var sec, podID *containerID
+	if c != nil {
+		sec = c.Security
+	}
+	podID = pod
+	if sec != nil && sec.RunAsUser != nil {
+		e.RunAsUser = sec.RunAsUser
+	} else if podID != nil {
+		e.RunAsUser = podID.RunAsUser
+	}
+	if sec != nil && sec.RunAsGroup != nil {
+		e.RunAsGroup = sec.RunAsGroup
+	} else if podID != nil {
+		e.RunAsGroup = podID.RunAsGroup
+	}
+	if podID != nil {
+		e.FSGroup = podID.FSGroup
+	}
+	if sec != nil && sec.RunAsNonRoot != nil {
+		e.RunAsNonRoot = sec.RunAsNonRoot
+	} else if podID != nil {
+		e.RunAsNonRoot = podID.RunAsNonRoot
+	}
+	return e
+}
+
+// podMount is one container's mount of a claim: the path and whether the mount
+// is read-only. The claim name is the map key on containerMounts' and mount's
+// results.
+type podMount struct {
+	Container string
+	Path      string
+	ReadOnly  bool
+}
+
+// pvcVolumes maps the pod's volume names to their PVC claim. Only PVC volumes
+// carry a claim; every other volume kind (emptyDir, hostPath, ...) is dropped,
+// so a pod with only emptyDir mounts has no claim, not one that was guessed.
+func (p podItem) pvcVolumes() map[string]string {
+	out := map[string]string{}
+	for _, v := range p.Spec.Volumes {
+		if v.PVC != nil && v.PVC.ClaimName != "" {
+			out[v.Name] = v.PVC.ClaimName
+		}
+	}
+	return out
+}
+
+// containerMounts maps one spec container's volumeMounts to the PVC claims it
+// references, keyed by claim name. Unknown volume names yield no entry.
+func (p podItem) containerMounts(name string) map[string]podMount {
+	vols := p.pvcVolumes()
+	out := map[string]podMount{}
+	for _, c := range p.Spec.Containers {
+		if c.Name != name {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if claim, ok := vols[m.VolumeName]; ok {
+				out[claim] = podMount{Container: c.Name, Path: m.MountPath, ReadOnly: m.ReadOnly}
+			}
+		}
+	}
+	return out
+}
+
+// mount is the union of all containers' claim mounts, keyed by claim name; the
+// first container that mounts a claim wins. It backs claims, which is what
+// sibling discovery matches on.
+func (p podItem) mount() map[string]podMount {
+	out := map[string]podMount{}
+	for _, c := range p.Spec.Containers {
+		for claim, m := range p.containerMounts(c.Name) {
+			if _, ok := out[claim]; !ok {
+				out[claim] = m
+			}
+		}
+	}
+	return out
+}
+
+// claims returns the set of PVC claims the pod's containers mount.
+func (p podItem) claims() map[string]bool {
+	out := map[string]bool{}
+	for claim := range p.mount() {
+		out[claim] = true
+	}
+	return out
+}
+
+// failing reports the containers that are not currently in the running state.
+// For a non-Succeeded pod every non-running container state (CrashLoopBackOff,
+// OOMKilled, ImagePullBackOff, a terminated crash, ...) is a failing container;
+// a healthy container in a Running pod is in the running state and is not
+// reported. Succeeded pods are never failing.
+func (p podItem) failing() map[string]bool {
+	if p.Status.Phase == "Succeeded" {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.State.Running == nil {
+			out[cs.Name] = true
+		}
+	}
+	return out
+}
+
+// ready summarizes the pod's container readiness in one string.
+func (p podItem) ready() string {
+	var running, ready, total int
+	for _, cs := range p.Status.ContainerStatuses {
+		total++
+		if cs.State.Running != nil {
+			running++
+		}
+		if cs.Ready {
+			ready++
+		}
+	}
+	return fmt.Sprintf("%d/%d ready, %d running", ready, total, running)
+}
+
+// containerSpec returns the declared spec entry for a container name, or nil
+// when the spec does not carry it. The runtime status may name a container the
+// spec read did not return, in which case there is no declared identity to read.
+func (p podItem) containerSpec(name string) *containerSpec {
+	for i := range p.Spec.Containers {
+		if p.Spec.Containers[i].Name == name {
+			return &p.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+// containerStatus is the subset of a pod's containerStatuses this service
+// reads. The current state and the last state are the same Kubernetes union
+// (running | waiting | terminated), so one type models both.
+type containerStatus struct {
+	Name         string         `json:"name"`
+	RestartCount int            `json:"restartCount"`
+	Ready        bool           `json:"ready"`
+	State        containerState `json:"state"`
+	LastState    containerState `json:"lastState"`
+}
+
+// containerState is the union of the three mutually exclusive container
+// states. Each member is a pointer so the zero value (nil) means "absent from
+// the JSON", which is how the apiserver signals which of the three states a
+// container is actually in: exactly one is non-nil.
+type containerState struct {
+	Running    *runningState    `json:"running"`
+	Waiting    *waitingState    `json:"waiting"`
+	Terminated *terminatedState `json:"terminated"`
+}
+
+type runningState struct {
+	StartedAt time.Time `json:"startedAt"`
+}
+
+type waitingState struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// terminatedState is the subset of the "terminated" state that tells an
+// operator why a container ended: the exit code, reason, any message the
+// container left, and when it finished. For a one-shot Job container that
+// terminated once and never restarted, this is state.terminated and the
+// pod's current log is the evidence; for a restarted (CrashLoop) container
+// the last failed run lives in lastState.terminated instead.
+type terminatedState struct {
+	ExitCode   int       `json:"exitCode"`
+	Reason     string    `json:"reason"`
+	Message    string    `json:"message"`
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
 }
 
 type eventItem struct {
@@ -170,11 +436,15 @@ type nodeList struct {
 // ownerRef is one entry of a Kubernetes object's metadata.ownerReferences. It
 // identifies the owner of this object; a pod created by a Job carries a
 // reference with Kind "Job" whose UID and Name match the job's metadata, which
-// is how the service confirms a pod is owned by a job it resolved.
+// is how the service confirms a pod is owned by a job it resolved. apiVersion
+// and controller are carried so an ownership chain can tell a controller
+// owner (the real one) from a non-controller owner on the same object.
 type ownerRef struct {
-	Kind string `json:"kind"`
-	Name string `json:"name"`
-	UID  string `json:"uid"`
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	UID        string `json:"uid"`
+	Controller *bool  `json:"controller"`
 }
 
 // jobObj is the subset of the batch/v1 Job shape this service reads for a
@@ -182,13 +452,18 @@ type ownerRef struct {
 // identifies the pods it created (their ownerReferences point at it), and the
 // controller label the controller manager copies from the job's pod template
 // onto each pod (job-name=<name>) is what a listing fallback keys on when
-// ownership cannot otherwise be established.
+// ownership cannot otherwise be established. The job's own ownerReferences
+// and labels say what the job *is* - a Job generated by a backup or
+// migration controller is owned by that controller even when its name is
+// derived from the application it serves.
 type jobObj struct {
 	Metadata struct {
-		Name            string     `json:"name"`
-		Namespace       string     `json:"namespace"`
-		UID             string     `json:"uid"`
-		OwnerReferences []ownerRef `json:"ownerReferences"`
+		Name            string            `json:"name"`
+		Namespace       string            `json:"namespace"`
+		UID             string            `json:"uid"`
+		Labels          map[string]string `json:"labels"`
+		Annotations     map[string]string `json:"annotations"`
+		OwnerReferences []ownerRef        `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
 		Template struct {
@@ -202,25 +477,77 @@ type jobObj struct {
 // jobRef is a job named by an alert in a group that was resolved (read) from
 // this client's cluster. The controller label it stamps on its pods
 // (ControllerKey/LabelValue) is the listing fallback used to attribute pods
-// when ownership cannot otherwise be established.
+// when ownership cannot otherwise be established. OwnerRefs and Identity
+// carry the job's own ownership and identifying labels, which say what the
+// job is (its controller) rather than only that it exists; they feed the
+// ownership chain the model is shown.
 type jobRef struct {
 	Namespace     string
 	Name          string
 	UID           string
 	ControllerKey string // the controller label key the job stamps on its pods
 	LabelValue    string // its value, usually the job name
+	OwnerRefs     []ownerRef
+	Identity      string // selected identifying labels/annotations, see identityTags
 }
 
 // Enrichment is the evidence gathered for one group.
 type Enrichment struct {
 	Nodes         []string
 	UnhealthyPods []string
-	PodLogs       map[string]string // pod key -> tail of previous container log
+	// PodID carries the declared execution identity and PVC mount
+	// relationships of the pods the alerts resolved to (a named pod, or a pod
+	// owned by a named Job), so permission hypotheses can be grounded in live
+	// spec data. The identity is what the pod declared — the API does not
+	// expose on-disk file ownership or mode, and nothing here claims to.
+	// Entries are keyed "ns/pod" so the digest names the subject.
+	PodID map[string]string
+	// PVCSiblings is comparison context: other pods in the alert's namespaces
+	// that mount a claim one of the alert's target pods also mounts, with their
+	// phase/readiness. It lets a healthy same-claim sibling distinguish "the
+	// mover failed" from "the serving workload is also unhealthy", without
+	// claiming the sibling is the application — a same-claim mount is a
+	// relationship, not proof of what the claim serves. Claim names are
+	// namespace-local, so a sibling is only matched inside its own namespace.
+	PVCSiblings []string
+	// PodLogs maps a pod key ("namespace/name") to the tail of the log stream
+	// that holds the failure evidence. The stream is chosen per container, not
+	// per pod: a container that never restarted (a one-shot Job) carries its
+	// failure in its *current* log, while a restarted one (a CrashLoop) carries
+	// it in the previous instance, and the container itself is named in the
+	// request so a multi-container pod is not answered by a default choice.
+	PodLogs map[string]string
+	// PodLogProvenance tells the renderer which container and which stream
+	// each PodLogs entry came from, so a "previous-container tail" label
+	// does not silently mislabel a one-shot Job's current log as a previous
+	// one. Keys match PodLogs.
+	PodLogProvenance map[string]podLogProvenance
+	// ContainerDiagnostics are the structured readings this service made
+	// itself about the containers of the pods above: the exit code,
+	// termination reason and finish time of the failed container run.
+	// Rendered outside the untrusted fence, like pod phases and node
+	// conditions — fencing this service's own reading would tell the model to
+	// distrust it (AGENTS.md). The container's own termination message is
+	// carried separately and fenced.
+	ContainerDiagnostics []string
+	// ContainerTerminationMessages are the workload-authored termination
+	// messages of the failed container runs above. They are the container's
+	// own words, so the renderer fences them, like event messages, rather
+	// than trusting them as a service reading.
+	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
-	// "off", "empty", or "error" so missing configuration is not confused with
-	// a successful query that returned no lines.
+	// "off", "empty", "ambient", or "error" so missing configuration is not
+	// confused with a successful query that returned no lines. "empty" means
+	// the queries issued returned no lines; "ambient" means no concrete subject
+	// could be resolved, the namespace-wide fallback did return lines, and those
+	// lines were routed to Ambient — the source is configured and answered.
 	BackendLogs  []string
 	BackendState string
+	// BackendScoped records whether the backend-log query was bounded to a
+	// resolved subject pod rather than falling back to the namespace. It keeps
+	// the "empty" state honest: only a subject-scoped query may claim it
+	// returned no lines for the subject (issue #136 review).
+	BackendScoped bool
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -235,6 +562,40 @@ type Enrichment struct {
 	// evidence the alert is about, so it is surfaced as its own finding rather
 	// than only mentioned inside UnhealthyPods.
 	RecentRestarts []string
+	// SubjectPods is the subset of UnhealthyPods that belongs to a resolved
+	// alert subject: a pod an alert named, or a pod owned by a Job an alert
+	// named. Only this subset is guaranteed subject-scoped, so only it may be
+	// presented as DIRECT SUBJECT EVIDENCE. UnhealthyPods is the full
+	// namespace scan and is context.
+	SubjectPods []string
+	// ContextPods is UnhealthyPods minus SubjectPods: namespace-wide pod
+	// failure state not known to concern the alert.
+	ContextPods []string
+	// SubjectPodObserved records whether at least one resolved subject pod was
+	// actually found in the namespace listing. When false, the Subject* fields
+	// are empty because no subject pod was inspected, not because the subject
+	// was healthy; the renderer must say so rather than emit a health negative
+	// scoped to a subject it never saw (issue #136 review).
+	SubjectPodObserved bool
+	// SubjectRestarts and ContextRestarts split RecentRestarts the same way.
+	SubjectRestarts []string
+	ContextRestarts []string
+	// SubjectContainerDiagnostics and ContextContainerDiagnostics split
+	// ContainerDiagnostics the same way: only a resolved subject's structured
+	// container reading is direct evidence.
+	SubjectContainerDiagnostics []string
+	ContextContainerDiagnostics []string
+	// SubjectContainerTerminationMessages and ContextContainerTerminationMessages
+	// split ContainerTerminationMessages the same way.
+	SubjectContainerTerminationMessages []string
+	ContextContainerTerminationMessages []string
+	// SubjectPodLogs and ContextPodLogs split PodLogs the same way: only a
+	// resolved subject's logs are direct evidence. Keys match PodLogs, and the
+	// matching Subject/ContextPodLogProvenance carries the container and stream.
+	SubjectPodLogs          map[string]string
+	ContextPodLogs          map[string]string
+	SubjectPodLogProvenance map[string]podLogProvenance
+	ContextPodLogProvenance map[string]podLogProvenance
 	// Ambient is context not known to concern the alert: cluster-wide findings
 	// when no namespace is named, and namespace events outside a resolved subject
 	// graph. It is kept apart so a coincidence is not read as a cause.
@@ -245,6 +606,14 @@ type Enrichment struct {
 	// half of the scope statement, kept apart from the namespace listing a
 	// failed backup job's own pod can only be reached through.
 	InspectedJobs []string
+	// Ownership is the compact subject relationship of the group's named
+	// workloads, built only from ownerReferences the API actually returned
+	// (see ownershipChain). "Pod/x -> Job/y -> Kind/z" tells the model who
+	// made the failed job; an ownerless job renders with no parent, so a
+	// generated maintenance job is never mistaken for the application it
+	// shares a name with. Entries are workload-authored metadata and are
+	// rendered to the model inside the untrusted fence.
+	Ownership []string
 	// Scope records what was actually inspected, so the narrative can
 	// distinguish "nothing is wrong" from "nothing was looked at".
 	Scope string
@@ -262,12 +631,150 @@ type Enrichment struct {
 	// "none", and a record is attached only to the Kustomization the pod
 	// resolved to, never to every Kustomization in the namespace.
 	KustomizationTopology []string
+	// CommitRelevance classifies the most recent Flux Kustomization revision
+	// for the affected workload against the workload's Git surface: one entry
+	// per resolved Kustomization, populated only when the Git source is GitHub
+	// and the GITHUB_TOKEN client is configured. A healthy Flux reconcile is
+	// not by itself evidence of a change (see fluxActivity); checking the
+	// commit that produced the revision lets the renderer say whether the
+	// reconciled commit actually touched the workload or one of its component
+	// paths, without having to fetch the diff.
+	//
+	// Empty when no Kustomization resolved, when the source is not GitHub,
+	// when the GITHUB_TOKEN env is unset, or when the lookup itself failed;
+	// each non-empty State carries the matching paths or a Reason explaining
+	// the degradation. See CommitRelevance for the three-state contract.
+	CommitRelevance []CommitRelevance
+}
+
+// sameClaimSibMax bounds the same-claim sibling list. A healthy sibling on the
+// same claim is the comparison that tells the operator whose failure it is,
+// but listing the whole namespace is exactly the namespace dump this evidence
+// is meant to avoid.
+const sameClaimSibMax = 3
+
+// identityFields renders a declared identity as the key=value list the prompt
+// and evidence use, preserving "unset" for fields neither the pod nor the
+// container declared.
+func identityFields(id containerID) string {
+	u, gr, fg, nr := id.format()
+	return fmt.Sprintf("runAsUser=%s runAsGroup=%s fsGroup=%s runAsNonRoot=%s", u, gr, fg, nr)
+}
+
+// podIdentities assembles the Enrichment.PodID lines. It works from the pods
+// already gathered for the group, so it adds no requests and no permissions:
+// the same read-only GETs as the rest of Enrich. For each target pod, one line
+// per failing container: the container, its effective declared securityContext
+// (Kubernetes precedence: the container's securityContext overrides the pod's
+// field by field, unset stays unset), and the PVC claims its containers mount
+// with the mount paths. The identity is the declared identity only — the
+// Kubernetes API does not expose on-disk file ownership or mode, and no line
+// claims to know it.
+func podIdentities(targetPods map[string]*podItem) map[string]string {
+	out := map[string]string{}
+	keys := make([]string, 0, len(targetPods))
+	for k := range targetPods {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		p := targetPods[key]
+		if p == nil {
+			continue // the alert named a pod the namespace list never returned
+		}
+		failing := p.failing()
+		names := make([]string, 0, len(failing))
+		for n := range failing {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		if len(names) == 0 {
+			continue
+		}
+		var b strings.Builder
+		b.WriteString(key)
+		for i, n := range names {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			id := p.containerSpec(n).effective(p.Spec.Security)
+			fmt.Fprintf(&b, "container %s (declared: %s)", n, identityFields(id))
+			claims := p.containerMounts(n)
+			claimNames := make([]string, 0, len(claims))
+			for c := range claims {
+				claimNames = append(claimNames, c)
+			}
+			sort.Strings(claimNames)
+			var mounts []string
+			for _, c := range claimNames {
+				m := claims[c]
+				mode := "read-write"
+				if m.ReadOnly {
+					mode = "read-only"
+				}
+				mounts = append(mounts, c+" at "+m.Path+" ("+mode+")")
+			}
+			if len(mounts) > 0 {
+				b.WriteString(", mounts " + strings.Join(mounts, ", "))
+			}
+		}
+		out[key] = b.String()
+	}
+	return out
+}
+
+// sameClaimTargets is the set of PVC claims mounted by the target pods in one
+// namespace. Claim names are namespace-local, so matching must be scoped to the
+// namespace a pod lives in; a claim named "data" in ns-a and one named "data"
+// in ns-b are unrelated objects and must not be conflated.
+func sameClaimTargets(targetPods map[string]*podItem, namespace string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range targetPods {
+		if p == nil || p.Metadata.Namespace != namespace {
+			continue
+		}
+		for claim := range p.claims() {
+			out[claim] = true
+		}
+	}
+	return out
+}
+
+// siblingClaimDetail describes the containers of a same-claim sibling that
+// actually mount the matched claim: each container's effective declared
+// identity and its mount path/read-only state. It is the comparison the
+// permission hypothesis needs — the mover's declared UID/GID/mount beside the
+// serving workload's on the same claim — and only containers that mount the
+// claim are listed, so a multi-container sibling does not imply the others
+// touch the volume. Returns "" when the spec read carried no matching mount.
+func siblingClaimDetail(p *podItem, claim string) string {
+	var parts []string
+	for i := range p.Spec.Containers {
+		c := &p.Spec.Containers[i]
+		m, ok := p.containerMounts(c.Name)[claim]
+		if !ok {
+			continue
+		}
+		mode := "read-write"
+		if m.ReadOnly {
+			mode = "read-only"
+		}
+		parts = append(parts, fmt.Sprintf("container %s (declared: %s), %s at %s (%s)",
+			c.Name, identityFields(c.effective(p.Spec.Security)), claim, m.Path, mode))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }
 
 func (e Enrichment) empty() bool {
 	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 && (e.BackendState == "" || e.BackendState == "off") &&
-		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 && len(e.InspectedJobs) == 0 &&
+		len(e.PodID) == 0 && len(e.PVCSiblings) == 0 &&
+		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 &&
+		(e.BackendState == "" || e.BackendState == "off" || e.BackendState == "ambient") &&
+		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 &&
+		len(e.InspectedJobs) == 0 && len(e.Ownership) == 0 &&
+		len(e.ContainerDiagnostics) == 0 &&
+		len(e.ContainerTerminationMessages) == 0 &&
 		len(e.KustomizationTopology) == 0
 }
 
@@ -326,7 +833,14 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 // When the group's cluster label does not match this client's cluster, the
 // enrichment is skipped and Scope reports "cluster state unavailable" to avoid
 // producing wrong evidence from a foreign API server.
-func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *Config) Enrichment {
+//
+// gh is the optional GitHub client used to classify the most recent
+// reconciled commit against the workload's Git surface (issue #135). It is
+// passed through here so the lookup sits alongside the rest of the
+// enrichment (one cluster read per Kustomization, no duplicate fetches);
+// nil is the common case (no GITHUB_REPO/GITHUB_TOKEN env), and the
+// CommitRelevance slice is left empty in that case.
+func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *Config, gh *gitHubClient) Enrichment {
 	var e Enrichment
 	if k == nil {
 		e.Scope = "cluster state unavailable"
@@ -367,9 +881,16 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// previous-container logs when the current container has already recovered
 	// (e.g. an OOMKilled container that has been replaced by a healthy one).
 	targetPods := map[string]bool{}
+	// targetPodItems carries the full pod object for every target, filled from
+	// the namespace listings below. It is what the declared identity and PVC
+	// relationships are read from; a target the listing never returned stays
+	// nil and contributes no identity line rather than a guessed one.
+	targetPodItems := map[string]*podItem{}
 	for _, a := range g.Alerts {
 		if a.Labels["pod"] != "" && a.namespace() != "" {
-			targetPods[a.namespace()+"/"+a.Labels["pod"]] = true
+			key := a.namespace() + "/" + a.Labels["pod"]
+			targetPods[key] = true
+			targetPodItems[key] = nil
 		}
 	}
 
@@ -404,6 +925,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.EventsScoped = len(resolvedSubjects) > 0
 
 	var seenPods []podRef
+	var podLogSpecs []podLogSpec
+	// sibSeen dedupes same-claim siblings across namespaces by claim+pod key;
+	// the cap is global so a group spanning many namespaces does not turn the
+	// sibling list into a namespace dump.
+	sibSeen := map[string]bool{}
 	for _, ns := range g.Namespaces {
 		esc := url.PathEscape(ns)
 
@@ -412,55 +938,17 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			logf("enrich: pods in %s: %v", ns, err)
 		}
 		type scoredPod struct {
-			desc    string
-			score   int // higher = worse health
-			restart int // restart count, surfaced as a finding on its own
-			key     string
-		}
-		var unhealthy []scoredPod
-		for _, p := range pods.Items {
-			seenPods = append(seenPods, podRef{
-				Name:        p.Metadata.Name,
-				Namespace:   p.Metadata.Namespace,
-				Annotations: p.Metadata.Annotations,
-			})
-			key := p.Metadata.Namespace + "/" + p.Metadata.Name
-			for _, cs := range p.Status.ContainerStatuses {
-				reason := ""
-				for state, s := range cs.State {
-					if state != "running" && s.Reason != "" {
-						reason = s.Reason
-					}
-				}
-				restartedRecently := cs.RestartCount > 0 && !cs.LastTerminationState.Terminated.FinishedAt.IsZero() &&
-					cs.LastTerminationState.Terminated.FinishedAt.After(since)
-				if p.Status.Phase == "Running" && cs.Ready && reason == "" {
-					// A recovered pod that the alert named still matters: its
-					// previous container's log is the evidence we want.
-					if !targetPods[key] && !restartedRecently {
-						continue
-					}
-				}
-				if p.Status.Phase == "Succeeded" {
-					continue
-				}
-				desc := fmt.Sprintf("%s %s", key, p.Status.Phase)
-				if reason != "" {
-					desc += " (" + reason + ")"
-				}
-				if cs.RestartCount > 0 {
-					desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
-				}
-				unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key})
-				if restartedRecently {
-					e.RecentRestarts = append(e.RecentRestarts, fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339)))
-				}
-				break
-			}
+			desc      string
+			score     int // higher = worse health
+			restart   int // restart count, surfaced as a finding on its own
+			key       string
+			container string
+			mode      string // log stream to fetch: "current", "previous", or "" to skip
 		}
 		// Promote the pods owned by a job the group's alerts named into the
-		// direct-target set, so they survive namespace noise and list
-		// truncation exactly as a pod-labelled alert's own pod does.
+		// direct-target set before scoring, so a job-owned pod is recognised as
+		// a subject while its state, logs and termination are recorded — not
+		// only when the post-scan sort decides which pods survive truncation.
 		for _, j := range jobTargets {
 			if j.Namespace != ns {
 				continue
@@ -470,6 +958,81 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				if jobOwnedBy(*j, owner) {
 					targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
 					resolvedSubjects[subjectKey{kind: "Pod", name: p.Metadata.Name, namespace: p.Metadata.Namespace}] = true
+				}
+			}
+		}
+		var unhealthy []scoredPod
+		for pi := range pods.Items {
+			p := &pods.Items[pi]
+			seenPods = append(seenPods, podRef{
+				Name:        p.Metadata.Name,
+				Namespace:   p.Metadata.Namespace,
+				Annotations: p.Metadata.Annotations,
+				Labels:      p.Metadata.Labels,
+				OwnerRefs:   p.Metadata.OwnerReferences,
+			})
+			key := p.Metadata.Namespace + "/" + p.Metadata.Name
+			if targetPods[key] {
+				targetPodItems[key] = p
+			}
+			// Record that a resolved subject was actually seen, before the
+			// Succeeded skip: a completed one-shot pod is still a subject we
+			// inspected, and its absence from the Subject* findings is then a
+			// true negative rather than "nothing was looked at".
+			if targetPods[key] {
+				e.SubjectPodObserved = true
+			}
+			if p.Status.Phase == "Succeeded" {
+				// A completed one-shot job: its container's terminated state is
+				// a clean exit, not failure evidence, so neither a diagnostic
+				// line nor a log stream is worth shipping for it.
+				continue
+			}
+			// Only a pod an alert named, or a pod owned by a Job an alert
+			// named, is a resolved subject. Everything else in the namespace is
+			// context, so the renderer never promotes namespace noise to
+			// DIRECT SUBJECT EVIDENCE (issue #136 review).
+			isSubject := targetPods[key]
+			for i := range p.Status.ContainerStatuses {
+				cs := &p.Status.ContainerStatuses[i]
+				if recentlyRestarted(*cs, since) {
+					line := fmt.Sprintf("%s container %s restarted %d time(s) since %s", key, cs.Name, cs.RestartCount, since.Format(time.RFC3339))
+					e.RecentRestarts = append(e.RecentRestarts, line)
+					if isSubject {
+						e.SubjectRestarts = append(e.SubjectRestarts, line)
+					} else {
+						e.ContextRestarts = append(e.ContextRestarts, line)
+					}
+				}
+			}
+			unhealthyPod, cs := podEvidence(isSubject, p.Status.ContainerStatuses, since)
+			if !unhealthyPod {
+				continue
+			}
+			mode := podLogMode(cs)
+			reason := stateReason(cs)
+			desc := fmt.Sprintf("%s %s", key, p.Status.Phase)
+			if reason != "" {
+				desc += " (" + reason + ")"
+			}
+			if cs.RestartCount > 0 {
+				desc += fmt.Sprintf(" restarts=%d", cs.RestartCount)
+			}
+			unhealthy = append(unhealthy, scoredPod{desc: desc, score: podHealthScore(p.Status.Phase, reason, cs.Ready, cs.RestartCount), restart: cs.RestartCount, key: key, container: cs.Name, mode: mode})
+			if d := containerReadingLine(key, *cs); d != "" {
+				e.ContainerDiagnostics = append(e.ContainerDiagnostics, d)
+				if isSubject {
+					e.SubjectContainerDiagnostics = append(e.SubjectContainerDiagnostics, d)
+				} else {
+					e.ContextContainerDiagnostics = append(e.ContextContainerDiagnostics, d)
+				}
+			}
+			if m := containerMessageLine(key, *cs); m != "" {
+				e.ContainerTerminationMessages = append(e.ContainerTerminationMessages, m)
+				if isSubject {
+					e.SubjectContainerTerminationMessages = append(e.SubjectContainerTerminationMessages, m)
+				} else {
+					e.ContextContainerTerminationMessages = append(e.ContextContainerTerminationMessages, m)
 				}
 			}
 		}
@@ -485,6 +1048,60 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		})
 		for _, sp := range unhealthy {
 			e.UnhealthyPods = append(e.UnhealthyPods, sp.desc)
+			if targetPods[sp.key] {
+				e.SubjectPods = append(e.SubjectPods, sp.desc)
+			} else {
+				e.ContextPods = append(e.ContextPods, sp.desc)
+			}
+			if sp.mode != "" {
+				parts := strings.SplitN(sp.key, "/", 2)
+				podLogSpecs = append(podLogSpecs, podLogSpec{
+					Namespace: parts[0],
+					Name:      parts[1],
+					Container: sp.container,
+					Previous:  sp.mode == "previous",
+				})
+			}
+		}
+
+		// Same-claim siblings: other pods in this namespace that mount a claim
+		// one of the alert's target pods in the same namespace mounts. The
+		// comparison is the diagnostic for permission failures: a mover that
+		// ran as a non-root UID against a claim whose data an application wrote
+		// as root is a hypothesis the spec alone supports, and a healthy
+		// sibling on the same claim tells the operator the failure is the
+		// mover, not the storage.
+		//
+		// Siblings are never labelled as the application. They mount the same
+		// claim; what workloads live on it is a relationship only the operator
+		// knows, and the prompt says so. Claims are namespace-local, so the
+		// target set is scoped to this namespace.
+		targetClaims := sameClaimTargets(targetPodItems, ns)
+		for pi := range pods.Items {
+			p := &pods.Items[pi]
+			if targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] {
+				continue
+			}
+			claims := make([]string, 0, len(p.claims()))
+			for claim := range p.claims() {
+				claims = append(claims, claim)
+			}
+			sort.Strings(claims)
+			for _, claim := range claims {
+				if !targetClaims[claim] {
+					continue
+				}
+				k2 := claim + "\x00" + p.Metadata.Namespace + "/" + p.Metadata.Name
+				if sibSeen[k2] || len(e.PVCSiblings) >= sameClaimSibMax {
+					continue
+				}
+				sibSeen[k2] = true
+				line := fmt.Sprintf("same-claim %s: %s %s (%s)", claim, p.Metadata.Namespace+"/"+p.Metadata.Name, p.Status.Phase, p.ready())
+				if d := siblingClaimDetail(p, claim); d != "" {
+					line += "; " + d
+				}
+				e.PVCSiblings = append(e.PVCSiblings, line)
+			}
 		}
 
 		if items, err := k.fetchEvents(ctx, ns); err == nil {
@@ -498,20 +1115,79 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.FluxActivity = append(e.FluxActivity, k.fluxActivity(ctx, esc, since)...)
 	}
 
+	// Read the declared identity and PVC relationships of every resolved target
+	// (a pod an alert named, or a pod owned by a Job an alert named) from the
+	// live spec objects gathered above. Same-claim siblings are comparison
+	// context and are capped; the identity lines are the direct finding.
+	e.PodID = podIdentities(targetPodItems)
+	e.PVCSiblings = dedupe(e.PVCSiblings)
 	e.Nodes = capList(e.Nodes, 6)
 	e.UnhealthyPods = capList(e.UnhealthyPods, 8)
+	e.SubjectPods = capList(e.SubjectPods, 8)
+	e.ContextPods = capList(e.ContextPods, 8)
 	e.RecentRestarts = capList(dedupe(e.RecentRestarts), 6)
-	e.PodLogs = k.fetchPodLogs(ctx, e.UnhealthyPods)
+	e.SubjectRestarts = capList(dedupe(e.SubjectRestarts), 6)
+	e.ContextRestarts = capList(dedupe(e.ContextRestarts), 6)
+	e.ContainerDiagnostics = capList(dedupe(e.ContainerDiagnostics), 8)
+	e.SubjectContainerDiagnostics = capList(dedupe(e.SubjectContainerDiagnostics), 8)
+	e.ContextContainerDiagnostics = capList(dedupe(e.ContextContainerDiagnostics), 8)
+	e.ContainerTerminationMessages = capList(dedupe(e.ContainerTerminationMessages), 8)
+	e.SubjectContainerTerminationMessages = capList(dedupe(e.SubjectContainerTerminationMessages), 8)
+	e.ContextContainerTerminationMessages = capList(dedupe(e.ContextContainerTerminationMessages), 8)
+	// The per-pod concurrency lives on the stack, not on *kube: the SIGTERM
+	// shutdown path calls drainBuffer while runFlushLoop's canceled process
+	// may still be unwinding, and both paths run Enrich on the same *kube.
+	// Writing the value into k would race with fetchPodLogs's goroutines
+	// reading it. Passing the normalised value keeps the shared struct
+	// immutable across concurrent callers (issue #146).
+	logConcurrency := normalizePodLogConcurrency(cfg.PodLogConcurrency)
+	e.PodLogs, e.PodLogProvenance = k.fetchPodLogs(ctx, podLogSpecs, logConcurrency)
+	// Split the log map by subject membership so the renderer can present only
+	// a resolved subject's logs as direct evidence and everything else as
+	// context. Keys are "namespace/name", the same form targetPods uses.
+	if len(e.PodLogs) > 0 {
+		e.SubjectPodLogs = map[string]string{}
+		e.ContextPodLogs = map[string]string{}
+		e.SubjectPodLogProvenance = map[string]podLogProvenance{}
+		e.ContextPodLogProvenance = map[string]podLogProvenance{}
+		for key, log := range e.PodLogs {
+			if targetPods[key] {
+				e.SubjectPodLogs[key] = log
+				e.SubjectPodLogProvenance[key] = e.PodLogProvenance[key]
+			} else {
+				e.ContextPodLogs[key] = log
+				e.ContextPodLogProvenance[key] = e.PodLogProvenance[key]
+			}
+		}
+	}
 	if k.logs != nil {
+		var res backendLogResult
 		var err error
-		e.BackendLogs, err = k.logs.fetchBackendLogsResult(ctx, g, window)
+		// The query is subject-scoped exactly when a resolved subject existed;
+		// otherwise fetchBackendLogsResult falls back to the namespace.
+		e.BackendScoped = len(targetPods) > 0
+		res, err = k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
 		if err != nil {
 			e.BackendState = "error"
 			logf("enrich: backend logs: %v", err)
-		} else if len(e.BackendLogs) == 0 {
-			e.BackendState = "empty"
 		} else {
-			e.BackendState = "ok"
+			e.BackendLogs = res.Primary
+			// Namespace-wide lines (present only when no concrete subject was
+			// resolved) are ambient context for ruling things out, never evidence
+			// about the failing resource, so they go to Ambient, not BackendLogs.
+			e.Ambient = append(e.Ambient, res.Ambient...)
+			switch {
+			case len(res.Primary) > 0:
+				e.BackendState = "ok"
+			case len(res.Ambient) > 0:
+				// The backend did return lines — it is the no-subject
+				// fallback. Rendering this as "empty" would put a false
+				// negative in the prompt next to the very lines we just
+				// routed to BACKGROUND.
+				e.BackendState = "ambient"
+			default:
+				e.BackendState = "empty"
+			}
 		}
 	} else {
 		e.BackendState = "off"
@@ -520,9 +1196,147 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	e.FluxActivity = capList(dedupe(e.FluxActivity), 6)
 	// Ambient only has to be enough for the model to rule things out.
 	e.Ambient = capList(dedupe(e.Ambient), 5)
+	// Ownership is built only from data read in this call: the jobs the
+	// alerts named and the pods the listing returned. Nothing is derived from
+	// names, so a job that merely shares its name with the application it
+	// serves is not reported as owned by it.
+	jobKeys := make([]string, 0, len(jobTargets))
+	for key := range jobTargets {
+		jobKeys = append(jobKeys, key)
+	}
+	sort.Strings(jobKeys)
+	for _, key := range jobKeys {
+		j := jobTargets[key]
+		jkey := j.Namespace + "/" + j.Name
+		// The job's parent tail is repeated on each pod it owns so every line
+		// describes a complete relationship, even when a group resolves jobs.
+		tail := ""
+		if o, ok := controllerOwnerRef(j.OwnerRefs); ok {
+			tail = " -> " + o.Kind + "/" + o.Name
+		}
+		e.Ownership = append(e.Ownership, ownershipChain("Job", jkey, j.OwnerRefs, j.Identity))
+		for _, p := range seenPods {
+			if !jobOwnedBy(*j, podOwner{Labels: p.Labels, OwnerReferences: p.OwnerRefs}) {
+				continue
+			}
+			entry := "Pod/" + p.Namespace + "/" + p.Name
+			if id := identityTags(p.Labels, p.Annotations); id != "" {
+				entry += " [" + id + "]"
+			}
+			e.Ownership = append(e.Ownership, entry+" -> Job/"+jkey+tail)
+		}
+	}
 	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
 	e.KustomizationTopology = k.resolveKustomizationTopology(ctx, seenPods)
+	if gh != nil {
+		e.CommitRelevance = k.resolveCommitRelevance(ctx, gh, seenPods)
+	}
 	return e
+}
+
+// resolveCommitRelevance checks, for every Flux Kustomization the pods
+// resolved to, whether the commit the Kustomization is currently reconciled
+// at actually touches the workload's Git surface. The result is one
+// CommitRelevance per unique Kustomization; non-Flux owners (Argo, a
+// fallback GITOPS_REPO) are skipped because the GitHub commit API only
+// answers the question when the source is GitHub.
+//
+// The lookup is best-effort and never blocks the digest: a nil gh, a
+// non-GitHub URL, an unparseable revision, or any API error degrades to
+// State == "unknown" with a one-line Reason, leaving RepoPaths and the
+// rest of the evidence intact. The function does not touch RepoPaths
+// itself — it only reads the pods' annotations to find the Kustomizations
+// they belong to, so a future KustomizationTopology lookup (#134) can
+// populate ComponentPaths from the same Kustomization read.
+//
+// Component paths default to nil because the topology signal is not yet
+// available in this branch; once #134 lands, the caller can read the
+// spec.components out of the same Kustomization read and pass them in.
+func (k *kube) resolveCommitRelevance(ctx context.Context, gh *gitHubClient, seenPods []podRef) []CommitRelevance {
+	if gh == nil {
+		return nil
+	}
+	if len(seenPods) == 0 {
+		return nil
+	}
+	type key struct{ ns, name string }
+	seen := map[key]bool{}
+	var out []CommitRelevance
+	for _, p := range seenPods {
+		kustom := p.Annotations["kustomize.toolkit.fluxcd.io/name"]
+		if kustom == "" {
+			continue
+		}
+		ns := p.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+		if ns == "" {
+			ns = p.Namespace
+		}
+		kk := key{ns: ns, name: kustom}
+		if seen[kk] {
+			continue
+		}
+		seen[kk] = true
+		out = append(out, k.fluxKustomizationRelevance(ctx, gh, ns, kustom))
+	}
+	return out
+}
+
+// fluxKustomizationRelevance reads one Flux Kustomization, resolves its
+// GitRepository + path, and (when the source is GitHub) classifies the
+// commit it is currently reconciled at against the workload's path. The
+// returned CommitRelevance always carries enough context to render even
+// when the lookup degraded to "unknown".
+func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient, ns, name string) CommitRelevance {
+	rel := CommitRelevance{State: commitRelevanceUnknown}
+	if k == nil {
+		rel.Reason = "no Kubernetes client available for this cluster"
+		return rel
+	}
+	var kuz struct {
+		Spec struct {
+			Path      string `json:"path"`
+			SourceRef struct {
+				Name string `json:"name"`
+				Kind string `json:"kind"`
+			} `json:"sourceRef"`
+			Components []string `json:"components"`
+		} `json:"spec"`
+		Status struct {
+			LastAppliedRevision string `json:"lastAppliedRevision"`
+		} `json:"status"`
+	}
+	p := "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + ns + "/kustomizations/" + name
+	if err := k.get(ctx, p, &kuz); err != nil {
+		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
+		return rel
+	}
+	srcKind := kuz.Spec.SourceRef.Kind
+	if srcKind == "" {
+		srcKind = "GitRepository"
+	}
+	var src struct {
+		Spec struct {
+			URL string `json:"url"`
+		} `json:"spec"`
+	}
+	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
+	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
+		return rel
+	}
+	rel.RepoURL = src.Spec.URL
+	rel.WorkloadPath = kuz.Spec.Path
+	rel.ComponentPaths = kuz.Spec.Components
+	rel.Revision = kuz.Status.LastAppliedRevision
+	return classifyCommit(ctx, gh, rel.RepoURL, rel.Revision, rel.WorkloadPath, rel.ComponentPaths)
+}
+
+// safeErr renders an err as a string without panicking on nil.
+func safeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // resolveJobs fetches, from this client's cluster, every distinct job that an
@@ -557,6 +1371,8 @@ func (k *kube) resolveJobs(ctx context.Context, g Group) map[string]*jobRef {
 			UID:           job.Metadata.UID,
 			ControllerKey: "job-name",
 			LabelValue:    job.Spec.Template.ObjectMeta.Labels["job-name"],
+			OwnerRefs:     job.Metadata.OwnerReferences,
+			Identity:      identityTags(job.Metadata.Labels, job.Metadata.Annotations),
 		}
 	}
 	return out
@@ -592,14 +1408,91 @@ func jobOwnedBy(j jobRef, p podOwner) bool {
 		return true
 	}
 	if hasJobOwner {
-		// Ownership is known but points at another Job, so labels cannot override it.
+		// Ownership was determinable but no reference pointed at this job.
 		return false
 	}
-	// Without a Job owner reference, the controller label is the best fallback.
+	// No Job owner reference at all, so ownership cannot be established.
 	if j.ControllerKey != "" && j.LabelValue != "" {
 		return p.Labels[j.ControllerKey] == j.LabelValue
 	}
 	return false
+}
+
+// controllerOwnerRef picks the owner reference to chain from. A reference
+// whose controller flag is set is the owner the API means: when an object
+// carries both a controller and a non-controller reference, the non-
+// controller one is a secondary association (e.g. a pod listed under the job
+// it is a backup of) and chaining from it would misreport the parent. If
+// none is flagged, the first reference is the only claim we have and is used.
+func controllerOwnerRef(refs []ownerRef) (ownerRef, bool) {
+	var fallback ownerRef
+	fbSet := false
+	for _, r := range refs {
+		if r.Kind == "" && r.Name == "" {
+			continue
+		}
+		if r.Controller != nil && *r.Controller {
+			return r, true
+		}
+		if !fbSet {
+			fallback, fbSet = r, true
+		}
+	}
+	return fallback, fbSet
+}
+
+// identityTags selects the labels/annotations that identify what an object is,
+// in preference order, and renders them as "key=value" pairs. A whitelist,
+// not a dump: high-cardinality keys (instance hashes, owner UIDs, hash
+// suffixes) would add noise without telling the model what the object is, so
+// they are never shown. Values are workload-authored; callers render them
+// untrusted.
+var identityLabelKeys = []string{
+	"app.kubernetes.io/managed-by", "app.kubernetes.io/name", "app.kubernetes.io/component",
+	"app.kubernetes.io/part-of", "app.kubernetes.io/instance", "app.kubernetes.io/version",
+	"app", "component", "controller", "role",
+}
+
+var identityAnnotationKeys = []string{
+	"kustomize.toolkit.fluxcd.io/name", "kustomize.toolkit.fluxcd.io/namespace",
+	"argocd.argoproj.io/instance",
+}
+
+func identityTags(labels, annotations map[string]string) string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(k, v string) {
+		if v == "" || seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, k+"="+v)
+	}
+	for _, k := range identityLabelKeys {
+		add(k, labels[k])
+	}
+	for _, k := range identityAnnotationKeys {
+		add(k, annotations[k])
+	}
+	return strings.Join(out, ",")
+}
+
+// ownershipChain builds one compact subject-relationship entry,
+// "Kind/ns/name" optionally followed by " -> <owner kind>/<owner name>" when
+// the object carries a controller owner reference, and a bracketed identity
+// string when curated identifying labels/annotations are present. An object
+// with no owner references produces no parent hop: nothing is fabricated, and
+// a job that shares a name with its application is not claimed to be owned by
+// it.
+func ownershipChain(kind, nsName string, refs []ownerRef, identity string) string {
+	s := kind + "/" + nsName
+	if o, ok := controllerOwnerRef(refs); ok {
+		s += " -> " + o.Kind + "/" + o.Name
+	}
+	if identity != "" {
+		s += " [" + identity + "]"
+	}
+	return s
 }
 
 // unhealthyNodes reports nodes that are not Ready, are under pressure, or have
@@ -707,6 +1600,29 @@ func (k *kube) warningEvents(ctx context.Context, namespace string, since time.T
 // podLogTail is the maximum number of lines to fetch per unhealthy pod.
 const podLogTail = 20
 
+// DefaultPodLogConcurrency caps how many per-pod log GETs run at once inside
+// a single fetchPodLogs call. The reads run in parallel so one stalled
+// apiserver cannot serialise the remaining reads of a flush (issue #146);
+// the cap keeps the blast radius bounded to what the API server should
+// absorb during one Enrich. Exported so main.go can derive its envInt
+// default from the same constant — bumping one without the other would
+// drift silently.
+const DefaultPodLogConcurrency = 4
+
+// normalizePodLogConcurrency normalises the configured value: unset or
+// non-positive falls back to the default, and it is clamped to the 8-pod cap
+// so a misconfiguration can never open more concurrent log reads than a group
+// can name.
+func normalizePodLogConcurrency(n int) int {
+	if n <= 0 {
+		n = DefaultPodLogConcurrency
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n
+}
+
 // secretPatterns are common patterns that likely contain secrets in logs.
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+`),
@@ -724,45 +1640,299 @@ func stripSecrets(s string) string {
 	return s
 }
 
-// fetchPodLogs retrieves the tail of the previous container log for each
-// unhealthy pod. Returns a map keyed by "namespace/name".
-func (k *kube) fetchPodLogs(ctx context.Context, pods []string) map[string]string {
-	if len(pods) == 0 || k.hc == nil {
-		return nil
+// podLogMode picks the log stream that holds the failure evidence for one
+// container, or "" when no log stream is worth fetching:
+//
+//   - a terminated container that has not restarted (the one-shot Job case)
+//     carries its failure in its *current* log — no previous instance ever
+//     existed for it, so previous=true would 404;
+//   - a container whose previous instance actually exists (restartCount > 0)
+//     — a CrashLoop or a recovered one — has its last failed run in the
+//     previous instance, so previous=true is the relevant failure evidence;
+//   - a container that is still running (a live process, ready or not) has
+//     only a current log, so it is fetched as current;
+//   - anything else (a clean exit, a container that is waiting or has not
+//     started a run yet) has no failure log to fetch, so "" — previous is
+//     never the fallback, because a previous instance may not exist at all.
+func podLogMode(cs *containerStatus) string {
+	switch {
+	case cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0:
+		return "current"
+	case cs.RestartCount > 0:
+		return "previous"
+	case cs.State.Terminated != nil:
+		// A clean (exit 0) terminated run is not failure evidence.
+		return ""
+	case cs.State.Running != nil:
+		return "current"
 	}
+	return ""
+}
+
+// recentlyRestarted reports whether a container's last restart happened
+// inside the window. lastState is the container's previous instance, so its
+// finishedAt stamps the restart; a zero time means no restart has occurred.
+func recentlyRestarted(cs containerStatus, since time.Time) bool {
+	t := cs.LastState.Terminated
+	return cs.RestartCount > 0 && t != nil && !t.FinishedAt.IsZero() && t.FinishedAt.After(since)
+}
+
+// stateReason returns the reason of a container's current state if it is
+// waiting or terminated; a running state carries no reason.
+func stateReason(cs *containerStatus) string {
+	if cs.State.Waiting != nil {
+		return cs.State.Waiting.Reason
+	}
+	if cs.State.Terminated != nil {
+		return cs.State.Terminated.Reason
+	}
+	return ""
+}
+
+// podEvidence reports whether a pod is unhealthy and which of its containers
+// to describe and log. Every container is scanned — not just the first, and
+// not the apiserver's default container — and the most conclusive is
+// returned, so a multi-container pod is diagnosed through the one that
+// actually failed:
+//
+//   - a terminated container with a non-zero exit code: a one-shot failure,
+//     the Job case this issue is about. Without this branch a failed Job pod
+//     that terminated once and never restarted has no waiting state and no
+//     restart, and would be read as healthy;
+//   - a waiting (stuck) container: the CrashLoop and image-pull shapes;
+//   - a container that is not ready in its current run: the pod is not
+//     actually healthy, whether or not the alert named it;
+//   - a container with a previous instance (restartCount > 0): its previous
+//     run's log is the evidence — listed for a pod the alert named, or one
+//     that restarted inside the window; an unrelated recovered pod is not
+//     fished out, which keeps the recovered-pod rule the old first-container
+//     loop applied.
+//
+// A pod whose containers are all healthy, reason-free and un-restarted is
+// not unhealthy; a Succeeded pod never gets here (the caller skips it).
+func podEvidence(isTarget bool, statuses []containerStatus, since time.Time) (bool, *containerStatus) {
+	var failed, waiting, unready, restarted *containerStatus
+	for i := range statuses {
+		cs := &statuses[i]
+		switch {
+		case cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0:
+			if failed == nil {
+				failed = cs
+			}
+		case cs.State.Waiting != nil:
+			if waiting == nil {
+				waiting = cs
+			}
+		case !cs.Ready:
+			if unready == nil {
+				unready = cs
+			}
+		case cs.RestartCount > 0 && (isTarget || recentlyRestarted(*cs, since)):
+			if restarted == nil {
+				restarted = cs
+			}
+		}
+	}
+	switch {
+	case failed != nil:
+		return true, failed
+	case waiting != nil:
+		return true, waiting
+	case unready != nil:
+		return true, unready
+	case restarted != nil:
+		return true, restarted
+	}
+	return false, nil
+}
+
+// terminatedEvidence returns the terminated state that is the failure
+// evidence for a container, or nil when none is a failure:
+//
+//   - a terminated current run (the one-shot Job case) is the evidence
+//     directly;
+//   - a container that is stuck waiting (a CrashLoop) whose previous
+//     instance terminated is the evidence — the last failed run is the
+//     failure, not the current waiting state.
+//
+// A clean exit (exit code 0) is not a failure, so it yields no line; the
+// caller checks the exit code.
+func terminatedEvidence(cs containerStatus) *terminatedState {
+	if cs.State.Terminated != nil {
+		return cs.State.Terminated
+	}
+	if cs.State.Waiting != nil && cs.LastState.Terminated != nil {
+		return cs.LastState.Terminated
+	}
+	return nil
+}
+
+// containerReadingLine renders the structured reading this service makes
+// itself for a failed container: the exit code, termination reason and
+// finish time. It is deliberately message-free: the container's own
+// termination message is workload-authored and travels in
+// ContainerTerminationMessages, where the renderer fences it (the split
+// issue #128's review asked for). Rendered outside the untrusted fence,
+// like pod phases and node conditions, because it is this service's reading
+// rather than a quote — fencing it would tell the model to distrust it.
+// A clean exit (exit code 0) is not a failure, so it produces no line.
+func containerReadingLine(key string, cs containerStatus) string {
+	t := terminatedEvidence(cs)
+	if t == nil || t.ExitCode == 0 {
+		return ""
+	}
+	line := fmt.Sprintf("%s: container %s terminated exit=%d", key, cs.Name, t.ExitCode)
+	if t.Reason != "" {
+		line += " reason=" + t.Reason
+	}
+	if !t.FinishedAt.IsZero() {
+		line += " at " + t.FinishedAt.Format(time.RFC3339)
+	}
+	return line
+}
+
+// containerMessageLine renders a failed container's own termination message
+// for the fenced block. It repeats the pod key and container name so the
+// fenced quote stands on its own: a line of workload text with no
+// attribution would read as the service's own assertion. It produces no
+// line when the container left no message — a clean exit (exit code 0) is
+// not a failure, and a failed run that said nothing has nothing to fence.
+func containerMessageLine(key string, cs containerStatus) string {
+	t := terminatedEvidence(cs)
+	if t == nil || t.ExitCode == 0 || t.Message == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s: container %s message: %s", key, cs.Name, truncate(t.Message, 160))
+}
+
+// podLogSpec is one log fetch: the pod, the container whose log is wanted,
+// and which stream. A container is named explicitly rather than left to the
+// apiserver's default-container choice, so a multi-container pod is always
+// logged through the container that actually failed.
+type podLogSpec struct {
+	Namespace string
+	Name      string
+	Container string
+	Previous  bool
+}
+
+// podLogProvenance tells renderEvidence and Discord delivery which container
+// produced the log and which stream it came from. Without this a one-shot
+// Job's current log would be mislabelled "previous container tail" — the
+// motivating bug of issue #128's review.
+type podLogProvenance struct {
+	Container string
+	Stream    string // "current" or "previous"
+}
+
+// fetchPodLogs retrieves the tail of each pod's failure-evidence log. It
+// returns a map keyed by "namespace/name" and a parallel provenance map
+// describing the container and stream ("current"/"previous") each came
+// from. The container and stream that hold the failure evidence are
+// carried per-entry, so a multi-container pod is answered by the
+// container that failed rather than the apiserver's default, and the
+// renderer does not falsely label a current log as "previous container
+// tail". A failure to fetch one pod's log is non-fatal: the rest of the
+// evidence, and the digest, still ship.
+//
+// The per-pod GETs run under a bounded semaphore rather than strictly in
+// series: one stalled apiserver on pod 1 must not serialise the remaining
+// reads of a flush and hold the flush loop — and any SIGTERM drain —
+// behind the worst pod times up-to-8. Bounded parallelism keeps the
+// API-server-pressure trade-off the serial per-group Enrich ordering makes;
+// it is a within-group cap, not a reason to fetch one log at a time
+// (issue #146).
+//
+// The semaphore caps the number of reads in flight; one goroutine per pod
+// is still spawned, and any excess sit parked inside the semaphore's
+// acquire until an in-flight read releases. Acquiring the slot inside the
+// goroutine (rather than on the dispatcher's stack) means a goroutine that
+// never reaches its release cannot deadlock the dispatcher — the worst
+// case is that goroutine leaks until ctx fires, and the others proceed
+// once the cap frees up. The cap is clamped here, not just in Enrich:
+// direct callers (tests, future paths) must not be able to opt out of the
+// 8-pod upper bound the file-level invariant promises.
+//
+// concurrency is taken by value so the caller can normalise the configured
+// cap once and pass it in — keeping *kube immutable across concurrent
+// Enrich calls. The SIGTERM drain path runs while a canceled runFlushLoop
+// process may still be unwinding; both paths share the same *kube and the
+// goroutines spawned here read concurrency, so any writeable field would
+// race with itself.
+func (k *kube) fetchPodLogs(ctx context.Context, specs []podLogSpec, concurrency int) (map[string]string, map[string]podLogProvenance) {
+	if len(specs) == 0 || k.hc == nil {
+		return nil, nil
+	}
+
+	concurrency = normalizePodLogConcurrency(concurrency)
 
 	logs := make(map[string]string)
-	for _, podKey := range pods {
-		parts := strings.SplitN(podKey, "/", 2)
-		if len(parts) != 2 {
-			continue
+	prov := make(map[string]podLogProvenance)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	for _, spec := range specs {
+		key := spec.Namespace + "/" + spec.Name
+		stream := "current"
+		if spec.Previous {
+			stream = "previous"
 		}
-		ns, name := parts[0], parts[1]
+		query := url.Values{}
+		query.Set("tailLines", strconv.Itoa(podLogTail))
+		if spec.Container != "" {
+			query.Set("container", spec.Container)
+		}
+		if spec.Previous {
+			query.Set("previous", "true")
+		}
+		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?%s", spec.Namespace, spec.Name, query.Encode())
 
-		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?previous=true&tailLines=%d", ns, name, podLogTail)
-		req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Authorization", "Bearer "+k.token)
-		resp, err := k.hc.Do(req)
-		if err != nil {
-			logf("enrich: pod logs (%s): %v", podKey, err)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
+		wg.Add(1)
+		go func(key, path string) {
+			defer wg.Done()
+			// Acquire inside the goroutine: a leaked slot here can't
+			// stall the dispatcher, and the wait error path returns
+			// without writing to logs so the bounded count still holds.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequestWithContext(ctx, "GET", k.base+path, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+k.token)
+			resp, err := k.hc.Do(req)
+			if err != nil {
+				logf("enrich: pod logs (%s): %v", key, err)
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return
+			}
+			data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			continue
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		logs[podKey] = stripSecrets(strings.TrimSpace(string(data)))
+			if err != nil {
+				return
+			}
+			// Write to the shared map under the lock: only the dispatch is
+			// concurrent, the 4096-byte cap and secret stripping are
+			// unchanged from the serial walk.
+			mu.Lock()
+			logs[key] = stripSecrets(strings.TrimSpace(string(data)))
+			mu.Unlock()
+		}(key, path)
+		// Provenance is derived from the spec, so it is recorded before
+		// the read returns. If the read fails the entry is simply absent
+		// from logs and the renderer never sees it.
+		prov[key] = podLogProvenance{Container: spec.Container, Stream: stream}
 	}
-
-	return logs
+	wg.Wait()
+	return logs, prov
 }
 
 // fluxActivity reports Flux resources that are failing, and - only when
@@ -1082,11 +2252,14 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 
 // podRef is the minimal pod shape resolveRepoPaths needs; the project does
 // not depend on client-go, so we carry only name, namespace, and the
-// annotations the GitOps tools use to identify their owner.
+// annotations the GitOps tools use to identify their owner. Labels and
+// OwnerRefs are carried for the ownership chain.
 type podRef struct {
 	Name        string
 	Namespace   string
 	Annotations map[string]string
+	Labels      map[string]string
+	OwnerRefs   []ownerRef
 }
 
 // kustomizationSpec is the subset of a Flux Kustomization read for the

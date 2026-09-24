@@ -44,6 +44,13 @@ type Config struct {
 	// a model backend that can absorb it.
 	NarrateConcurrency int
 
+	// PodLogConcurrency caps how many per-pod log GETs run at once inside a
+	// single Enrich. The default of 4 keeps a single stalled apiserver from
+	// serialising the remaining log reads of a flush (issue #146) without
+	// putting more than a handful of extra reads on the API server during a
+	// group's enrichment.
+	PodLogConcurrency int
+
 	// TriageLabel, when set, makes the webhook drop any alert whose
 	// labels[TriageLabel] is not "true". It defaults to empty so a fresh
 	// deployment triages everything (fail-open, matching WEBHOOK_TOKEN):
@@ -108,6 +115,7 @@ func loadConfig() Config {
 		MaxAlerts:            envInt("MAX_ALERTS", 500),
 		MaxGroups:            envInt("MAX_GROUPS", 12),
 		NarrateConcurrency:   envInt("NARRATE_CONCURRENCY", 2),
+		PodLogConcurrency:    envInt("POD_LOG_CONCURRENCY", DefaultPodLogConcurrency),
 		LiteLLMURL:           envDefault("LITELLM_URL", ""),
 		LiteLLMKey:           os.Getenv("LITELLM_API_KEY"),
 		Model:                envDefault("MODEL", "dsv4f"),
@@ -530,10 +538,16 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	}
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))
+	gh := newGitHub(cfg)
 	for i, g := range groups {
-		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg)}
+		r := Report{Cfg: cfg, Group: g, Enrichment: k.Enrich(ctx, g, cfg.EvidenceWindow, cfg, gh)}
 		if prom != nil {
-			r.Metrics = prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
+			metrics := prom.EnrichMetricsWithRules(ctx, g, cfg.EvidenceWindow, rules, rulesErr)
+			// Scope is per metric source: only the fixed context metrics can be
+			// pod-bounded, so only they may reach the direct tier. The alert-rule
+			// expression results stay context.
+			r.SubjectMetrics = metrics.Subject
+			r.ContextMetrics = metrics.Context
 		}
 		// Count prior sightings (for the "seen N time(s) recently" footer)
 		// but do NOT record this fire yet: history is only written after

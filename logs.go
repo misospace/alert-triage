@@ -97,15 +97,16 @@ func (b *logsBackend) endpoint() (string, error) {
 }
 
 // fetchBackendLogs keeps the original, convenient method for callers while
-// recording backend errors in the service log. Enrich uses the result variant
-// below so a configured-but-empty backend is distinguishable from an outage.
+// recording backend errors in the service log. It returns only the primary
+// (subject-scoped) lines; Enrich uses the result variant below so it can also
+// receive the ambient namespace-wide context and keep the two apart.
 func (b *logsBackend) fetchBackendLogs(ctx context.Context, g Group, window time.Duration) []string {
-	lines, err := b.fetchBackendLogsResult(ctx, g, window)
+	res, err := b.fetchBackendLogsResult(ctx, g, window, targetPodsFromAlerts(g.Alerts))
 	if err != nil {
 		logf("enrich: backend logs: %v", err)
-		return lines
+		return res.Primary
 	}
-	return lines
+	return res.Primary
 }
 
 type backendLog struct {
@@ -114,12 +115,67 @@ type backendLog struct {
 	count   int
 }
 
-func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, window time.Duration) ([]string, error) {
+// backendLogResult separates primary evidence (lines scoped to a resolved
+// concrete subject) from ambient context (namespace-wide lines gathered because
+// no subject could be resolved). Enrich keeps the two apart so a coincidence is
+// never read as a cause: Primary goes to BackendLogs, Ambient to
+// Enrichment.Ambient (rendered under BACKGROUND), and neither is presented as
+// the failing resource's own logs when it is not.
+type backendLogResult struct {
+	Primary []string
+	Ambient []string
+}
+
+// ambientLogMarker prefixes namespace-wide backend-log lines returned when no
+// concrete subject could be resolved. It is what makes them explicitly
+// ambient/background: Enrich routes them to Enrichment.Ambient so they render
+// under BACKGROUND, never into the primary BackendLogs.
+const ambientLogMarker = "(ambient, namespace-wide) "
+
+// targetPodsFromAlerts builds the concrete-subject set from raw alert pod
+// labels, the same way Enrich does, so the convenience wrapper stays usable on
+// its own. Enrich passes its own set, which also includes Job-resolved pods
+// once subject resolution lands.
+func targetPodsFromAlerts(alerts []Alert) map[string]bool {
+	out := make(map[string]bool)
+	for _, a := range alerts {
+		if a.Labels["pod"] != "" && a.namespace() != "" {
+			out[a.namespace()+"/"+a.Labels["pod"]] = true
+		}
+	}
+	return out
+}
+
+// targetPodsByNamespace groups a set of "namespace/pod" subject keys by their
+// namespace so each resolved pod can be queried once per namespace. Pod and
+// namespace names are DNS-1123 (no "/"), so the first slash unambiguously
+// separates the two; invalid keys are dropped rather than queried.
+func targetPodsByNamespace(targetPods map[string]bool) map[string][]string {
+	out := make(map[string][]string)
+	for key := range targetPods {
+		i := strings.IndexByte(key, '/')
+		if i <= 0 || i == len(key)-1 {
+			continue
+		}
+		ns := strings.TrimSpace(key[:i])
+		pod := strings.TrimSpace(key[i+1:])
+		if ns == "" || pod == "" {
+			continue
+		}
+		out[ns] = append(out[ns], pod)
+	}
+	for ns := range out {
+		sort.Strings(out[ns])
+	}
+	return out
+}
+
+func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, window time.Duration, targetPods map[string]bool) (backendLogResult, error) {
 	if b == nil {
-		return nil, nil
+		return backendLogResult{}, nil
 	}
 	if len(g.Namespaces) == 0 {
-		return nil, nil
+		return backendLogResult{}, nil
 	}
 	if window <= 0 {
 		window = 5 * time.Minute
@@ -134,25 +190,24 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	var order []*backendLog
 	seenQueries := make(map[string]struct{})
 
-	// Deduplicate pod-specific requests while retaining a namespace-only
-	// request for groups which contain alerts without a pod label.
+	// Concrete subjects resolved by enrichment, grouped by namespace. When
+	// non-empty we query only those pods: a namespace-only query would return a
+	// slice of whatever else runs in the namespace (Flux reconciles, other
+	// controllers) and drown the primary evidence in plausible but causally
+	// irrelevant text. It is issued only when no subject could be resolved.
+	byNS := targetPodsByNamespace(targetPods)
+
 	for _, namespace := range g.Namespaces {
 		namespace = strings.TrimSpace(namespace)
 		if namespace == "" {
 			continue
 		}
-		queries := map[string]string{"": ""}
-		for _, alert := range g.Alerts {
-			pod := strings.TrimSpace(alert.Labels["pod"])
-			if pod != "" {
-				queries[pod] = pod
-			}
+		var pods []string
+		if len(byNS) > 0 {
+			pods = byNS[namespace]
+		} else {
+			pods = []string{""}
 		}
-		pods := make([]string, 0, len(queries))
-		for pod := range queries {
-			pods = append(pods, pod)
-		}
-		sort.Strings(pods)
 		for _, pod := range pods {
 			queryKey := namespace + "\x00" + pod
 			if _, ok := seenQueries[queryKey]; ok {
@@ -161,7 +216,7 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 			seenQueries[queryKey] = struct{}{}
 			records, err := b.query(ctx, namespace, pod, start, now)
 			if err != nil {
-				return nil, err
+				return backendLogResult{}, err
 			}
 			for _, record := range records {
 				message := strings.Join(strings.Fields(stripSecrets(record.message)), " ")
@@ -182,7 +237,17 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		}
 	}
 
-	return collapseAndCap(seen, order, b.limit), nil
+	collapsed := collapseAndCap(seen, order, b.limit)
+	if len(byNS) == 0 {
+		// No concrete subject: everything returned is namespace-wide, so mark it
+		// ambient and keep it out of the primary evidence.
+		marked := make([]string, len(collapsed))
+		for i, line := range collapsed {
+			marked[i] = ambientLogMarker + line
+		}
+		return backendLogResult{Ambient: marked}, nil
+	}
+	return backendLogResult{Primary: collapsed}, nil
 }
 
 func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, end time.Time) ([]backendLog, error) {
