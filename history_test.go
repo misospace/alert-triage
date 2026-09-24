@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,6 +71,55 @@ func TestHistoryTruncatedFinalLine(t *testing.T) {
 	}
 	if len(h.entries) > 0 && h.entries[0].Signature != "valid_sig" {
 		t.Errorf("expected valid_sig, got %s", h.entries[0].Signature)
+	}
+}
+
+// TestHistoryLoadValidFinalLineWithoutNewline is the regression for the
+// loader dropping a well-formed final line that ends the file without a
+// trailing newline (a writer killed between emitting the JSON bytes and
+// the newline): the line is a complete record and must be parsed on
+// reload, not lost to the early EOF return.
+func TestHistoryLoadValidFinalLineWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	first := sighting{Signature: "first_sig", Title: "first_title", At: now}
+	second := sighting{Signature: "second_sig", Title: "second_title", At: now}
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(first); err != nil {
+		t.Fatal(err)
+	}
+	// Second record is complete JSON with no trailing newline:
+	// json.Marshal (unlike Encoder.Encode) adds no newline, so writing
+	// its raw bytes ends the file mid-record-terminator.
+	raw, err := json.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.PriorSeen("first_sig", "first_title"); got != 1 {
+		t.Errorf("PriorSeen(first_sig) = %d, want 1", got)
+	}
+	if got := h.PriorSeen("second_sig", "second_title"); got != 1 {
+		t.Errorf("PriorSeen(second_sig) = %d, want 1 (valid final line without trailing newline must load)", got)
+	}
+	if got := len(h.entries); got != 2 {
+		t.Errorf("expected 2 entries, got %d", got)
 	}
 }
 
@@ -377,6 +432,264 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 	}
 	if got := reloaded.PriorSeen(sig, title); got != 1 {
 		t.Errorf("after 1 fail + 1 success, PriorSeen = %d, want 1", got)
+	}
+}
+
+// TestHistoryLoadSurvivesOversizedLine is the regression test for issue
+// #162: load used a bufio.Scanner capped at 1 MiB per token, so one line
+// over the cap (bufio.ErrTooLong) ended the whole read and every record
+// after it was dropped; the next Compact then persisted the truncated
+// snapshot. A 2 MiB line sandwiched between two valid records must be
+// skipped and both valid records must still load.
+func TestHistoryLoadSurvivesOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	// 2 MiB line, over the old 1 MiB scanner cap.
+	if _, err := f.WriteString(strings.Repeat("a", 2*1024*1024) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Encode(sighting{Signature: "after_sig", Title: "after_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
+	}
+	if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+		t.Errorf("PriorSeen(after_sig) = %d, want 1 (record after the oversized line must not be dropped)", got)
+	}
+	if got := len(h.entries); got != 2 {
+		t.Errorf("expected 2 entries, got %d", got)
+	}
+}
+
+// TestHistoryLoadOversizedLineIsLogged is the second half of issue #162's
+// acceptance: the oversized line is skipped but logged once, and the read
+// continues past it (no panic, no early stop).
+func TestHistoryLoadOversizedLineIsLogged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("b", 2*1024*1024) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Encode(sighting{Signature: "after_sig", Title: "after_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// The oversized line begins immediately after the first newline in the
+	// file. That is the file offset where the loader skipped it, and the
+	// log must report it (issue #162 acceptance: line number AND file
+	// offset, not just a byte length).
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstNL := bytes.IndexByte(data, '\n')
+	if firstNL < 0 {
+		t.Fatal("expected a newline after the first line")
+	}
+	oversizedOff := firstNL + 1
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("NewHistory panicked on oversized line: %v", rec)
+			}
+		}()
+		h, err := NewHistory(path, retain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+			t.Errorf("read stopped at the oversized line: PriorSeen(after_sig) = %d, want 1", got)
+		}
+	}()
+
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "skipping oversized line") {
+		t.Errorf("expected the oversized line to be logged once; log output: %q", logOut)
+	}
+	if !strings.Contains(logOut, fmt.Sprintf("at file offset %d", oversizedOff)) {
+		t.Errorf("expected the log to report the file offset %d where parsing skipped; log output: %q", oversizedOff, logOut)
+	}
+}
+
+// TestHistoryLoadOversizedFinalLineWithoutNewline is the regression for the
+// unterminated oversized final line: ReadSlice hands back its trailing
+// fragment with io.EOF, and the loader must detect the oversize before that
+// EOF return so the record is logged and skipped exactly once (rather than
+// silently appended) and the read does not stop.
+func TestHistoryLoadOversizedFinalLineWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	now := time.Now()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(sighting{Signature: "before_sig", Title: "before_title", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	// A 2 MiB final line with no trailing newline (e.g. killed mid-write).
+	if _, err := f.WriteString(strings.Repeat("c", 2*1024*1024)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
+	}
+	if got := len(h.entries); got != 1 {
+		t.Errorf("expected 1 entry (oversized final line skipped), got %d", got)
+	}
+	if !strings.Contains(logBuf.String(), "skipping oversized line") {
+		t.Errorf("expected the unterminated oversized final line to be logged once; log output: %q", logBuf.String())
+	}
+}
+
+// TestHistoryLineReaderBoundedRetain is the regression for the old
+// ReadBytes-based read in readHistoryLine: ReadBytes buffers the whole
+// record before returning, so a corrupt multi-megabyte line was fully
+// allocated before the oversized check could bound anything. The read
+// must instead drain the record through buffer-full fragments
+// (ReadSlice / bufio.ErrBufferFull), retaining only a bounded tail
+// sample.
+//
+// What is observable here, and asserted, without instrumenting the read:
+//   - the record spans many fragments: a 2 MiB record through a 4 KiB
+//     buffer is 512 buffer-full fragments, and the read reports
+//     consumed == the record's full byte length, proving every fragment
+//     was drained through the terminating newline;
+//   - the retained line is exactly the bounded tail sample
+//     (<= oversizedLineSample), not the whole record;
+//   - the reader is left positioned at the following record: the next
+//     readHistoryLine returns the valid line after the oversized one,
+//     and the read after that is clean io.EOF.
+//
+// No process RSS assertion: the capped retained sample plus the drained
+// consumed count is what "bounded" means for this helper.
+func TestHistoryLineReaderBoundedRetain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+
+	// A record well over oversizedLineCap (1 MiB), so it is "oversized"
+	// in the same sense as the production corrupt-line case.
+	const recLen = 2 * 1024 * 1024
+	rec := strings.Repeat("a", recLen) + "\n"
+	valid := `{"sig":"after_sig","title":"after_title","at":"2025-01-02T03:04:05Z"}` + "\n"
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(rec + valid); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	in, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	// A buffer far smaller than the record: the oversized line is
+	// consumed through recLen/4096 = 512 buffer-full fragments.
+	r := bufio.NewReaderSize(in, 4096)
+
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("readHistoryLine panicked on an oversized record: %v", p)
+		}
+	}()
+
+	line, lineStart, consumed, err := readHistoryLine(r, 0)
+	if err != nil {
+		t.Fatalf("readHistoryLine on the oversized record: %v", err)
+	}
+	if lineStart != 0 {
+		t.Errorf("lineStart = %d, want 0", lineStart)
+	}
+	if consumed != recLen+1 {
+		t.Fatalf("consumed = %d, want %d (every buffer-full fragment must be drained through the newline)",
+			consumed, recLen+1)
+	}
+	if len(line) > oversizedLineSample {
+		t.Errorf("retained sample = %d bytes, want <= %d (the read must not accumulate the record)",
+			len(line), oversizedLineSample)
+	}
+	// Capture the retained sample before the reads below: the following
+	// readHistoryLine calls refill the reader's internal buffer, so a
+	// sample aliased into that buffer would have been overwritten by the
+	// time the tail is re-asserted at the end of the test.
+	oversizedTail := line
+
+	// The reader must be left positioned at the next record.
+	line, _, consumed, err = readHistoryLine(r, int64(recLen+1))
+	if err != nil {
+		t.Fatalf("readHistoryLine for the line after the oversized record: %v", err)
+	}
+	if string(line) != valid {
+		t.Fatalf("line after the oversized record = %q, want %q", line, valid)
+	}
+
+	// ...and nothing after that.
+	line, _, consumed, err = readHistoryLine(r, int64(recLen+1+consumed))
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF after the last record, got %v (line %q, consumed %d)", err, line, consumed)
+	}
+
+	// The tail includes the record's terminating newline: the last
+	// oversizedLineSample bytes of rec are 511 "a"s plus the "\n".
+	// Re-asserted after the two reads above, which refilled the reader's
+	// buffer: a sample aliased into that buffer would have been
+	// overwritten and would fail here.
+	if !bytes.Equal(oversizedTail, []byte(strings.Repeat("a", oversizedLineSample-1)+"\n")) {
+		t.Errorf("retained sample (len %d) is not the tail of the record after subsequent reads: %q", len(oversizedTail), oversizedTail)
 	}
 }
 
