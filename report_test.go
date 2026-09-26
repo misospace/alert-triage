@@ -79,6 +79,37 @@ func TestDeliverClamp(t *testing.T) {
 	}
 }
 
+func TestDeliverIncludesTrackedIssueLink(t *testing.T) {
+	ghStub := newStubGitHub(t)
+	orig := newGitHubClient
+	t.Cleanup(func() { newGitHubClient = orig })
+	newGitHubClient = func(*Config) *gitHubClient {
+		return &gitHubClient{token: "tok", repo: "owner/repo", hc: &http.Client{}, apiURL: ghStub.server.URL}
+	}
+
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		receivedBody = string(data)
+	}))
+	defer srv.Close()
+
+	cfg := &Config{DiscordURL: srv.URL, GitHubRepo: "owner/repo", GitHubToken: "tok"}
+	rpt := Report{
+		Group:  Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")},
+		Triage: Triage{FixLocation: "git"},
+	}
+	if err := Deliver(context.Background(), cfg, rpt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(receivedBody, "Tracked:") {
+		t.Fatalf("expected a Tracked: pointer in the Discord body, got: %s", receivedBody)
+	}
+	if !strings.Contains(receivedBody, "https://example.com/42") {
+		t.Fatalf("expected the issue URL in the Discord body, got: %s", receivedBody)
+	}
+}
+
 func TestDeliverWithEnrichment(t *testing.T) {
 	var receivedBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
