@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -394,6 +395,289 @@ func TestDeliverGitHubNilClient(t *testing.T) {
 	}
 	if action.Outcome != "none" {
 		t.Fatalf("expected outcome=none for nil client, got %q", action.Outcome)
+	}
+}
+
+// --- Severity label sync (issue #171) ---
+
+func TestIsSeverityLabel(t *testing.T) {
+	cases := map[string]bool{
+		"critical":      true,
+		"Warning":       true,
+		"info":          true,
+		"alert-triage":  false,
+		"team-payments": false,
+		"":              false,
+		"strange":       false,
+	}
+	for in, want := range cases {
+		if got := isSeverityLabel(in); got != want {
+			t.Errorf("isSeverityLabel(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestHasLabel(t *testing.T) {
+	labels := []ghLabel{{Name: "alert-triage"}, {Name: "warning"}}
+	if !hasLabel(labels, "warning") {
+		t.Errorf("hasLabel should find warning in %v", labels)
+	}
+	if hasLabel(labels, "critical") {
+		t.Errorf("hasLabel should not find critical in %v", labels)
+	}
+	if hasLabel(nil, "warning") {
+		t.Errorf("hasLabel(nil, ...) should be false")
+	}
+}
+
+// TestSetSeverityLabel verifies the wire shape: a PUT to the labels endpoint
+// whose body drops every stale severity label, keeps the non-severity labels,
+// and appends the new severity exactly once.
+func TestSetSeverityLabel(t *testing.T) {
+	var (
+		putMethod string
+		putPath   string
+		putBody   []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putMethod = r.Method
+			putPath = r.URL.Path
+			putBody, _ = io.ReadAll(r.Body)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(srv.Close)
+	g := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{Timeout: 5 * time.Second}, apiURL: srv.URL}
+	err := g.setSeverityLabel(context.Background(), 7, []ghLabel{
+		{Name: "alert-triage"},
+		{Name: "team-payments"},
+		{Name: "warning"},
+	}, "critical")
+	if err != nil {
+		t.Fatalf("setSeverityLabel: %v", err)
+	}
+	if putMethod != http.MethodPut {
+		t.Fatalf("method = %q, want PUT", putMethod)
+	}
+	if putPath != "/repos/owner/repo/issues/7/labels" {
+		t.Fatalf("path = %q, want /repos/owner/repo/issues/7/labels", putPath)
+	}
+	var payload struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal(putBody, &payload); err != nil {
+		t.Fatalf("decode PUT body: %v", err)
+	}
+	want := []string{"alert-triage", "team-payments", "critical"}
+	if len(payload.Labels) != len(want) {
+		t.Fatalf("labels = %v, want %v", payload.Labels, want)
+	}
+	for i, l := range payload.Labels {
+		if l != want[i] {
+			t.Fatalf("labels = %v, want %v", payload.Labels, want)
+		}
+	}
+	count := 0
+	for _, l := range payload.Labels {
+		if l == "critical" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("want appears %d times, want exactly once (labels=%v)", count, payload.Labels)
+	}
+	for _, stale := range []string{"warning"} {
+		for _, l := range payload.Labels {
+			if l == stale {
+				t.Fatalf("stale severity label %q was not dropped (labels=%v)", stale, payload.Labels)
+			}
+		}
+	}
+}
+
+// statefulGitHub is a stateful httptest server: unlike the stateless
+// stubGitHub it remembers the labels on issue 7 across calls (a PUT /labels
+// replaces them) and counts comments, so one client can drive the full
+// create -> escalate -> repeat sequence of deliverGitHub (issue #171). The
+// mutex guards shared state because httptest handlers run on other
+// goroutines and the test reads the state between calls.
+type statefulGitHub struct {
+	server   *httptest.Server
+	mu       sync.Mutex
+	marker   string   // signature marker the served issue body carries
+	labels   []string // current labels on issue 7, mutated by PUT
+	comments int      // comments served/recorded for issue 7
+	putCalls int      // PUT /labels calls seen
+}
+
+func newStatefulGitHub(t *testing.T) *statefulGitHub {
+	t.Helper()
+	s := &statefulGitHub{comments: 1} // >=1 so the "never commented" branch stays out of the way
+	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues":
+			s.mu.Lock()
+			marker, labels := s.marker, append([]string(nil), s.labels...)
+			comments := s.comments
+			s.mu.Unlock()
+			labs := make([]map[string]string, 0, len(labels))
+			for _, l := range labels {
+				labs = append(labs, map[string]string{"name": l})
+			}
+			// updated_at is now on every response so the interval gate never
+			// independently fires; the severity gate is what the test
+			// exercises.
+			issue := map[string]any{
+				"number":     7,
+				"title":      "re-fire",
+				"state":      "open",
+				"html_url":   "http://example.invalid/7",
+				"body":       marker + "\n\nbody",
+				"labels":     labs,
+				"created_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+				"updated_at": time.Now().UTC().Format(time.RFC3339),
+				"comments":   comments,
+			}
+			buf, _ := json.Marshal([]map[string]any{issue})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(buf)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/7/comments":
+			s.mu.Lock()
+			s.comments++
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":1}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/issues/7/labels":
+			var payload struct {
+				Labels []string `json:"labels"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			s.mu.Lock()
+			s.labels = payload.Labels
+			s.putCalls++
+			s.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		}
+	}))
+	t.Cleanup(s.server.Close)
+	return s
+}
+
+// TestDeliverGitHubSeverityLabelSync is the acceptance sequence from issue
+// #171: an issue carrying a stale severity label escalates, and the repeat
+// at the new severity must be suppressed by the interval gate. Before the
+// fix the stored label was never updated, so every repeat re-tripped the
+// severity-change gate and commented regardless of ISSUE_COMMENT_INTERVAL.
+func TestDeliverGitHubSeverityLabelSync(t *testing.T) {
+	stub := newStatefulGitHub(t)
+	cfg := &Config{
+		GitHubRepo:           "owner/repo",
+		GitHubToken:          "tok",
+		IssueCommentInterval: 12 * time.Hour,
+	}
+	g := newGitHub(cfg)
+	if g == nil {
+		t.Fatalf("client should be non-nil")
+	}
+	g.apiURL = stub.server.URL
+
+	mk := func(sev string) Report {
+		return Report{
+			Group:  Group{Key: "KubeJobFailed", Alerts: sampleAlerts(sev)},
+			Triage: Triage{FixLocation: "git"},
+		}
+	}
+	// The stub must advertise the marker the client will search for; the
+	// signature is derived from the alerts, so it is computed per report
+	// and injected before each call.
+	setMarker := func(r Report) {
+		stub.mu.Lock()
+		stub.marker = fmt.Sprintf(signatureMarker, r.Group.Signature())
+		stub.mu.Unlock()
+	}
+	setLabels := func(labels []string) {
+		stub.mu.Lock()
+		stub.labels = labels
+		stub.mu.Unlock()
+	}
+
+	// 1. The stored severity already matches: the severity gate is quiet and
+	// the fresh updated_at suppresses the interval gate -> no comment, no PUT.
+	setLabels([]string{"alert-triage", "warning"})
+	r1 := mk("warning")
+	setMarker(r1)
+	action, err := deliverGitHub(context.Background(), g, cfg, r1)
+	if err != nil {
+		t.Fatalf("deliver 1: %v", err)
+	}
+	if action.Outcome != "none" {
+		t.Fatalf("step 1 outcome = %q, want none", action.Outcome)
+	}
+	stub.mu.Lock()
+	putCalls, comments := stub.putCalls, stub.comments
+	stub.mu.Unlock()
+	if putCalls != 0 {
+		t.Fatalf("step 1: expected no PUT /labels, got %d", putCalls)
+	}
+	if comments != 1 {
+		t.Fatalf("step 1: expected no new comment, got %d total", comments)
+	}
+
+	// 2. Escalate to critical: the severity gate fires, a comment is posted,
+	// and the label is synchronised to critical with the non-severity label
+	// preserved.
+	setLabels([]string{"alert-triage", "warning"})
+	r2 := mk("critical")
+	setMarker(r2)
+	action, err = deliverGitHub(context.Background(), g, cfg, r2)
+	if err != nil {
+		t.Fatalf("deliver 2: %v", err)
+	}
+	if action.Outcome != "commented" {
+		t.Fatalf("step 2 outcome = %q, want commented", action.Outcome)
+	}
+	stub.mu.Lock()
+	putCalls, labelsNow, comments := stub.putCalls, stub.labels, stub.comments
+	stub.mu.Unlock()
+	if putCalls != 1 {
+		t.Fatalf("step 2: expected one PUT /labels, got %d", putCalls)
+	}
+	if comments != 2 {
+		t.Fatalf("step 2: expected one new comment, got %d total", comments)
+	}
+	if len(labelsNow) != 2 || labelsNow[0] != "alert-triage" || labelsNow[1] != "critical" {
+		t.Fatalf("step 2: labels after sync = %v, want [alert-triage critical]", labelsNow)
+	}
+
+	// 3. Repeat at critical: the label now carries the current severity, so
+	// only the (unexpired) interval gate applies -> no comment. Without the
+	// label sync from step 2 this step would comment again (issue #171).
+	r3 := mk("critical")
+	setMarker(r3)
+	action, err = deliverGitHub(context.Background(), g, cfg, r3)
+	if err != nil {
+		t.Fatalf("deliver 3: %v", err)
+	}
+	if action.Outcome != "none" {
+		t.Fatalf("step 3 outcome = %q, want none (severity gate re-fired)", action.Outcome)
+	}
+	stub.mu.Lock()
+	putCalls, comments = stub.putCalls, stub.comments
+	stub.mu.Unlock()
+	if putCalls != 1 {
+		t.Fatalf("step 3: expected no further PUT /labels, got %d total", putCalls)
+	}
+	if comments != 2 {
+		t.Fatalf("step 3: expected no new comment, got %d total", comments)
 	}
 }
 
