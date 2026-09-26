@@ -114,6 +114,16 @@ func deliverGitHub(ctx context.Context, gh *gitHubClient, cfg *Config, r Report)
 			return issueAction{}, err
 		}
 		logf("github: commented on #%d for %s", existing.Number, sig)
+		// Synchronize the stored severity so a repeated fire at THIS severity
+		// obeys the interval gate instead of re-tripping the severity-change
+		// gate forever (issue #171). Best-effort: the comment is already
+		// delivered, so a failed label update degrades to the old behaviour
+		// (this severity may re-comment once) and is only logged.
+		if want := severityLabel(r.Group.Severity()); want != "" && !hasLabel(existing.Labels, want) {
+			if err := gh.setSeverityLabel(ctx, existing.Number, existing.Labels, want); err != nil {
+				logf("github: commented on #%d but could not sync severity label %q: %v", existing.Number, want, err)
+			}
+		}
 		return issueAction{Outcome: "commented", URL: existing.HTMLURL}, nil
 	}
 	return issueAction{Outcome: "none", URL: existing.HTMLURL}, nil
@@ -122,7 +132,10 @@ func deliverGitHub(ctx context.Context, gh *gitHubClient, cfg *Config, r Report)
 // shouldComment gates re-fire comments. Two reasons to post: the severity
 // moved (so the issue reflects the current state) or the last comment is older
 // than the flap interval. PriorSeen contributes a "fired N times recently"
-// line which is what makes the comment worthwhile.
+// line which is what makes the comment worthwhile. The severity gate is not
+// permanently true: deliverGitHub re-stamps the issue's severity label after
+// a successful comment, so a repeat at the same severity falls through to
+// the interval gate (issue #171).
 func shouldComment(existing *ghIssue, r Report, interval time.Duration) bool {
 	if interval <= 0 {
 		interval = 12 * time.Hour
@@ -181,6 +194,28 @@ func severityLabel(s string) string {
 		return ""
 	}
 	return s
+}
+
+// isSeverityLabel reports whether name is one of the severity labels this
+// service manages (the set labelsFor can stamp). Non-severity labels — the
+// alert-triage marker and anything an operator adds — are never severity
+// labels and must survive a severity sync.
+func isSeverityLabel(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "critical", "warning", "info":
+		return true
+	}
+	return false
+}
+
+// hasLabel reports whether the label set already carries name.
+func hasLabel(labels []ghLabel, name string) bool {
+	for _, l := range labels {
+		if l.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // renderIssueBody is the full GitHub-flavoured Markdown body. Chat delivery
@@ -444,6 +479,47 @@ func (g *gitHubClient) comment(ctx context.Context, number int, body string) err
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("github comment: %s: %s", resp.Status, string(body))
+	}
+	return nil
+}
+
+// setSeverityLabel replaces the issue's severity label with want, leaving all
+// non-severity labels (alert-triage, operator-added labels) untouched. The
+// labels endpoint replaces the whole set, so we resend the non-severity labels
+// we want to keep and drop any stale severity label this service manages, then
+// append the new severity. want is itself a severity label, so it cannot
+// duplicate a kept label.
+func (g *gitHubClient) setSeverityLabel(ctx context.Context, number int, existing []ghLabel, want string) error {
+	labels := make([]string, 0, len(existing)+1)
+	for _, l := range existing {
+		if isSeverityLabel(l.Name) {
+			continue
+		}
+		labels = append(labels, l.Name)
+	}
+	labels = append(labels, want)
+
+	payload := map[string]any{"labels": labels}
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s/repos/%s/issues/%d/labels", g.apiURL, g.repo, number)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	g.setHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := g.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("github labels: %s: %s", resp.Status, string(body))
 	}
 	return nil
 }
