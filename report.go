@@ -873,6 +873,12 @@ func discordDescription(cfg *Config, r Report) string {
 	return desc.String()
 }
 
+// newGitHubClient is the GitHub constructor Deliver uses. It is a
+// package-level var (matching the timeNow / compactRewriteDelay seams) so a
+// test can point it at a stub apiserver and drive Deliver end-to-end;
+// production always uses newGitHub.
+var newGitHubClient = newGitHub //nolint:gochecknoglobals
+
 // Deliver posts one incident to the digest webhook. When GitHub is configured
 // and the triage is actionable it is also mirrored to a GitHub issue keyed on
 // the group signature; see issue #14. Unset env keeps the original chat-only
@@ -883,7 +889,7 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 		return fmt.Errorf("no discord webhook configured")
 	}
 
-	gh := newGitHub(cfg)
+	gh := newGitHubClient(cfg)
 	var ghAction issueAction
 	if gh != nil && r.Triage.Actionable() {
 		ghCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -897,9 +903,21 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 
 	desc := discordDescription(cfg, r)
 
+	// A GitHub issue now mirrors this incident; link the chat digest to that
+	// durable record so the operator can click through. The link has to be
+	// inside the embed — it is the only thing marshaled into the wire body —
+	// so it is folded into the description before the embed is built. The
+	// base body is clamped to 3900 to keep headroom under Discord's 4096
+	// description cap for the appended link, then the combined string is
+	// clamped again so a long URL can never overflow it (issue #168).
+	description := clamp(desc, 3900)
+	if ghAction.URL != "" {
+		description = clamp(description+fmt.Sprintf("\n\nTracked: <%s>", ghAction.URL), 4096)
+	}
+
 	embed := discordEmbed{
 		Title:       r.Group.Title(),
-		Description: clamp(desc, 3900),
+		Description: description,
 		Color:       severityColor(r.Group.Severity()),
 	}
 	seen := "first time seen"
@@ -916,17 +934,6 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 			Value  string `json:"value"`
 			Inline bool   `json:"inline"`
 		}{Name: "Source", Value: untrusted(p), Inline: false})
-	}
-
-	// When a GitHub issue now exists, the chat becomes a pointer plus a one-
-	// line summary; the full body lives in the issue so verbose evidence can
-	// be folded under <details>. Behaviour is unchanged when ghAction is
-	// empty (env unset) or Outcome=="none" (non-actionable), since both
-	// paths leave ghAction.URL unset. The link is appended after the embed
-	// description was captured, so it appears only in the raw body — the
-	// same placement it had before discordDescription was extracted.
-	if ghAction.URL != "" {
-		desc += fmt.Sprintf("\nTracked: <%s>", ghAction.URL)
 	}
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
