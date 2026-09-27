@@ -13,6 +13,12 @@ type sighting struct {
 	Signature string    `json:"sig"`
 	Title     string    `json:"title"`
 	At        time.Time `json:"at"`
+	// seq is the in-process sequence number Record assigns, used by
+	// Compact to tell which in-window records a mid-rewrite rename
+	// stranded on the old inode. It is unexported, so the JSONL format
+	// is unchanged. Records loaded from disk keep seq 0, which marks
+	// them as predating this process; live records are always >= 1.
+	seq uint64
 }
 
 // History records every group the service has reported, so a digest can say
@@ -20,10 +26,18 @@ type sighting struct {
 // rather than a database: the volume is a handful of records a day, and a file
 // on the PVC survives restarts without a schema or a driver.
 type History struct {
-	mu      sync.Mutex
-	path    string
-	retain  time.Duration
-	entries []sighting
+	mu sync.Mutex
+	// fileMu serializes on-disk operations: appendLine's append and
+	// Compact's rename. Without it a rename would race a concurrent
+	// append and strand the appended record on the old inode. Lock
+	// order is always mu -> fileMu, never the reverse; Compact's rename
+	// takes only fileMu (no mu).
+	fileMu          sync.Mutex
+	path            string
+	retain          time.Duration
+	entries         []sighting
+	seq             uint64
+	lastAppendedSeq uint64
 }
 
 func NewHistory(path string, retain time.Duration) (*History, error) {
@@ -255,18 +269,33 @@ func (h *History) Record(sig, title string, at time.Time) int {
 		}
 	}
 	h.entries = kept
-	h.entries = append(h.entries, sighting{Signature: sig, Title: title, At: at})
+	// Assign the sequence number under mu, in the same critical section
+	// as the in-memory append and the (blocking) file append, so seq
+	// order matches on-disk append order. Compact relies on that to
+	// recover the records a mid-rewrite rename strands. The increment
+	// comes first so live records always have seq >= 1: seq 0 is
+	// reserved for records loaded from disk, which must never be matched
+	// by Compact's re-append range.
+	h.seq++
+	s := sighting{Signature: sig, Title: title, At: at, seq: h.seq}
+	h.entries = append(h.entries, s)
 
-	h.appendLine(sighting{Signature: sig, Title: title, At: at})
+	h.appendLine(s)
 	return prior
 }
 
 // appendLine best-effort persists one record. Losing history is not worth
 // failing a digest over, so errors are swallowed after being surfaced once.
+// The whole open/append/close runs under fileMu so it cannot race Compact's
+// rename: an append that slips in before the rename advances lastAppendedSeq
+// past s.seq and is re-appended after it, and one that slips in after lands
+// in the new file and is left alone.
 func (h *History) appendLine(s sighting) {
 	if h.path == "" {
 		return
 	}
+	h.fileMu.Lock()
+	defer h.fileMu.Unlock()
 	f, err := os.OpenFile(h.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		logf("history: append failed: %v", err)
@@ -275,7 +304,9 @@ func (h *History) appendLine(s sighting) {
 	defer f.Close()
 	if err := json.NewEncoder(f).Encode(s); err != nil {
 		logf("history: encode failed: %v", err)
+		return
 	}
+	h.lastAppendedSeq = s.seq
 }
 
 // compactRewriteDelay is a hook tests use to slow the temp-file write
@@ -290,9 +321,15 @@ var compactRewriteDelay func()
 // PriorSeen and Record callers do not stall on a slow filesystem; only
 // the in-memory snapshot and the swap back into h.entries are guarded.
 // A Record running mid-Compact appends to h.path (not the .tmp path), so
-// the temp file is never half-written from another caller's view: the
-// append either lands in the pre-rename file (lost on rename) or in the
-// post-rename file (kept).
+// the temp file is never half-written from another caller's view. fileMu
+// serializes that append against the rename: an append that lands before
+// the rename is re-appended to the post-rename file, and one that lands
+// after is left alone, so a mid-rewrite record is neither lost nor
+// duplicated.
+//
+// This assumes a single caller: runCompactLoop is the only place Compact
+// is invoked, so two concurrent Compacts cannot re-append against each
+// other's renames.
 func (h *History) Compact() error {
 	if h.path == "" {
 		return nil
@@ -300,7 +337,11 @@ func (h *History) Compact() error {
 
 	// Snapshot the in-window entries under the lock and release it. The
 	// copy lives in a fresh backing array so a concurrent Record that
-	// reuses h.entries' storage cannot trample the snapshot.
+	// reuses h.entries' storage cannot trample the snapshot. seqMark is
+	// the highest seq in the snapshot (h.seq); a Record running during
+	// the rewrite takes a seq above it. lastAppendedSeq is the highest
+	// seq persisted to the old inode; read again just before the rename
+	// it marks the last record the rename stranded there.
 	h.mu.Lock()
 	snapshotCutoff := time.Now().Add(-h.retain)
 	snapshot := make([]sighting, 0, len(h.entries))
@@ -309,10 +350,11 @@ func (h *History) Compact() error {
 			snapshot = append(snapshot, e)
 		}
 	}
+	seqMark := h.seq
 	h.mu.Unlock()
 
 	// Write the snapshot to a temp file and rename it into place. No
-	// lock is held during this window: a slow filesystem here cannot
+	// h.mu is held during this window: a slow filesystem here cannot
 	// stall the flush loop's PriorSeen/Record calls.
 	tmp := h.path + ".tmp"
 	if err := writeHistoryFile(tmp, snapshot); err != nil {
@@ -321,24 +363,60 @@ func (h *History) Compact() error {
 	if compactRewriteDelay != nil {
 		compactRewriteDelay()
 	}
+	// fileMu keeps the rename from racing a concurrent append. Reading
+	// lastAppendedSeq under it, before the rename, captures the highest
+	// seq persisted to the old inode (watermark); the records in
+	// (seqMark, watermark] are the ones the rename stranded and are
+	// re-appended to the new file below. A failed rename leaves the
+	// live file untouched, so those appends survived and there is
+	// nothing to re-append.
+	var watermark uint64
+	h.fileMu.Lock()
+	watermark = h.lastAppendedSeq
 	if err := os.Rename(tmp, h.path); err != nil {
+		h.fileMu.Unlock()
 		return err
 	}
+	h.fileMu.Unlock()
 
 	// Swap the in-memory state under the lock so PriorSeen and Record
 	// see a consistent view. Any entries a concurrent Record added
-	// during the rewrite are kept here (Record's appendLine also wrote
-	// them to h.path, either pre-rename as a lost write or post-rename
-	// as a kept write).
+	// during the rewrite are kept here; the ones whose append landed on
+	// the pre-rename inode (pending) are re-appended to the new file so
+	// the rename does not lose them. pending is the kept in-window
+	// records with seq strictly above seqMark — the rewrite's new
+	// records — up to the watermark, the highest seq persisted to the
+	// old inode. The lower bound is open (>) so seq-0 records loaded
+	// from disk, which are already in the snapshot, can never be
+	// re-appended as duplicates. A failed append leaves a gap in the
+	// seqs and the gap is simply retried, which is harmless because a
+	// failed record was never on disk. The range is exact because
+	// appends occur in seq order under mu: at the moment the watermark
+	// was read, the post-snapshot records persisted to the old inode are
+	// exactly those in (seqMark, watermark] — a pre-rename success at
+	// seq X advanced the watermark past X before the read, and a record
+	// whose appendLine waited on fileMu across the rename wrote after
+	// the read, so its seq is above the watermark and it is excluded.
 	h.mu.Lock()
 	swapCutoff := time.Now().Add(-h.retain)
 	pruned := h.entries[:0]
+	var pending []sighting
 	for _, e := range h.entries {
-		if e.At.After(swapCutoff) {
-			pruned = append(pruned, e)
+		if !e.At.After(swapCutoff) {
+			continue
+		}
+		pruned = append(pruned, e)
+		if e.seq > seqMark && e.seq <= watermark {
+			pending = append(pending, e)
 		}
 	}
 	h.entries = pruned
+	// Re-appending through appendLine bumps lastAppendedSeq; harmless,
+	// because the watermark is only read under fileMu immediately before
+	// a rename and Compact has a single caller.
+	for _, e := range pending {
+		h.appendLine(e)
+	}
 	h.mu.Unlock()
 	return nil
 }

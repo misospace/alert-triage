@@ -770,9 +770,9 @@ func TestHistoryCompactDoesNotBlockPriorSeenDuringRewrite(t *testing.T) {
 // TestHistoryCompactReleasesLockDuringRewrite pairs with the prior-seen
 // test to cover the writer side of issue #147: a Record running while
 // Compact is mid-rewrite must not block on the rewrite either. It also
-// verifies the post-rewrite ordering invariant from the issue: the
-// appended line lands in either the pre-rename file (lost on rename,
-// but the call itself does not error) or the post-rename file (kept).
+// verifies the post-rewrite ordering invariant: the appended line lands
+// in either the pre-rename file (re-appended after the rename, so kept)
+// or the post-rename file (kept) — the call itself never errors.
 func TestHistoryCompactReleasesLockDuringRewrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "history.jsonl")
@@ -823,8 +823,9 @@ func TestHistoryCompactReleasesLockDuringRewrite(t *testing.T) {
 	}
 
 	// Reload the on-disk file. Whether the appended line landed
-	// pre-rename (lost) or post-rename (kept), the file must be valid
-	// JSONL and must not show a half-written temp artifact.
+	// pre-rename (re-appended after the rename) or post-rename, the
+	// file must be valid JSONL and must not show a half-written temp
+	// artifact.
 	reloaded, err := NewHistory(path, retain)
 	if err != nil {
 		t.Fatalf("reload after Compact: %v", err)
@@ -836,5 +837,232 @@ func TestHistoryCompactReleasesLockDuringRewrite(t *testing.T) {
 		if e.Signature == "" || e.Title == "" {
 			t.Errorf("entry %d is malformed: %+v", i, e)
 		}
+	}
+}
+
+// TestHistoryCompactPreservesRecordDuringRewrite is the regression test
+// for issue #170: a Record appended after Compact's snapshot but before
+// its rename used to land on the old inode, which the rename then
+// replaced, so the record was lost on the next reload even though it
+// stayed in memory. The fix re-appends exactly those records to the
+// post-rename file.
+//
+// The hook parks Compact between the temp-file write and the rename, so
+// the concurrent Record below is guaranteed to append to the pre-rename
+// file (the lost-write case) and must be recovered by the re-append. The
+// complementary case — an append that lands after the rename and must
+// NOT be re-appended — is a genuine race on fileMu (the append wins or
+// loses the rename) that the single fixed-position hook cannot pin
+// deterministically; it is covered by the seq-range argument in Compact
+// plus the nonblocking tests above rather than a sleep-based test.
+func TestHistoryCompactPreservesRecordDuringRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	if got := h.Record("seed_sig", "seed_title", now); got != 0 {
+		t.Fatalf("seed Record prior = %d, want 0", got)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	oldHook := compactRewriteDelay
+	compactRewriteDelay = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { compactRewriteDelay = oldHook })
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- h.Compact() }()
+
+	// Wait until Compact is parked between the temp-file write and the
+	// rename, so the Record below is guaranteed to append to the
+	// pre-rename file.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("Compact did not reach the rewrite hook within 2s")
+	}
+
+	// Record must return quickly (no lock is held across the rewrite
+	// window) and lands on the old inode, which the rename is about to
+	// replace. Its result is reported on a channel so the assertions run
+	// in this goroutine.
+	type recordResult struct {
+		prior   int
+		elapsed time.Duration
+	}
+	recordDone := make(chan recordResult, 1)
+	go func() {
+		start := time.Now()
+		prior := h.Record("concurrent_sig", "concurrent_title", time.Now())
+		recordDone <- recordResult{prior: prior, elapsed: time.Since(start)}
+	}()
+	var res recordResult
+	select {
+	case res = <-recordDone:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("concurrent Record did not return within 2s")
+	}
+
+	if res.elapsed > 50*time.Millisecond {
+		t.Errorf("Record blocked for %v during Compact rewrite; expected sub-millisecond", res.elapsed)
+	}
+	if res.prior != 0 {
+		t.Errorf("Record prior = %d, want 0 (concurrent_sig is new)", res.prior)
+	}
+
+	close(release)
+	if err := <-compactDone; err != nil {
+		t.Fatalf("Compact returned %v after the rewrite delay", err)
+	}
+
+	// Reload: the concurrent record must have been re-appended and the
+	// seed must survive, with the concurrent record present exactly once
+	// (no duplicate from the re-append).
+	reloaded, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatalf("reload after Compact: %v", err)
+	}
+
+	seedCount, concurrentCount := 0, 0
+	for _, e := range reloaded.entries {
+		switch e.Signature {
+		case "seed_sig":
+			seedCount++
+		case "concurrent_sig":
+			concurrentCount++
+		}
+	}
+	if seedCount != 1 {
+		t.Errorf("seed_sig count after reload = %d, want 1", seedCount)
+	}
+	if concurrentCount != 1 {
+		t.Errorf("concurrent_sig count after reload = %d, want 1 (preserved, not duplicated)", concurrentCount)
+	}
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		t.Error(".tmp file leaked after Compact")
+	}
+}
+
+// TestHistoryCompactPreservesLoadedRecords is the regression test for the
+// seq-collision half of issue #170. Records loaded from disk carry seq 0,
+// and a fresh process's in-process counter used to start at 0 too, so the
+// first Compact in a process that had only loaded records (no Records yet)
+// captured seqMark = 0. A concurrent Record then also took seq 0 and
+// lost = 1, and the old inclusive-lower range (seq >= seqMark) matched
+// every loaded record, re-appending the whole loaded file as duplicates.
+// Live records now always have seq >= 1 and the pending range is open at
+// the bottom (seq > seqMark), so loaded records can never be re-appended.
+func TestHistoryCompactPreservesLoadedRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	retain := 24 * time.Hour
+
+	// Write a few records, then reopen via NewHistory so this process's
+	// entries are all loaded from disk and therefore carry seq 0.
+	seed, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, sig := range []string{"loaded_a", "loaded_b", "loaded_c"} {
+		seed.Record(sig, sig+"-title", now)
+	}
+
+	h, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(h.entries); got != 3 {
+		t.Fatalf("expected 3 loaded entries, got %d", got)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	oldHook := compactRewriteDelay
+	compactRewriteDelay = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { compactRewriteDelay = oldHook })
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- h.Compact() }()
+
+	// Wait until Compact is parked between the temp-file write and the
+	// rename, so the Record below appends to the pre-rename file.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("Compact did not reach the rewrite hook within 2s")
+	}
+
+	// A concurrent Record while Compact is parked mid-rewrite. In the
+	// buggy code it took seq 0 (the loaded records' seq) and the
+	// inclusive-lower range re-appended every loaded record as well.
+	type recordResult struct {
+		prior   int
+		elapsed time.Duration
+	}
+	recordDone := make(chan recordResult, 1)
+	go func() {
+		start := time.Now()
+		prior := h.Record("concurrent_sig", "concurrent_title", time.Now())
+		recordDone <- recordResult{prior: prior, elapsed: time.Since(start)}
+	}()
+	var res recordResult
+	select {
+	case res = <-recordDone:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-compactDone
+		t.Fatal("concurrent Record did not return within 2s")
+	}
+
+	if res.elapsed > 50*time.Millisecond {
+		t.Errorf("Record blocked for %v during Compact rewrite; expected sub-millisecond", res.elapsed)
+	}
+	if res.prior != 0 {
+		t.Errorf("Record prior = %d, want 0 (concurrent_sig is new)", res.prior)
+	}
+
+	close(release)
+	if err := <-compactDone; err != nil {
+		t.Fatalf("Compact returned %v after the rewrite delay", err)
+	}
+
+	reloaded, err := NewHistory(path, retain)
+	if err != nil {
+		t.Fatalf("reload after Compact: %v", err)
+	}
+
+	counts := map[string]int{}
+	for _, e := range reloaded.entries {
+		counts[e.Signature]++
+	}
+	if got := counts["concurrent_sig"]; got != 1 {
+		t.Errorf("concurrent_sig count after reload = %d, want 1", got)
+	}
+	for _, sig := range []string{"loaded_a", "loaded_b", "loaded_c"} {
+		if got := counts[sig]; got != 1 {
+			t.Errorf("%s count after reload = %d, want 1 (loaded records must not be duplicated)", sig, got)
+		}
+	}
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		t.Error(".tmp file leaked after Compact")
 	}
 }
