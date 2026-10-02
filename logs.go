@@ -250,15 +250,49 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	return backendLogResult{Primary: collapsed}, nil
 }
 
+// quoteLogValue renders a label value as a double-quoted literal with `"` and
+// `\` escaped, using strconv.Quote so a value containing either cannot break
+// out of the literal and inject query syntax. Both backends use double-quoted
+// string literals in their query languages, so one helper serves both.
+func quoteLogValue(v string) string {
+	return strconv.Quote(v)
+}
+
+// buildQuery spells the (namespace, pod) filter in the backend's query
+// language. LogsQL and LogQL do not share one: VictoriaLogs takes
+// `field:"value"` filters joined by AND, Loki takes a `{label="value"}`
+// stream selector, so the query is built per flavor.
+func (b *logsBackend) buildQuery(namespace, pod string) string {
+	switch b.flavor {
+	case "loki":
+		if pod != "" {
+			return "{namespace=" + quoteLogValue(namespace) + ",pod=" + quoteLogValue(pod) + "}"
+		}
+		return "{namespace=" + quoteLogValue(namespace) + "}"
+	case "victorialogs":
+		query := "namespace:" + quoteLogValue(namespace)
+		if pod != "" {
+			query += " AND pod:" + quoteLogValue(pod)
+		}
+		return query
+	default:
+		// Unreachable: endpoint() rejects unknown flavors before query()
+		// builds a request, so the flavor whitelist stays in one mental
+		// place without dead code.
+		query := "namespace:" + quoteLogValue(namespace)
+		if pod != "" {
+			query += " AND pod:" + quoteLogValue(pod)
+		}
+		return query
+	}
+}
+
 func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, end time.Time) ([]backendLog, error) {
 	endpoint, err := b.endpoint()
 	if err != nil {
 		return nil, err
 	}
-	query := fmt.Sprintf("namespace:%q", namespace)
-	if pod != "" {
-		query += " AND pod:" + fmt.Sprintf("%q", pod)
-	}
+	query := b.buildQuery(namespace, pod)
 	params := url.Values{}
 	params.Set("query", query)
 	params.Set("start", strconv.FormatInt(start.UTC().UnixNano(), 10))

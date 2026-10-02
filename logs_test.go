@@ -270,6 +270,51 @@ func TestQueryVictoriaLogsOverHTTP(t *testing.T) {
 	}
 }
 
+// TestBuildQuery asserts the exact query string per flavor: VictoriaLogs
+// takes LogsQL `field:"value"` filters joined by AND, Loki takes a LogQL
+// stream selector — the two backends do not share a query language.
+func TestBuildQuery(t *testing.T) {
+	cases := []struct {
+		flavor string
+		pod    string
+		want   string
+	}{
+		{"victorialogs", "", `namespace:"ns-a"`},
+		{"victorialogs", "p1", `namespace:"ns-a" AND pod:"p1"`},
+		{"loki", "", `{namespace="ns-a"}`},
+		{"loki", "p1", `{namespace="ns-a",pod="p1"}`},
+	}
+	for _, tc := range cases {
+		b := &logsBackend{flavor: tc.flavor}
+		if got := b.buildQuery("ns-a", tc.pod); got != tc.want {
+			t.Errorf("flavor %q pod %q: buildQuery = %q, want %q", tc.flavor, tc.pod, got, tc.want)
+		}
+	}
+}
+
+// TestBuildQueryEscapesValues ensures a `"` or `\` in a namespace or pod
+// value cannot break out of the quoted literal in either dialect.
+func TestBuildQueryEscapesValues(t *testing.T) {
+	ns := `ns"a\b`
+	pod := `p"x\y`
+	cases := []struct {
+		flavor string
+		pod    string
+		want   string
+	}{
+		{"victorialogs", "", `namespace:"ns\"a\\b"`},
+		{"victorialogs", pod, `namespace:"ns\"a\\b" AND pod:"p\"x\\y"`},
+		{"loki", "", `{namespace="ns\"a\\b"}`},
+		{"loki", pod, `{namespace="ns\"a\\b",pod="p\"x\\y"}`},
+	}
+	for _, tc := range cases {
+		b := &logsBackend{flavor: tc.flavor}
+		if got := b.buildQuery(ns, tc.pod); got != tc.want {
+			t.Errorf("flavor %q pod %q: buildQuery = %q, want %q", tc.flavor, tc.pod, got, tc.want)
+		}
+	}
+}
+
 func TestQueryLokiStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/loki/api/v1/query_range") {
@@ -338,7 +383,7 @@ func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
 		q := r.URL.Query().Get("query")
 		queries = append(queries, q)
 		w.Header().Set("Content-Type", "application/json")
-		if q == `namespace:"ns-a" AND pod:"p1"` {
+		if q == `{namespace="ns-a",pod="p1"}` {
 			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns-a"},"values":[["1","target pod failure line"]]}]}}`)
 			return
 		}
@@ -378,7 +423,7 @@ func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
 	if len(queries) != 1 {
 		t.Fatalf("expected exactly one (pod-scoped) query, got %d: %v", len(queries), queries)
 	}
-	if !strings.Contains(queries[0], "pod:") {
+	if !strings.Contains(queries[0], `pod="p1"`) {
 		t.Fatalf("the only query must be pod-scoped, got %q", queries[0])
 	}
 }
@@ -389,7 +434,7 @@ func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
 func TestFetchBackendLogsTargetDedup(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.URL.Query().Get("query"), "pod:") {
+		if !strings.Contains(r.URL.Query().Get("query"), `pod="`) {
 			t.Errorf("unexpected non-pod-scoped query %q", r.URL.RawQuery)
 		}
 		atomic.AddInt32(&hits, 1)
@@ -427,8 +472,8 @@ func TestFetchBackendLogsTargetDedup(t *testing.T) {
 func TestFetchBackendLogsNoSubjectIsAmbient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("query")
-		if strings.Contains(q, "pod:") {
-			t.Errorf("no pod-scoped query expected, got %q", q)
+		if q != `{namespace="ns-a"}` {
+			t.Errorf("exact namespace-only selector expected, got %q", q)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"other","namespace":"ns-a"},"values":[["1","namespace chatter"]]}]}}`)
@@ -455,6 +500,73 @@ func TestFetchBackendLogsNoSubjectIsAmbient(t *testing.T) {
 	}
 	if len(res.Ambient) != 1 || !strings.Contains(res.Ambient[0], "(ambient, namespace-wide)") {
 		t.Fatalf("expected exactly one explicitly-ambient line, got %#v", res.Ambient)
+	}
+}
+
+// TestFetchBackendLogsLokiSelectors asserts the exact LogQL stream selector
+// on the wire for both the pod-scoped primary path and the namespace-only
+// ambient fallback: Loki's query_range endpoint does not accept the
+// VictoriaLogs `pod:"..."` filter syntax.
+func TestFetchBackendLogsLokiSelectors(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		queries = append(queries, q)
+		w.Header().Set("Content-Type", "application/json")
+		switch q {
+		case `{namespace="ns-a",pod="p1"}`:
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns-a"},"values":[["1","resolved pod line"]]}]}}`)
+		case `{namespace="ns-a"}`:
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"other","namespace":"ns-a"},"values":[["1","namespace chatter"]]}]}}`)
+		default:
+			t.Errorf("unexpected query %q", q)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		base:   srv.URL,
+		flavor: "loki",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{Namespaces: []string{"ns-a"}}
+
+	// Resolved subject: the pod-scoped selector must be what hits the wire
+	// and its line must be primary evidence.
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{"ns-a/p1": true})
+	if err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "resolved pod line") {
+		t.Fatalf("expected the resolved pod's line as primary, got %#v", res.Primary)
+	}
+	if len(res.Ambient) != 0 {
+		t.Fatalf("no ambient expected with a resolved subject, got %#v", res.Ambient)
+	}
+
+	// No subject: only the namespace-only selector may be issued and its
+	// line must be ambient.
+	res, err = b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
+	if err != nil {
+		t.Fatalf("fetchBackendLogsResult: %v", err)
+	}
+	if len(res.Primary) != 0 {
+		t.Fatalf("no primary expected without a subject, got %#v", res.Primary)
+	}
+	if len(res.Ambient) != 1 || !strings.Contains(res.Ambient[0], "namespace chatter") {
+		t.Fatalf("expected the namespace chatter as ambient, got %#v", res.Ambient)
+	}
+
+	want := []string{`{namespace="ns-a",pod="p1"}`, `{namespace="ns-a"}`}
+	if len(queries) != 2 {
+		t.Fatalf("expected exactly 2 queries, got %d: %v", len(queries), queries)
+	}
+	for i, w := range want {
+		if queries[i] != w {
+			t.Errorf("query[%d] = %q, want %q", i, queries[i], w)
+		}
 	}
 }
 
