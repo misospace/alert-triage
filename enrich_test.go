@@ -2443,8 +2443,8 @@ func TestEnrichBackendLogsNoSubjectGoesAmbient(t *testing.T) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
 			q := r.URL.Query().Get("query")
-			if strings.Contains(q, "pod:") {
-				t.Errorf("namespace-only expected, got pod-scoped query %q", q)
+			if q != `{namespace="ns1"}` {
+				t.Errorf("exact namespace-only selector expected, got %q", q)
 			}
 			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"unrelated","namespace":"ns1"},"values":[["1","namespace chatter line"]]}]}}`)
 			return
@@ -2539,7 +2539,7 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
 			q := r.URL.Query().Get("query")
-			if !strings.Contains(q, `pod:"p1"`) {
+			if !strings.Contains(q, `pod="p1"`) {
 				t.Errorf("expected only a pod-scoped query, got %q", q)
 			}
 			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns1"},"values":[["1","target failure line"]]}]}}`)
