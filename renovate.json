@@ -9,12 +9,14 @@
       "matchDepNames": ["go"],
       "matchDepTypes": ["golang"],
       "rangeStrategy": "bump",
-      "groupName": "Go toolchain"
+      "groupName": "Go toolchain",
+      "minimumGroupSize": 2
     },
     {
       "matchManagers": ["dockerfile"],
       "matchPackageNames": ["docker.io/library/golang"],
-      "groupName": "Go toolchain"
+      "groupName": "Go toolchain",
+      "minimumGroupSize": 2
     }
   ]
 }
