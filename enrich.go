@@ -170,7 +170,7 @@ func idInt(v *int64) string {
 	if v == nil {
 		return "unset"
 	}
-	return itoa(int(*v))
+	return strconv.Itoa(int(*v))
 }
 
 // idBool keeps the three-state value of a pointer bool: unset, true, false.
