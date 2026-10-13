@@ -146,8 +146,79 @@ admits only Alertmanager to port 8080.
 
 ## RBAC
 
-Read-only, cluster-wide: `pods` and `events` in `""`, `helmreleases` in
-`helm.toolkit.fluxcd.io`, `kustomizations` in `kustomize.toolkit.fluxcd.io`.
+The enrichment client is read-only. Each row below is one API call the service
+makes on every window flush, the verb Kubernetes requires to authorise it, the
+shape of the read (list a collection, get a named object, or get a named
+subresource), and the enrichment path it backs. `list` is required for
+single-object GETs that the client walks by label: the API server maps both to
+the same URL pattern and authorises them with the collection's list verb.
+
+A failed read degrades to absence and renders as an explicit negative ("all
+nodes Ready"), never as silence, so the model does not mistake missing data
+for an unprobed subject. Operators who do not run an optional integration
+should omit its rules and accept the corresponding gap in evidence.
+
+### Core Kubernetes
+
+| API group | Resource | Verbs | Read shape | What enrichment needs it for |
+| --- | --- | --- | --- | --- |
+| `""` | `nodes` | `get`, `list` | List, cluster-wide | `unhealthyNodes` reports NotReady, under-pressure, or cordoned nodes; missing data renders as silence and the model reads that as "not checked". |
+| `""` | `pods` | `get`, `list` | List, per namespace | The pod health sort that produces the "unhealthy pods" findings for a group, and the pod-to-node lookup that the `node` correlation key relies on. |
+| `""` | `pods/log` | `get` | Get, per named pod (subresource) | Tail of the previous or current container log for failing pods; `pods/log` is a subresource and is not granted by `pods` alone. |
+| `""` | `events` | `get`, `list` | List, cluster-wide and per namespace | Warning events that contextualise an alert; cluster-wide only when the alert names no namespace. |
+| `batch` | `jobs` | `get`, `list` | Get, per named job (per alert) | `KubeJobFailed` resolution: the alert names the job by label but not the pod, so enrichment fetches the Job to walk ownerReferences and surface the failed pod as a subject. |
+
+### Flux
+
+| API group | Resource | Verbs | Read shape | What enrichment needs it for |
+| --- | --- | --- | --- | --- |
+| `helm.toolkit.fluxcd.io` | `helmreleases` | `get`, `list` | List, cluster-wide and per namespace | Flux activity feed: NotReady HelmReleases and namespace-scoped Ready transitions. |
+| `kustomize.toolkit.fluxcd.io` | `kustomizations` | `get`, `list` | List (cluster-wide and per namespace) and get per named | Same Flux activity feed for Kustomizations, plus the workload-path and sourceRef lookup that drives the `git`/`partial` decision. |
+| `source.toolkit.fluxcd.io` | `gitrepositories` | `get` | Get, per named, sourceRef-dependent | The Kustomization `sourceRef` is dereferenced to obtain the repository URL for commit classification; only the kinds a resolved Kustomization actually references are read. |
+| `source.toolkit.fluxcd.io` | `ocirepositories` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `OCIRepository`. |
+| `source.toolkit.fluxcd.io` | `buckets` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `Bucket`. |
+| `source.toolkit.fluxcd.io` | `helmcharts` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `HelmChart`. |
+
+### Argo CD (optional)
+
+| API group | Resource | Verbs | Read shape | What enrichment needs it for |
+| --- | --- | --- | --- | --- |
+| `argoproj.io` | `applications` | `get` | Get, per named instance, tried in the `argocd` namespace first and cluster-wide second | Fallback path: if an alert's `instance` label matches an Argo CD Application, enrichment reads its `source.repoURL` and `source.path` to anchor the workload. Omit these rules if the cluster does not run Argo CD. |
+
+### Example ClusterRole
+
+The deployment that materialises this `ClusterRole` lives in the GitOps
+repository, not here. The manifest below covers every read the service
+currently makes; trim the rules for integrations you do not run.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alert-triage
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories", "ocirepositories", "buckets", "helmcharts"]
+    verbs: ["get"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get"]
+```
 
 ## Endpoints
 
