@@ -113,3 +113,16 @@ func TestNamespaceLabelEmptySuppressed(t *testing.T) {
 		t.Fatalf("unexpected label: %q", got)
 	}
 }
+
+// TestNamespaceLabelEscapesValues verifies the LogQL literal in the
+// Explore link is built through quoteLogValue so a `"` or `\` in the
+// namespace cannot break out of the quoted literal and inject selector
+// syntax. The envelope selector shape is the one Grafana decodes and
+// parses, so URL-encoding at the outer JSON marshaler is not enough.
+func TestNamespaceLabelEscapesValues(t *testing.T) {
+	ns := `ns"a\b`
+	want := `{namespace="ns\"a\\b"}`
+	if got := namespaceLabel(ns); got != want {
+		t.Fatalf("namespaceLabel(%q) = %q, want %q", ns, got, want)
+	}
+}

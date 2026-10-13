@@ -108,12 +108,18 @@ func grafanaLinks(cfg *Config, expression, namespace string, window [2]time.Time
 	return metrics, logs
 }
 
-// namespaceLabel turns "kube-system" into the LogQL convention `{namespace="kube-system"}`.
-// An empty namespace yields an empty string, which suppresses the logs link
-// rather than emitting a `{namespace=""}` that would search every namespace.
+// namespaceLabel turns "kube-system" into the LogQL convention
+// `{namespace="kube-system"}`. The value is rendered through quoteLogValue
+// (strconv.Quote) so `"` and `\` in the namespace cannot break out of the
+// literal — Grafana decodes the URL envelope and parses the resulting
+// selector, so escaping at the JSON marshaler alone leaves LogQL itself
+// injectable. Namespaces are DNS-1123 in practice, so this is defensive
+// consistency with logs.buildQuery rather than a live defect. An empty
+// namespace yields an empty string, which suppresses the logs link rather
+// than emitting a `{namespace=""}` that would search every namespace.
 func namespaceLabel(ns string) string {
 	if ns == "" {
 		return ""
 	}
-	return `{namespace="` + ns + `"}`
+	return "{namespace=" + quoteLogValue(ns) + "}"
 }
