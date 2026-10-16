@@ -895,6 +895,11 @@ func (g *gitHubClient) fetchCommitFiles(ctx context.Context, ownerRepo, sha stri
 // fetchCommitPage fetches one page of the commit endpoint and returns the
 // file names on that page plus the URL of the next page (from the Link
 // rel="next" header) or "" when there is no next page.
+//
+// A renamed file contributes BOTH its new (filename) and old
+// (previous_filename) path: a move out of the workload still changes the
+// workload's Git surface, so dropping the old path would turn that into a
+// false "does not touch" (issue #185).
 func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -921,7 +926,9 @@ func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]strin
 	}
 	var payload struct {
 		Files []struct {
-			Filename string `json:"filename"`
+			Filename         string `json:"filename"`
+			Status           string `json:"status"`
+			PreviousFilename string `json:"previous_filename"`
 		} `json:"files"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
@@ -931,6 +938,10 @@ func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]strin
 	for _, f := range payload.Files {
 		if f.Filename != "" {
 			out = append(out, f.Filename)
+		}
+		// A rename's source path stays in the changed set (issue #185).
+		if f.Status == "renamed" && f.PreviousFilename != "" {
+			out = append(out, f.PreviousFilename)
 		}
 	}
 	next := ""

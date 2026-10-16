@@ -999,7 +999,14 @@ func newFakeCommitServer(t *testing.T) *fakeCommitServer {
 		}
 		files := make([]map[string]string, 0, len(p.files))
 		for _, fl := range p.files {
-			files = append(files, map[string]string{"filename": fl["filename"]})
+			f := map[string]string{"filename": fl["filename"]}
+			if s := fl["status"]; s != "" {
+				f["status"] = s
+			}
+			if pf := fl["previous_filename"]; pf != "" {
+				f["previous_filename"] = pf
+			}
+			files = append(files, f)
 		}
 		resp := map[string]any{
 			"sha":    sha,
@@ -1103,6 +1110,114 @@ func TestClassifyCommitComponentPathMatch(t *testing.T) {
 	}
 	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/components/backup/job.yaml" {
 		t.Fatalf("matching paths = %v, want [apps/payments/components/backup/job.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestClassifyCommitRenameOutOfWorkload: a file renamed out of the workload still touches it (issue #185).
+func TestClassifyCommitRenameOutOfWorkload(t *testing.T) {
+	srv := newFakeCommitServer(t)
+	srv.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files: []map[string]string{
+			{"filename": "archive/payments/deployment.yaml", "status": "renamed", "previous_filename": "apps/payments/deployment.yaml"},
+		},
+		message: "archive the payments manifest",
+	}
+	g := srv.client()
+	rel := classifyCommit(context.Background(), g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+		"apps/payments", nil)
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/deployment.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/payments/deployment.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestClassifyCommitRenameOutOfComponent: a file renamed out of a declared component still touches the workload (issue #185).
+func TestClassifyCommitRenameOutOfComponent(t *testing.T) {
+	srv := newFakeCommitServer(t)
+	srv.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files: []map[string]string{
+			{"filename": "archive/backup-job.yaml", "status": "renamed", "previous_filename": "apps/payments/components/backup/job.yaml"},
+		},
+		message: "relocate the backup job",
+	}
+	g := srv.client()
+	rel := classifyCommit(context.Background(), g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+		"apps/payments", []string{"components/backup"})
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/components/backup/job.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/payments/components/backup/job.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestClassifyCommitRenameIntoWorkload: a file renamed into the workload touches it (issue #185).
+func TestClassifyCommitRenameIntoWorkload(t *testing.T) {
+	srv := newFakeCommitServer(t)
+	srv.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files: []map[string]string{
+			{"filename": "apps/payments/deployment.yaml", "status": "renamed", "previous_filename": "legacy/deployment.yaml"},
+		},
+		message: "adopt the legacy deployment",
+	}
+	g := srv.client()
+	rel := classifyCommit(context.Background(), g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+		"apps/payments", nil)
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/payments/deployment.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/payments/deployment.yaml]", rel.MatchingPaths)
+	}
+}
+
+// TestClassifyCommitRenameBetweenUnrelated: a rename between two unrelated dirs does not touch the workload (issue #185).
+func TestClassifyCommitRenameBetweenUnrelated(t *testing.T) {
+	srv := newFakeCommitServer(t)
+	srv.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files: []map[string]string{
+			{"filename": "docs/a.md", "status": "renamed", "previous_filename": "notes/b.md"},
+		},
+		message: "tidy the docs",
+	}
+	g := srv.client()
+	rel := classifyCommit(context.Background(), g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+		"apps/payments", nil)
+	if rel.State != commitRelevanceDoesNotTouch {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceDoesNotTouch, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 0 {
+		t.Fatalf("expected no matching paths, got %v", rel.MatchingPaths)
+	}
+}
+
+// TestClassifyCommitPreviousFilenameOnlyForRenamed pins the exclusion half of
+// the rule (issue #185): previous_filename joins the changed set only for
+// status "renamed", so a stray old path on another status cannot fabricate a
+// touch.
+func TestClassifyCommitPreviousFilenameOnlyForRenamed(t *testing.T) {
+	srv := newFakeCommitServer(t)
+	srv.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files: []map[string]string{
+			{"filename": "archive/x.yaml", "status": "modified", "previous_filename": "apps/payments/deployment.yaml"},
+		},
+		message: "edit an archived file",
+	}
+	g := srv.client()
+	rel := classifyCommit(context.Background(), g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+		"apps/payments", nil)
+	if rel.State != commitRelevanceDoesNotTouch {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceDoesNotTouch, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 0 {
+		t.Fatalf("expected no matching paths, got %v", rel.MatchingPaths)
 	}
 }
 
