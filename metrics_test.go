@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -717,5 +720,309 @@ func TestPrometheusGetReadsNormalResponse(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"status":"success"`) {
 		t.Errorf("body = %q, want JSON success envelope", string(body))
+	}
+}
+
+// TestMemoryWorkingSetMatchingByContainerIdentity guards issue #190: the
+// memory ratio must match working set and limit by container (in addition to
+// namespace and pod) so a multi-container pod yields one ratio per container
+// rather than one cross-container ratio or an invalid one-to-one match.
+func TestMemoryWorkingSetMatchingByContainerIdentity(t *testing.T) {
+	queries := contextMetricQueries("ns", "pod")
+	var mem struct {
+		name string
+		expr string
+	}
+	for _, q := range queries {
+		if q.name == "memory_working_set" {
+			mem = q
+			break
+		}
+	}
+	if mem.name == "" {
+		t.Fatal("memory_working_set query missing from contextMetricQueries")
+	}
+
+	if strings.Contains(mem.expr, "ignoring(") {
+		t.Errorf("memory_working_set expr must not use ignoring(...); got %q", mem.expr)
+	}
+	if !strings.Contains(mem.expr, "on(namespace, pod, container)") {
+		t.Errorf("memory_working_set expr must match on(namespace, pod, container); got %q", mem.expr)
+	}
+	wantHead := "container_memory_working_set_bytes{"
+	if !strings.HasPrefix(mem.expr, wantHead) {
+		t.Errorf("memory_working_set expr must start with %q; got %q", wantHead, mem.expr)
+	}
+	if !strings.Contains(mem.expr, "/ on(namespace, pod, container) container_memory_limit_bytes{") {
+		t.Errorf("memory_working_set expr must divide working set by limit on(namespace, pod, container); got %q", mem.expr)
+	}
+}
+
+// TestMemoryWorkingSetPrometheusFixture runs the issue #190 acceptance fixture
+// against the actual memory_working_set expressions via `promtool test rules`.
+// The tool is gated on $PROMTOOL so this test is skipped in environments
+// without it; the structural assertion in
+// TestMemoryWorkingSetMatchingByContainerIdentity still runs everywhere.
+// The fixture mirrors the issue: working sets api=64, sidecar=16 paired with
+// their own limits 128 and 64, and requires api=0.5 and sidecar=0.25. The
+// second recording rule exercises the namespace-only selector that the app
+// produces when no pod label is present on the alert.
+func TestMemoryWorkingSetPrometheusFixture(t *testing.T) {
+	promtoolPath := os.Getenv("PROMTOOL")
+	if promtoolPath == "" {
+		t.Skip("PROMTOOL env var not set; skipping external Prometheus fixture")
+	}
+	if _, err := os.Stat(promtoolPath); err != nil {
+		t.Skipf("PROMTOOL=%s not found: %v", promtoolPath, err)
+	}
+
+	podScopedExpr := ""
+	nsOnlyExpr := ""
+	for _, q := range contextMetricQueries("sample", "web") {
+		if q.name == "memory_working_set" {
+			podScopedExpr = q.expr
+		}
+	}
+	for _, q := range contextMetricQueries("sample", "") {
+		if q.name == "memory_working_set" {
+			nsOnlyExpr = q.expr
+		}
+	}
+	if podScopedExpr == "" || nsOnlyExpr == "" {
+		t.Fatal("memory_working_set expression missing for one or both selector forms")
+	}
+
+	dir := t.TempDir()
+	rulesYAML := fmt.Sprintf(`groups:
+  - name: fixture
+    rules:
+      - record: memory_ratio_podscoped
+        expr: %q
+      - record: memory_ratio_ns_only
+        expr: %q
+`, podScopedExpr, nsOnlyExpr)
+	if err := os.WriteFile(filepath.Join(dir, "rules.yml"), []byte(rulesYAML), 0o644); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+
+	testYAML := `rule_files:
+  - rules.yml
+evaluation_interval: 1m
+tests:
+  # Pod-scoped: two-container pod. api working set 64 / api limit 128 = 0.5,
+  # sidecar working set 16 / sidecar limit 64 = 0.25, no cross match.
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="sample",pod="web",container="api"}'
+        values: '64 64 64'
+      - series: 'container_memory_working_set_bytes{namespace="sample",pod="web",container="sidecar"}'
+        values: '16 16 16'
+      - series: 'container_memory_limit_bytes{namespace="sample",pod="web",container="api"}'
+        values: '128 128 128'
+      - series: 'container_memory_limit_bytes{namespace="sample",pod="web",container="sidecar"}'
+        values: '64 64 64'
+    promql_expr_test:
+      - expr: memory_ratio_podscoped
+        eval_time: 1m
+        exp_samples:
+          - labels: 'memory_ratio_podscoped{container="api",namespace="sample",pod="web"}'
+            value: 0.5
+          - labels: 'memory_ratio_podscoped{container="sidecar",namespace="sample",pod="web"}'
+            value: 0.25
+  # Pod-scoped: mismatched container identities. working_set=api has no
+  # matching limit because only sidecar's limit exists; the expression must
+  # NOT invent a cross-container ratio.
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="sample",pod="web",container="api"}'
+        values: '64 64 64'
+      - series: 'container_memory_limit_bytes{namespace="sample",pod="web",container="sidecar"}'
+        values: '128 128 128'
+    promql_expr_test:
+      - expr: memory_ratio_podscoped
+        eval_time: 1m
+  # Namespace-only query spanning two pods. The selector omits pod; the
+  # on(...) clause still requires a pod match, so each pod produces its own
+  # per-container ratio without merging across pods.
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="sample",pod="webA",container="api"}'
+        values: '64 64 64'
+      - series: 'container_memory_working_set_bytes{namespace="sample",pod="webB",container="api"}'
+        values: '32 32 32'
+      - series: 'container_memory_limit_bytes{namespace="sample",pod="webA",container="api"}'
+        values: '128 128 128'
+      - series: 'container_memory_limit_bytes{namespace="sample",pod="webB",container="api"}'
+        values: '64 64 64'
+    promql_expr_test:
+      - expr: memory_ratio_ns_only
+        eval_time: 1m
+        exp_samples:
+          - labels: 'memory_ratio_ns_only{container="api",namespace="sample",pod="webA"}'
+            value: 0.5
+          - labels: 'memory_ratio_ns_only{container="api",namespace="sample",pod="webB"}'
+            value: 0.5
+`
+	if err := os.WriteFile(filepath.Join(dir, "tests.yml"), []byte(testYAML), 0o644); err != nil {
+		t.Fatalf("write tests: %v", err)
+	}
+
+	cmd := exec.Command(promtoolPath, "test", "rules", "tests.yml")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promtool test rules failed:\n%s\n--- output end ---", out)
+	}
+	if !strings.Contains(string(out), "SUCCESS") {
+		t.Fatalf("promtool output missing SUCCESS marker:\n%s", out)
+	}
+}
+
+// TestEnrichMemoryRatioSubjectScoped covers the pipeline that fixed context
+// metrics expose: a two-container pod with a common pod label classifies the
+// memory_working_set lines as subject evidence; the renderer carries the
+// container label through to make per-container ratios distinguishable.
+func TestEnrichMemoryRatioSubjectScoped(t *testing.T) {
+	queries := make([]string, 0, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/query_range" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			return
+		}
+		expr := r.URL.Query().Get("query")
+		queries = append(queries, expr)
+		if !strings.Contains(expr, "memory_working_set") {
+			// Other fixed metrics produce empty result, which renders as
+			// "no data"; the parser is irrelevant for this test.
+			json.NewEncoder(w).Encode(queryRangeResponse{
+				Status: "success",
+				Data:   queryRangeData{ResultType: "matrix", Result: []queryResult{}},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(queryRangeResponse{
+			Status: "success",
+			Data: queryRangeData{
+				ResultType: "matrix",
+				Result: []queryResult{
+					{Metric: map[string]string{
+						"namespace": "sample", "pod": "web", "container": "api",
+					}, Values: [][]interface{}{
+						{float64(1000), "0.5"}, {float64(1010), "0.5"},
+					}},
+					{Metric: map[string]string{
+						"namespace": "sample", "pod": "web", "container": "sidecar",
+					}, Values: [][]interface{}{
+						{float64(1000), "0.25"}, {float64(1010), "0.25"},
+					}},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{
+		"alertname": "HighMemory", "namespace": "sample", "pod": "web",
+	}}}}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, nil, nil)
+
+	var mem []string
+	for _, line := range ev.Subject {
+		if strings.Contains(line, "memory_working_set") {
+			mem = append(mem, line)
+		}
+	}
+	if len(mem) != 2 {
+		t.Fatalf("expected 2 memory_working_set subject lines (one per container), got %d: %v", len(mem), mem)
+	}
+	// Each rendered line must carry the container label so the model can
+	// tell api from sidecar. This is the visible fallout from the ignoring()
+	// bug: container stripped from the metric series was stripped from the
+	// rendered evidence too.
+	containers := map[string]bool{}
+	for _, line := range mem {
+		for _, c := range []string{"container=api", "container=sidecar"} {
+			if strings.Contains(line, c) {
+				containers[c] = true
+			}
+		}
+	}
+	if len(containers) != 2 {
+		t.Errorf("expected each container label in the subject evidence; got lines: %v", mem)
+	}
+
+	// Verify the expression sent to the backend matches by container.
+	var memQuery string
+	for _, q := range queries {
+		if strings.Contains(q, "memory_working_set") {
+			memQuery = q
+		}
+	}
+	if memQuery == "" {
+		t.Fatal("memory_working_set query not issued")
+	}
+	if strings.Contains(memQuery, "ignoring(container)") {
+		t.Errorf("memory_working_set query regressed to ignoring(container): %s", memQuery)
+	}
+	if !strings.Contains(memQuery, "on(namespace, pod, container)") {
+		t.Errorf("memory_working_set query missing on(namespace, pod, container): %s", memQuery)
+	}
+}
+
+// TestEnrichMemoryRatioMismatchedContainers proves the expression yields no
+// ratio when containers do not pair. The pipeline surfaces Prometheus's
+// empty result as a "no data" line for the metric name; the test asserts
+// that surface form is preserved (no synthetic cross-container ratio is
+// fabricated to fill a line) when the only working_set and only limit
+// belong to different containers.
+func TestEnrichMemoryRatioMismatchedContainers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		if !strings.Contains(query, "memory_working_set") {
+			json.NewEncoder(w).Encode(queryRangeResponse{
+				Status: "success",
+				Data:   queryRangeData{ResultType: "matrix", Result: []queryResult{}},
+			})
+			return
+		}
+		if !strings.Contains(query, "on(namespace, pod, container)") {
+			t.Errorf("memory_working_set query regressed to ignoring(container): %s", query)
+		}
+		// Prometheus returns an empty result when the on() clause pairs no
+		// series; that empty result surfaces as "memory_working_set: no data".
+		json.NewEncoder(w).Encode(queryRangeResponse{
+			Status: "success",
+			Data:   queryRangeData{ResultType: "matrix", Result: []queryResult{}},
+		})
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{
+		"alertname": "HighMemory", "namespace": "sample", "pod": "web",
+	}}}}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, nil, nil)
+
+	var memLines []string
+	memLines = append(memLines, ev.Subject...)
+	memLines = append(memLines, ev.Context...)
+	var sawNoData bool
+	for _, line := range memLines {
+		if !strings.Contains(line, "memory_working_set") {
+			continue
+		}
+		// A ratio line would carry min=/max=/last= stats; no_data must
+		// NOT carry them, and the line is the truthful surface for the
+		// "no matching pairs" condition.
+		if strings.Contains(line, "min=") {
+			t.Errorf("memory_working_set must not invent a ratio when containers do not pair; got %q", line)
+		}
+		if strings.Contains(line, "no data") {
+			sawNoData = true
+		}
+	}
+	if !sawNoData {
+		t.Errorf("expected a memory_working_set 'no data' line; got subject=%v context=%v", ev.Subject, ev.Context)
 	}
 }

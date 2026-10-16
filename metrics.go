@@ -345,6 +345,14 @@ func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, st
 // given namespace and optional pod, escaping label values for PromQL string
 // literals. Kept pure (no I/O) so the escaping can be asserted without a
 // live backend.
+//
+// The memory_working_set ratio matches on (namespace, pod, container) so a
+// multi-container pod divides each container's working set by its own limit
+// (issue #190). `ignoring(container)` would either invalidate one-to-one
+// matching on two series with otherwise identical labels or, with only one
+// series per side, divide one container's usage by another container's limit
+// and strip the container label from the output, hiding where the pressure
+// came from.
 func contextMetricQueries(ns, pod string) []struct {
 	name string
 	expr string
@@ -359,7 +367,7 @@ func contextMetricQueries(ns, pod string) []struct {
 		expr string
 	}{
 		{"container_restarts", fmt.Sprintf(`kube_pod_container_status_restarts_total{%s}`, labelFilter)},
-		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / ignoring(container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
+		{"memory_working_set", fmt.Sprintf(`container_memory_working_set_bytes{%s} / on(namespace, pod, container) container_memory_limit_bytes{%s}`, labelFilter, labelFilter)},
 		{"cpu_throttle_ratio", fmt.Sprintf(`rate(container_cpu_throttled_seconds_total{%s}[5m])`, labelFilter)},
 	}
 }
