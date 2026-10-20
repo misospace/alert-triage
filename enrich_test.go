@@ -160,6 +160,16 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"authorization: Basic dXNlcjpwYXNz. Retrying", "authorization: [REDACTED]. Retrying"},
 		// JSON form carrying a dotted JWT: the whole credential goes.
 		{`{"authorization": "Basic ` + jwt + `"}`, `{"authorization": "[REDACTED]"}`},
+		// A tail that ends on a scheme word is emitted, not consumed, so the
+		// next credential keeps its context and is redacted on the next pass.
+		{"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz", "basic [REDACTED].basic [REDACTED]"},
+		{"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz", "authorization: [REDACTED].basic [REDACTED]"},
+		{"basic dXNlcjpwYXNz.authorization: Basic dXVpZDpwYXNz", "basic [REDACTED].authorization: [REDACTED]"},
+		{"basic dXNlcjpwYXNz.basic", "basic [REDACTED].basic"},
+		// The danger tail must not redact on its own: a header value that
+		// is no credential survives, and the glued credential behind the
+		// scheme word is still redacted by the scheme pass.
+		{"authorization: Negotiate.basic dXVpZDpwYXNz", "authorization: Negotiate.basic [REDACTED]"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -208,6 +218,17 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			t.Errorf("stripSecrets(%q) = %q; percent-encoded tail survived", in, got)
 		}
 	}
+	// Two adjacent credentials separated by ".": the second one leaked when
+	// the tail swallowed its scheme word, so check both payloads per input.
+	for _, in := range []string{
+		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 }
 
 // TestStripSecretsBasicAuthIdempotent pins that redacting an already
@@ -222,6 +243,8 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"authorization: Basic " + jwt,
 		"basic " + jwt,
 		"Basic dXNlcjpwYXNz%3Dextra",
+		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
