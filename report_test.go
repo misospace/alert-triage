@@ -721,6 +721,38 @@ func TestNarrateTruncatedConnectionStillNarrates(t *testing.T) {
 	}
 }
 
+// Data after the first JSON value must not break the narration: the capped
+// read hands the whole body to a decoder that stops at the end of the value,
+// exactly as the streaming decode did before the cap. This pins the claim
+// that in-cap decode semantics are unchanged.
+func TestNarrateTrailingDataAfterValueStillNarrates(t *testing.T) {
+	const narrative = "trailing bytes after the reply are tolerated"
+	triage := `{"narrative":"` + narrative + `","fix_location":"unknown","confidence":"high"}`
+	cases := []struct {
+		name      string
+		apiFormat string
+		reply     string
+	}{
+		{"openai", "openai", `{"choices":[{"message":{"content":"` + strings.ReplaceAll(triage, `"`, `\"`) + `"}}]}`},
+		{"anthropic", "anthropic", `{"content":[{"type":"text","text":"` + strings.ReplaceAll(triage, `"`, `\"`) + `"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.reply+"\n\nnot-part-of-the-value\n")
+			}))
+			defer srv.Close()
+			cfg := narrateCfg(srv.URL, tc.apiFormat, "m")
+			cfg.NarrateTimeout = 10 * time.Second
+			tri, ok := Narrate(context.Background(), cfg, Report{Group: Group{}})
+			if !ok || tri.Narrative != narrative {
+				t.Fatalf("expected the reply to narrate despite trailing data, got ok=%v narrative %q", ok, tri.Narrative)
+			}
+		})
+	}
+}
+
 func TestNarrateOpenAIEmptyContentFallsBackToReasoning(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
