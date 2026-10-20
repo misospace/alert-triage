@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1632,8 +1634,104 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`),
 }
 
+// basicAuthHeaderPattern matches an Authorization-style header and the
+// credential it carries. The credential is base64("user-id:password")
+// (RFC 7617) and has no keyword[=:] shape, so no entry in secretPatterns can
+// reach it. The value is captured in the base64 alphabet, so the credential
+// is separated from whatever follows it in the same token. The header name
+// is captured and re-emitted so the operator can still see what was
+// stripped, which is why this needs a replacement template instead of the
+// slice's fixed "[REDACTED]".
+var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)\s+)?([A-Za-z0-9+/=_-]+)`)
+
+// basicAuthSchemePattern finds a Basic-scheme credential that no header name
+// introduces. Words between the scheme and the credential ("basic auth:
+// <payload>") are tolerated, because the scheme word alone does not say
+// that what follows it is a credential; the decode test decides that.
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+={0,2})`)
+
+// stripBasicAuth redacts HTTP basic-auth credentials. A header that names
+// the Basic scheme is redacted on its context: RFC 7235 puts the credential
+// right after the scheme, so whatever sits there goes even when it is too
+// mangled to decode, because half a credential still authenticates as much
+// as a whole one does. A value without the scheme word, and a bare "basic
+// <token>" outside any header, carry no such context, so they are redacted
+// only when they decode to a credential. Prose survives: "basic
+// authentication failed" is not a credential and must stay readable.
+func stripBasicAuth(s string) string {
+	s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
+		sub := basicAuthHeaderPattern.FindStringSubmatch(m)
+		if len(sub) != 5 {
+			return m
+		}
+		prefix, scheme, value := sub[1], sub[3], sub[4]
+		if scheme != "" {
+			return prefix + "[REDACTED]"
+		}
+		if decodesToBasicCredential(value) {
+			return prefix + "[REDACTED]"
+		}
+		return m
+	})
+	s = basicAuthSchemePattern.ReplaceAllStringFunc(s, func(m string) string {
+		sub := basicAuthSchemePattern.FindStringSubmatch(m)
+		if len(sub) != 2 || !decodesToBasicCredential(sub[1]) {
+			return m
+		}
+		// The scheme word stays visible: outside a header it is the only
+		// context that says a credential was here.
+		return strings.TrimSuffix(m, sub[1]) + "[REDACTED]"
+	})
+	return s
+}
+
+// decodesToBasicCredential reports whether cand is base64 of a
+// "user-id:password" pair, which is what RFC 7617 basic credentials are.
+// The decoded bytes must read like that pair — a printable user-id, then a
+// colon, then a password — because ordinary words also decode to bytes
+// holding a colon ("open" decodes to bytes that start with one), and
+// redacting prose would delete evidence.
+func decodesToBasicCredential(cand string) bool {
+	b, ok := decodeBase64(cand)
+	if !ok {
+		return false
+	}
+	i := bytes.IndexByte(b, ':')
+	if i <= 0 {
+		return false
+	}
+	for _, c := range b[:i] {
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	for _, c := range b[i+1:] {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeBase64 decodes a candidate in any of the alphabets a client may have
+// used, padded or not.
+func decodeBase64(cand string) ([]byte, bool) {
+	if b, err := base64.StdEncoding.DecodeString(cand); err == nil {
+		return b, true
+	}
+	trimmed := strings.TrimRight(cand, "=")
+	if b, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
+		return b, true
+	}
+	if b, err := base64.RawURLEncoding.DecodeString(trimmed); err == nil {
+		return b, true
+	}
+	return nil, false
+}
+
 // stripSecrets replaces obvious secrets in log lines with [REDACTED].
 func stripSecrets(s string) string {
+	s = stripBasicAuth(s)
 	for _, re := range secretPatterns {
 		s = re.ReplaceAllString(s, "[REDACTED]")
 	}
