@@ -135,6 +135,95 @@ func TestStripSecrets(t *testing.T) {
 	}
 }
 
+func TestStripSecretsBasicAuth(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// Header form: the credential is consumed and the header name
+		// stays visible, so the operator can still see what was stripped.
+		{"authorization: Basic dXNlcjpwYXNz", "authorization: [REDACTED]"},
+		{"Authorization: Basic dXNlcjpwYXNzd29yZA==", "Authorization: [REDACTED]"},
+		{"Proxy-Authorization: Basic dXNlcjpwYXNz", "Proxy-Authorization: [REDACTED]"},
+		{`{"authorization": "Basic dXNlcjpwYXNz"}`, `{"authorization": "[REDACTED]"}`},
+		{"authorization=Basic dXNlcjpwYXNz", "authorization=[REDACTED]"},
+		{"GET /x HTTP/1.1 Authorization: Basic dXNlcjpwYXNz", "GET /x HTTP/1.1 Authorization: [REDACTED]"},
+		// A short credential decodes to a user:password pair, so it goes
+		// even though it is too short to look like credential material.
+		{"authorization: Basic dTpw", "authorization: [REDACTED]"},
+		// The slot after the scheme holds the credential, so a mangled one
+		// is redacted too: half a credential still authenticates.
+		{"authorization: Basic YWRtaW4", "authorization: [REDACTED]"},
+		// A header value that carries the credential without naming the
+		// scheme still decodes to one, so it goes too. Punctuation after
+		// the credential is not part of it.
+		{"authorization: dXNlcjpwYXNz", "authorization: [REDACTED]"},
+		{"authorization=dXNlcjpwYXNz,host=example", "authorization=[REDACTED],host=example"},
+		// Bare scheme: the scheme word stays visible, and words between
+		// the scheme and the credential are tolerated.
+		{"basic dXNlcjpwYXNz", "basic [REDACTED]"},
+		{"basic YWRtaW46YWRtaW4=", "basic [REDACTED]"},
+		{"basic auth: dXNlcjpwYXNz", "basic auth: [REDACTED]"},
+		{"basic auth dXNlcjpwYXNz", "basic auth [REDACTED]"},
+		{"basic: dXNlcjpwYXNz", "basic: [REDACTED]"},
+		{"basic dXNlcjpwYXNz,host=example", "basic [REDACTED],host=example"},
+		// Prose survives. Words that also decode to bytes holding a colon
+		// ("open" decodes to bytes that start with one, "2006" to bytes
+		// whose user-id is not printable) are not credentials.
+		{"basic authentication failed", "basic authentication failed"},
+		{"basic verification failed", "basic verification failed"},
+		{"basic auth required", "basic auth required"},
+		{"basic incompatibility detected", "basic incompatibility detected"},
+		{"basic Output", "basic Output"},
+		{"basic Open", "basic Open"},
+		{"basic 2006", "basic 2006"},
+		// The scheme word must start a word, and a header value that is
+		// no credential is left alone.
+		{"subbasic dXNlcjpwYXNz", "subbasic dXNlcjpwYXNz"},
+		{"authorization: Basic", "authorization: Basic"},
+		{"authorization: Digest abc123", "authorization: Digest abc123"},
+		{"no secrets here", "no secrets here"},
+	}
+	for _, tt := range tests {
+		got := stripSecrets(tt.in)
+		if got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthPayloadGone pins the property that matters for
+// the fix: the credential itself never reaches the digest, whichever form
+// it arrived in.
+func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
+	const payload = "dXNlcjpwYXNz"
+	for _, in := range []string{
+		"authorization: Basic " + payload,
+		`{"authorization": "Basic ` + payload + `"}`,
+		"basic " + payload,
+		"authorization: " + payload,
+	} {
+		if got := stripSecrets(in); strings.Contains(got, payload) {
+			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived", in, got)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthIdempotent pins that redacting an already
+// redacted line changes nothing: the digest is rendered from text that has
+// been through stripSecrets more than once.
+func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
+	for _, in := range []string{
+		"authorization: Basic dXNlcjpwYXNz",
+		"basic dXNlcjpwYXNz",
+		"basic authentication failed",
+	} {
+		once := stripSecrets(in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", in, once, twice)
+		}
+	}
+}
+
 func TestFetchPodLogs_empty(t *testing.T) {
 	k := &kube{}
 	got, _ := k.fetchPodLogs(context.Background(), nil, DefaultPodLogConcurrency)
