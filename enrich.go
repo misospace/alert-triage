@@ -1624,18 +1624,76 @@ func normalizePodLogConcurrency(n int) int {
 }
 
 // secretPatterns are common patterns that likely contain secrets in logs.
-var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+`),
-	regexp.MustCompile(`(?i)(password|passwd|pwd)\s*[=:]\s*\S+`),
-	regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*\S+`),
-	regexp.MustCompile(`(?i)(secret|credential)\s*[=:]\s*\S+`),
-	regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`),
+// Each entry carries its own replacement template and an optional guard.
+// Most consume the whole match; RE2 has no lookbehind, so a pattern that
+// must keep a leading key visible for the operator captures it instead and
+// re-emits it in repl. A non-nil guard vetoes individual matches of its
+// pattern (stripSecrets falls back to per-match filtering for those).
+var secretPatterns = []struct {
+	re    *regexp.Regexp
+	repl  string
+	guard func(match string) bool
+}{
+	// JSON/structured logs quote the key — {"password": "hunter2"} — which
+	// the bare keyword[=:] forms below cannot reach, so this runs first and
+	// owns that shape. Real-world keys are usually prefixed ("access_token",
+	// "client_secret", "db_password"), so the captured key may carry a
+	// prefix segment ending in "_" or "-" and is re-emitted intact. That
+	// also over-redacts innocent keys like "note_password"; fail-safe beats
+	// leak. The value must be quoted; a bare word after the key is prose,
+	// not a secret. Escaped quotes inside the value are consumed too,
+	// otherwise a value containing \" leaves a half-redacted remnant.
+	{
+		regexp.MustCompile(`(?i)"((?:[a-z0-9_.\-]+[_\-])?(?:password|passwd|pwd|token|bearer|secret|credential|api[_\-]?key|aws_access_key_id|aws_secret_access_key))"(\s*:\s*)"(?:[^"\\]|\\.)*"`),
+		`"$1"$2"[REDACTED]"`,
+		nil,
+	},
+	{regexp.MustCompile(`(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+`), "[REDACTED]", nil},
+	{regexp.MustCompile(`(?i)(password|passwd|pwd)\s*[=:]\s*\S+`), "[REDACTED]", nil},
+	{regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*\S+`), "[REDACTED]", nil},
+	{regexp.MustCompile(`(?i)(secret|credential)\s*[=:]\s*\S+`), "[REDACTED]", nil},
+	{regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`), "[REDACTED]", nil},
+	// Authorization header lines separate "Bearer" from the token with a
+	// space, which the keyword[=:] forms above cannot match. Sixteen
+	// characters keeps prose like "bearer authentication failed" intact;
+	// the token is consumed but the "authorization:" name stays so operators
+	// can see what was stripped. Percent-encoding (%3D padding and the like)
+	// is part of the token class so it cannot leave a remnant after the
+	// match. The guard then rejects runs of only letters and hyphens:
+	// "token-expiry-validation-failed-check-logs" is a message, not a
+	// credential, and redacting it would delete evidence. JWTs, hex and
+	// base64 essentially always carry a digit or a separator other than "-".
+	// The accepted residual under-redaction is a pure alphabetic+hyphen
+	// credential of 16+ characters, e.g. "Bearer mysecretpassword"; leaking
+	// that is rarer in real logs than the evidence loss it prevents.
+	{
+		regexp.MustCompile(`(?i)bearer\s+[a-z0-9\-._~+/=%]{16,}=*`),
+		"[REDACTED]",
+		func(match string) bool {
+			// The match is "bearer" + a whitespace run + the token; only
+			// the token part is judged.
+			token := match
+			if i := strings.IndexAny(match, " \t\n\v\f\r"); i >= 0 {
+				token = strings.TrimLeft(match[i+1:], " \t\n\v\f\r")
+			}
+			return strings.ContainsAny(token, "0123456789._~+/=%")
+		},
+	},
 }
 
 // stripSecrets replaces obvious secrets in log lines with [REDACTED].
 func stripSecrets(s string) string {
-	for _, re := range secretPatterns {
-		s = re.ReplaceAllString(s, "[REDACTED]")
+	for _, p := range secretPatterns {
+		if p.guard == nil {
+			s = p.re.ReplaceAllString(s, p.repl)
+			continue
+		}
+		s = p.re.ReplaceAllStringFunc(s, func(m string) string {
+			if !p.guard(m) {
+				return m
+			}
+			return p.re.ReplaceAllString(m, p.repl)
+		})
 	}
 	return s
 }
