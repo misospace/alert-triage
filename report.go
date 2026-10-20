@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -216,6 +217,29 @@ type anthropicResp struct {
 	} `json:"content"`
 }
 
+// narrateBodyCap bounds how much of a model reply we'll buffer before failing
+// the narration. It aliases metricsBodyCap (4 MiB) so the bulk read paths
+// (metrics, logs, webhook payloads) share one ceiling that cannot drift. An
+// uncapped model reply from a misconfigured endpoint would otherwise force the
+// whole body into memory on the goroutine the flush path spawns per report.
+const narrateBodyCap = metricsBodyCap
+
+// readCappedBody reads at most limit bytes from r. It reads limit+1 so an
+// over-cap body is unambiguously detectable: io.LimitReader silently
+// truncates, but a body larger than the limit yields limit+1 bytes here and
+// is reported as an error instead of being returned truncated.
+//
+// A read error is returned together with the bytes read so far: a reply whose
+// body was cut short after a complete JSON value still decodes, and the
+// caller must not throw that reply away.
+func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("reply body exceeded %d bytes", limit)
+	}
+	return body, err
+}
+
 // Narrate asks the model for a story and a judgement about where a fix belongs.
 // A failure here is not fatal: the digest still ships with its evidence, just
 // without the summary. The caller's context bounds the in-flight model call, so
@@ -279,9 +303,24 @@ func Narrate(ctx context.Context, cfg *Config, r Report) (Triage, bool) {
 		logf("narrate: %s", resp.Status)
 		return Triage{}, false
 	}
+	// Read the reply once, under a cap, before branching on the API format:
+	// both formats decode the same body, and a runaway reply must fail here
+	// rather than force the whole body into memory on the goroutine the
+	// flush path spawns per report.
+	raw, err := readCappedBody(resp.Body, narrateBodyCap)
+	if err != nil && len(raw) == 0 {
+		logf("narrate: read: %v", err)
+		return Triage{}, false
+	}
+	// When the transport broke after handing over some bytes, the decoder
+	// decides: a complete JSON value among them is still a complete reply.
+	// This matches the pre-cap streaming decode, which never issued the read
+	// that would have surfaced a break after the value ended, whatever the
+	// error class. A genuinely truncated reply fails in the decode path
+	// below, as it did before.
 	if strings.EqualFold(cfg.APIFormat, "anthropic") {
 		var out anthropicResp
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&out); err != nil {
 			logf("narrate: decode: %v", err)
 			return Triage{}, false
 		}
@@ -306,7 +345,7 @@ func Narrate(ctx context.Context, cfg *Config, r Report) (Triage, bool) {
 		return parseTriage(fallback.String())
 	}
 	var out chatResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&out); err != nil {
 		logf("narrate: decode: %v", err)
 		return Triage{}, false
 	}

@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -484,6 +489,267 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "thinking block fallback narrative" {
 		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
+	}
+}
+
+// lockedBuffer is a log sink safe for concurrent use: the httptest handler
+// goroutine can log server errors into the same standard logger the test
+// captures, so the capture must be race-free.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// errReader hands over its bytes and then fails with err, the way a transport
+// surfaces what it read before the connection broke.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// A model reply that is larger than the body cap must fail the narration
+// instead of being buffered whole. The reply here is otherwise valid JSON, so
+// without the cap it would be buffered whole, the envelope would decode, and
+// the raw multi-megabyte reply would end up kept verbatim as the narrative
+// (parseTriage cannot read a Triage out of it) — with no "exceeded" line in
+// the log either.
+func TestNarrateOverCapBodyFails(t *testing.T) {
+	cases := []struct {
+		name      string
+		apiFormat string
+		prefix    string
+		suffix    string
+	}{
+		{"openai", "openai", `{"choices":[{"message":{"content":"`, `"}}]}`},
+		{"anthropic", "anthropic", `{"content":[{"type":"text","text":"`, `"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf lockedBuffer
+			prev := log.Writer()
+			log.SetOutput(&logBuf)
+			t.Cleanup(func() { log.SetOutput(prev) })
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.prefix)
+				// Stream the padding in chunks rather than building one
+				// huge string; the client stops reading at the cap, so the
+				// write fails and the remainder is never sent.
+				chunk := bytes.Repeat([]byte("a"), 64*1024)
+				remaining := int64(narrateBodyCap) + int64(len(chunk))
+				for remaining > 0 {
+					n := int64(len(chunk))
+					if n > remaining {
+						n = remaining
+					}
+					written, err := w.Write(chunk[:n])
+					remaining -= int64(written)
+					if err != nil {
+						return
+					}
+				}
+				_, _ = io.WriteString(w, tc.suffix)
+			}))
+			defer srv.Close()
+
+			cfg := narrateCfg(srv.URL, tc.apiFormat, "m")
+			cfg.NarrateTimeout = 30 * time.Second
+			tri, ok := Narrate(context.Background(), cfg, Report{Group: Group{}})
+			if ok {
+				t.Errorf("expected narration to fail on an over-cap reply, got ok=true, narrative %q", tri.Narrative)
+			}
+			if tri.Narrative != "" {
+				t.Errorf("expected empty narrative on an over-cap reply, got %q", tri.Narrative)
+			}
+			if !strings.Contains(logBuf.String(), "exceeded") {
+				t.Errorf("expected the over-cap reply to be logged as exceeded, log output: %q", logBuf.String())
+			}
+		})
+	}
+}
+
+func TestReadCappedBody(t *testing.T) {
+	got, err := readCappedBody(strings.NewReader("hello"), 16)
+	if err != nil {
+		t.Fatalf("under-limit read failed: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("under-limit read = %q, want %q", got, "hello")
+	}
+
+	// Exactly at the limit is still allowed.
+	got, err = readCappedBody(strings.NewReader("0123456789abcdef"), 16)
+	if err != nil {
+		t.Fatalf("at-limit read failed: %v", err)
+	}
+	if len(got) != 16 {
+		t.Errorf("at-limit read = %d bytes, want 16", len(got))
+	}
+
+	_, err = readCappedBody(strings.NewReader(strings.Repeat("x", 17)), 16)
+	if err == nil {
+		t.Fatal("expected an error for an over-limit body")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("expected the error to mention the limit, got %q", err.Error())
+	}
+
+	// A transport error must come back unwrapped, together with the bytes
+	// read so far: the reply may be complete even though the connection
+	// broke, and throwing those bytes away would lose it.
+	got, err = readCappedBody(&errReader{data: []byte("hello"), err: io.ErrUnexpectedEOF}, 16)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("expected io.ErrUnexpectedEOF, got %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("expected the bytes read so far, got %q", got)
+	}
+
+	// Any other transport error must surface too, not be swallowed.
+	sentinel := errors.New("connection reset by peer")
+	got, err = readCappedBody(&errReader{data: []byte("hi"), err: sentinel}, 16)
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected the transport error to be returned unwrapped, got %v", err)
+	}
+	if string(got) != "hi" {
+		t.Errorf("expected the bytes read so far, got %q", got)
+	}
+
+	// The over-cap check wins over the read error: an over-limit body is
+	// discarded rather than handed back with the error.
+	got, err = readCappedBody(&errReader{data: []byte(strings.Repeat("x", 17)), err: io.ErrUnexpectedEOF}, 16)
+	if err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("expected the over-cap error, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected the over-cap bytes to be discarded, got %q", got)
+	}
+}
+
+// A reply that is complete but whose connection closes before the promised
+// Content-Length must still be narrated: the transport only learns the reply
+// was cut short after handing over the bytes it did read, and a complete JSON
+// value in those bytes is still a complete reply.
+func TestNarrateTruncatedConnectionStillNarrates(t *testing.T) {
+	const narrative = "reply text survives a truncated connection"
+	reply := `{"choices":[{"message":{"content":"{\"narrative\":\"` + narrative + `\",\"fix_location\":\"unknown\",\"confidence\":\"high\"}"}}]}`
+
+	// The handler runs on its own goroutine and can outlive the test body, so
+	// it reports setup failures through a channel instead of calling t.Errorf:
+	// logging after the test has completed panics the test binary.
+	handlerErr := make(chan error, 4)
+	handlerDone := make(chan struct{})
+	report := func(err error) {
+		select {
+		case handlerErr <- err:
+		default:
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		// Drain the request body before hijacking: bytes left unread in the
+		// socket make the server's close send an RST, which the client
+		// reports as a connection reset rather than the short read we want.
+		_, _ = io.Copy(io.Discard, r.Body)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			report(errors.New("ResponseWriter does not support hijacking"))
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			report(fmt.Errorf("hijack: %w", err))
+			return
+		}
+		defer conn.Close()
+		// Promise more bytes than are actually written, then half-close:
+		// the client sees a complete JSON value followed by a short read.
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(reply)+100, reply)
+		if err := buf.Flush(); err != nil {
+			report(fmt.Errorf("flush: %w", err))
+			return
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			if err := tcp.CloseWrite(); err != nil {
+				report(fmt.Errorf("close write: %w", err))
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cfg := narrateCfg(srv.URL, "openai", "m")
+	cfg.NarrateTimeout = 10 * time.Second
+	tri, ok := Narrate(context.Background(), cfg, Report{Group: Group{}})
+	if tri.Narrative != narrative {
+		t.Fatalf("expected the reply text to be narrated, got %q", tri.Narrative)
+	}
+	if !ok {
+		t.Errorf("expected narration to succeed on a complete reply over a truncated connection")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the hijacked handler to finish")
+	}
+	select {
+	case err := <-handlerErr:
+		t.Errorf("handler reported: %v", err)
+	default:
+	}
+}
+
+// Data after the first JSON value must not break the narration: the capped
+// read hands the whole body to a decoder that stops at the end of the value,
+// exactly as the streaming decode did before the cap. This pins the claim
+// that in-cap decode semantics are unchanged.
+func TestNarrateTrailingDataAfterValueStillNarrates(t *testing.T) {
+	const narrative = "trailing bytes after the reply are tolerated"
+	triage := `{"narrative":"` + narrative + `","fix_location":"unknown","confidence":"high"}`
+	cases := []struct {
+		name      string
+		apiFormat string
+		reply     string
+	}{
+		{"openai", "openai", `{"choices":[{"message":{"content":"` + strings.ReplaceAll(triage, `"`, `\"`) + `"}}]}`},
+		{"anthropic", "anthropic", `{"content":[{"type":"text","text":"` + strings.ReplaceAll(triage, `"`, `\"`) + `"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.reply+"\n\nnot-part-of-the-value\n")
+			}))
+			defer srv.Close()
+			cfg := narrateCfg(srv.URL, tc.apiFormat, "m")
+			cfg.NarrateTimeout = 10 * time.Second
+			tri, ok := Narrate(context.Background(), cfg, Report{Group: Group{}})
+			if !ok || tri.Narrative != narrative {
+				t.Fatalf("expected the reply to narrate despite trailing data, got ok=%v narrative %q", ok, tri.Narrative)
+			}
+		})
 	}
 }
 
