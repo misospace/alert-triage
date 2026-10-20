@@ -94,14 +94,20 @@ func TestStripSecrets(t *testing.T) {
 		{"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", "[REDACTED]"},
 		{"aws_secret_access_key: wJalrXUtnFEMIfake", "[REDACTED]"},
 		// Authorization header: space-separated Bearer token, name kept.
-		// 15 chars with digits survives the length floor; 16 is redacted.
-		{"authorization: Bearer abcdefghij12345", "authorization: Bearer abcdefghij12345"},
+		// Digit-bearing tokens are redacted from eight characters; seven
+		// survive the floor.
+		{"authorization: Bearer abc1234", "authorization: Bearer abc1234"},
+		{"authorization: Bearer abc12345", "authorization: [REDACTED]"},
 		{"authorization: Bearer abcdefghij123456", "authorization: [REDACTED]"},
+		// Hex runs are credential material even when every character is a
+		// letter, and case does not matter.
+		{"authorization: Bearer deadbeefdeadbeef", "authorization: [REDACTED]"},
+		{"Bearer DEADBEEF", "[REDACTED]"},
 		// Percent-encoding is part of the token: nothing left behind.
 		{"authorization: Bearer dXNlcjpwYXNzd29yZDEyMzQ%3Dextra", "authorization: [REDACTED]"},
-		// Letter-and-hyphen runs are prose: the guard spares them, which
-		// also documents the accepted residual (a pure alphabetic+hyphen
-		// credential of 16+ characters escapes).
+		// Letter-and-hyphen runs reaching beyond the hex alphabet are
+		// prose: the guard spares them, which also documents the accepted
+		// residual (a pure alphabetic+hyphen credential escapes).
 		{"Bearer token-expiry-validation-failed-check-logs", "Bearer token-expiry-validation-failed-check-logs"},
 		{"Bearer alpha-only-credential-string", "Bearer alpha-only-credential-string"},
 		{"authorization: Bearer " + fakeJWT, "authorization: [REDACTED]"},
