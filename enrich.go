@@ -1642,13 +1642,25 @@ var secretPatterns = []*regexp.Regexp{
 // is captured and re-emitted so the operator can still see what was
 // stripped, which is why this needs a replacement template instead of the
 // slice's fixed "[REDACTED]".
-var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)\s+)?([A-Za-z0-9+/=_-]+)`)
+//
+// A strict base64 class stops at "." and "%", which left a JWT's later
+// segments or a percent-encoded fragment sitting right next to
+// "[REDACTED]". The optional tail consumes a glued "." or "%" and the token
+// characters that follow, but only when redaction fires and only up to a
+// token character, so a sentence-final "." after a credential survives. The
+// decode test sees the core only, because the tail is not base64.
+var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)\s+)?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // basicAuthSchemePattern finds a Basic-scheme credential that no header name
 // introduces. Words between the scheme and the credential ("basic auth:
 // <payload>") are tolerated, because the scheme word alone does not say
 // that what follows it is a credential; the decode test decides that.
-var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+={0,2})`)
+// The core is the base64 alphabet; a glued "." or "%" tail is consumed too,
+// for the same reason as the header pattern — a strict base64 class stops at
+// those and left JWT segments and percent-encoded fragments next to
+// "[REDACTED]". The tail ends on a token character, so sentence punctuation
+// after a credential survives, and the decode test sees the core only.
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
@@ -1661,7 +1673,7 @@ var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z]
 func stripBasicAuth(s string) string {
 	s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
 		sub := basicAuthHeaderPattern.FindStringSubmatch(m)
-		if len(sub) != 5 {
+		if len(sub) != 6 {
 			return m
 		}
 		prefix, scheme, value := sub[1], sub[3], sub[4]
@@ -1675,12 +1687,12 @@ func stripBasicAuth(s string) string {
 	})
 	s = basicAuthSchemePattern.ReplaceAllStringFunc(s, func(m string) string {
 		sub := basicAuthSchemePattern.FindStringSubmatch(m)
-		if len(sub) != 2 || !decodesToBasicCredential(sub[1]) {
+		if len(sub) != 3 || !decodesToBasicCredential(sub[1]) {
 			return m
 		}
 		// The scheme word stays visible: outside a header it is the only
 		// context that says a credential was here.
-		return strings.TrimSuffix(m, sub[1]) + "[REDACTED]"
+		return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]"
 	})
 	return s
 }
