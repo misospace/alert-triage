@@ -1666,7 +1666,7 @@ var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z]
 // ("core.basic <cred>"): a ReplaceAll pass cannot rescan what it emitted, so
 // consuming that tail strips the NEXT credential's context and it survives.
 // Emitting the tail instead lets the fixed-point pass below redact it.
-var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:[=.%]|^)(?:basic|authorization)$`)
+var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$`)
 
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
