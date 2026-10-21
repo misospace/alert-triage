@@ -142,6 +142,7 @@ func TestStripSecrets(t *testing.T) {
 }
 
 func TestStripSecretsBasicAuth(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
 	tests := []struct {
 		in, want string
 	}{
@@ -188,6 +189,32 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"authorization: Basic", "authorization: Basic"},
 		{"authorization: Digest abc123", "authorization: Digest abc123"},
 		{"no secrets here", "no secrets here"},
+		// Dotted-JWT and percent-encoded fragments: the tail glued to the
+		// credential core is consumed with it, leaving no remnant next to
+		// "[REDACTED]".
+		{"authorization: Basic " + jwt, "authorization: [REDACTED]"},
+		{"Basic " + jwt, "Basic [REDACTED]"},
+		{"basic " + jwt, "basic [REDACTED]"},
+		{"basic bearer " + jwt, "basic bearer [REDACTED]"},
+		{"Basic dXNlcjpwYXNz%3Dextra", "Basic [REDACTED]"},
+		{"authorization: Basic dXNlcjpwYXNz%3Dextra", "authorization: [REDACTED]"},
+		{"authorization: dXNlcjpwYXNz%3Dextra", "authorization: [REDACTED]"},
+		// A sentence-final "." after the credential is not part of it, so it
+		// survives the redaction.
+		{"basic dXNlcjpwYXNz.", "basic [REDACTED]."},
+		{"authorization: Basic dXNlcjpwYXNz. Retrying", "authorization: [REDACTED]. Retrying"},
+		// JSON form carrying a dotted JWT: the whole credential goes.
+		{`{"authorization": "Basic ` + jwt + `"}`, `{"authorization": "[REDACTED]"}`},
+		// A tail that ends on a scheme word is emitted, not consumed, so the
+		// next credential keeps its context and is redacted on the next pass.
+		{"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz", "basic [REDACTED].basic [REDACTED]"},
+		{"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz", "authorization: [REDACTED].basic [REDACTED]"},
+		{"basic dXNlcjpwYXNz.authorization: Basic dXVpZDpwYXNz", "basic [REDACTED].authorization: [REDACTED]"},
+		{"basic dXNlcjpwYXNz.basic", "basic [REDACTED].basic"},
+		// The danger tail must not redact on its own: a header value that
+		// is no credential survives, and the glued credential behind the
+		// scheme word is still redacted by the scheme pass.
+		{"authorization: Negotiate.basic dXVpZDpwYXNz", "authorization: Negotiate.basic [REDACTED]"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -212,20 +239,81 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived", in, got)
 		}
 	}
+
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
+	// A dotted JWT: every segment must be gone, not just the first; and for a
+	// percent-encoded fragment the "%3Dextra" tail must go as well.
+	for _, in := range []string{
+		"authorization: Basic " + jwt,
+		"Basic " + jwt,
+		"basic " + jwt,
+	} {
+		for _, seg := range []string{"eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJmYWtlIn0", "fakesigvalue1234"} {
+			if got := stripSecrets(in); strings.Contains(got, seg) {
+				t.Errorf("stripSecrets(%q) = %q; JWT segment %q survived", in, got, seg)
+			}
+		}
+	}
+	for _, in := range []string{
+		"Basic dXNlcjpwYXNz%3Dextra",
+		"authorization: Basic dXNlcjpwYXNz%3Dextra",
+		"authorization: dXNlcjpwYXNz%3Dextra",
+	} {
+		if got := stripSecrets(in); strings.Contains(got, "%3Dextra") {
+			t.Errorf("stripSecrets(%q) = %q; percent-encoded tail survived", in, got)
+		}
+	}
+	// Two adjacent credentials separated by ".": the second one leaked when
+	// the tail swallowed its scheme word, so check both payloads per input.
+	for _, in := range []string{
+		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 }
 
 // TestStripSecretsBasicAuthIdempotent pins that redacting an already
 // redacted line changes nothing: the digest is rendered from text that has
 // been through stripSecrets more than once.
 func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
 	for _, in := range []string{
 		"authorization: Basic dXNlcjpwYXNz",
 		"basic dXNlcjpwYXNz",
 		"basic authentication failed",
+		"authorization: Basic " + jwt,
+		"basic " + jwt,
+		"Basic dXNlcjpwYXNz%3Dextra",
+		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
 			t.Errorf("stripSecrets(%q) = %q; second pass = %q", in, once, twice)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthLayerInteraction pins that both redaction layers
+// act on a single line: the basic-auth layer and the secretPatterns layer
+// (which runs after it), each stripping its own secret and leaving the other
+// layer's "[REDACTED]" marker in place.
+func TestStripSecretsBasicAuthLayerInteraction(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
+	tests := []struct {
+		in, want string
+	}{
+		{"password=s3cret authorization: Basic " + jwt, "[REDACTED] authorization: [REDACTED]"},
+		{"token=abc123 basic dXNlcjpwYXNz%3Dextra", "[REDACTED] basic [REDACTED]"},
+		{"authorization: Basic dXNlcjpwYXNz token=abc123", "authorization: [REDACTED] [REDACTED]"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
 		}
 	}
 }
