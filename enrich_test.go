@@ -173,6 +173,19 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"basic auth dXNlcjpwYXNz", "basic auth [REDACTED]"},
 		{"basic: dXNlcjpwYXNz", "basic: [REDACTED]"},
 		{"basic dXNlcjpwYXNz,host=example", "basic [REDACTED],host=example"},
+		// Percent-encoded separator between the scheme word and the
+		// credential: URL- and query-encoded auth values logged by proxies
+		// and web apps. In a header the whole value is consumed; outside
+		// one the scheme word stays visible as context.
+		{"proxy-authorization: Basic%20Zm9vOmJhcg%3D%3D", "proxy-authorization: [REDACTED]"},
+		{"authorization=Basic%20dXNlcjpwYXNz", "authorization=[REDACTED]"},
+		{"basic%20Zm9vOmJhcg%3D%3D", "basic%20[REDACTED]"},
+		{"basic%3AdXNlcjpwYXNz", "basic%3A[REDACTED]"},
+		// Prose survives the encoded separators too: the decode gate still
+		// decides scheme-word-only matches, and a sentence containing the
+		// scheme word stays byte-identical.
+		{"basic%20authentication failed", "basic%20authentication failed"},
+		{"basic auth failed for basic.io keep this sentence", "basic auth failed for basic.io keep this sentence"},
 		// Prose survives. Words that also decode to bytes holding a colon
 		// ("open" decodes to bytes that start with one, "2006" to bytes
 		// whose user-id is not printable) are not credentials.
@@ -2792,6 +2805,96 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 	for _, a := range en.Ambient {
 		if strings.Contains(a, "(ambient, namespace-wide)") {
 			t.Fatalf("no ambient backend logs expected when a subject is resolved, got %v", en.Ambient)
+		}
+	}
+}
+
+// Captured-real-alert replay for the #218 shapes: the pod-log lines recorded
+// in issue #218 (observed on the cluster during the #207 review) are driven
+// through the production consumer — Enrich's backend-log query with a resolved
+// subject, not a direct stripSecrets call — and into the digest evidence the
+// model is given. Each captured credential shape must arrive redacted, the
+// prose line must survive byte-identical, and no captured credential byte may
+// reach the evidence either way.
+func TestEnrichBackendLogsCapturedBasicAuthShapes(t *testing.T) {
+	captured := []string{
+		"proxy-authorization: Basic%20Zm9vOmJhcg%3D%3D",
+		"authorization=Basic%20dXNlcjpwYXNz",
+		"basic%20Zm9vOmJhcg%3D%3D",
+		"basic auth failed for basic.io keep this sentence",
+	}
+	entries := make([]string, len(captured))
+	for i, line := range captured {
+		entries[i] = fmt.Sprintf(`{"stream":{"pod":"web-fallback-1","namespace":"default"},"values":[["1",%q]]}`, line)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/pods") || strings.Contains(r.URL.Path, "/log") ||
+			strings.Contains(r.URL.Path, "/nodes") || strings.Contains(r.URL.Path, "/events") {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			q := r.URL.Query().Get("query")
+			if !strings.Contains(q, `pod="web-fallback-1"`) {
+				t.Errorf("expected only a pod-scoped query, got %q", q)
+			}
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[`+strings.Join(entries, ",")+`]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"default"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "default", "pod": "web-fallback-1"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "ok" {
+		t.Fatalf("expected backend state \"ok\", got %q", en.BackendState)
+	}
+	if !en.BackendScoped {
+		t.Errorf("a resolved target pod must mark the backend query subject-scoped")
+	}
+	if len(en.BackendLogs) != len(captured) {
+		t.Fatalf("expected %d backend log lines, got %d: %v", len(captured), len(en.BackendLogs), en.BackendLogs)
+	}
+	evidence := renderEvidence(Report{Cfg: &Config{}, Group: g, Enrichment: en})
+	const prose = "basic auth failed for basic.io keep this sentence"
+	leakTokens := []string{"Zm9vOmJhcg%3D%3D", "dXNlcjpwYXNz"}
+	for _, sink := range []struct {
+		where string
+		lines []string
+	}{
+		{"BackendLogs", en.BackendLogs},
+		{"rendered evidence", []string{evidence}},
+	} {
+		joined := strings.Join(sink.lines, "\n")
+		for _, tok := range leakTokens {
+			if strings.Contains(joined, tok) {
+				t.Errorf("captured credential %q survived into %s", tok, sink.where)
+			}
+		}
+		if !strings.Contains(joined, prose) {
+			t.Errorf("prose line did not survive byte-identical into %s", sink.where)
+		}
+	}
+	wantRedacted := []string{
+		"proxy-authorization: [REDACTED]",
+		"authorization=[REDACTED]",
+		"basic%20[REDACTED]",
+	}
+	for _, want := range wantRedacted {
+		if !strings.Contains(strings.Join(en.BackendLogs, "\n"), want) {
+			t.Errorf("backend logs missing redacted form %q, got %v", want, en.BackendLogs)
+		}
+		if !strings.Contains(evidence, want) {
+			t.Errorf("rendered evidence missing redacted form %q", want)
 		}
 	}
 }
