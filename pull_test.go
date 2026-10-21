@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1139,5 +1140,77 @@ func TestDeliverPullContextCancelledInFlight(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context cancellation error, got %v", err)
+	}
+}
+
+// TestListPRsCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #210: a paginated PR list must fail rather than
+// buffer a body larger than ghListBodyCap.
+func TestListPRsCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := strings.Repeat("a", 64<<10)
+		for i := 0; i < 96; i++ { // 6 MiB total, well over the 4 MiB cap
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	_, _, err := g.listPRs(context.Background(), 1, 50)
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}
+
+// TestDefaultBranchCapsOverSizeResponse guards the ref half of the
+// default-branch lookup (#210): the repo record is known-small, so an
+// over-cap body must fail rather than buffer.
+func TestDefaultBranchCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/repos/o/r") {
+			w.Write([]byte(`{"default_branch":"main"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, strings.Repeat("a", ghSmallBodyCap+1))
+	}))
+	defer srv.Close()
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	_, _, err := g.defaultBranch(context.Background())
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}
+
+// TestGetFileCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #210: a Contents API read must fail rather than
+// buffer a body larger than ghFileBodyCap.
+func TestGetFileCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := strings.Repeat("a", 64<<10)
+		for i := 0; i < 96; i++ { // 6 MiB total, well over the 4 MiB cap
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	if _, _, err := g.getFile(context.Background(), "main", "deploy/x.yaml"); err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	} else if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
 	}
 }

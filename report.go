@@ -231,7 +231,9 @@ const narrateBodyCap = metricsBodyCap
 //
 // A read error is returned together with the bytes read so far: a reply whose
 // body was cut short after a complete JSON value still decodes, and the
-// caller must not throw that reply away.
+// model-reply caller must not throw that reply away. Other callers (the
+// Kubernetes and GitHub reads capped against #210) discard on any error and
+// degrade gracefully instead.
 func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if int64(len(body)) > limit {
