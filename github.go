@@ -348,6 +348,19 @@ func (g *gitHubClient) findOpenIssue(ctx context.Context, sig string) (*ghIssue,
 	}
 }
 
+// ghListBodyCap bounds how much of a paginated GitHub list response (issues,
+// PRs) we'll buffer before failing the read. It aliases metricsBodyCap
+// (4 MiB): the list endpoints are not known-small — findOpenIssue pages at
+// 100 issues whose bodies each carry a full digest — so they take the shared
+// bulk ceiling rather than a tighter guess.
+const ghListBodyCap = metricsBodyCap
+
+// ghSmallBodyCap bounds single-object GitHub replies (an issue create
+// response, the repo record, a ref): the payload is known to be small, so the
+// ceiling sits far below the bulk caps and anything larger is a misbehaving
+// endpoint, not a real reply.
+const ghSmallBodyCap = 64 << 10
+
 // listIssues returns one page of issues. The custom media type asks for the
 // issues' labels inline so we don't have to fan out a second request per row
 // just to compute the severity-change check.
@@ -380,7 +393,11 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 	}
 
 	var raw []ghIssue
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	if err != nil {
+		return nil, 0, fmt.Errorf("github list: %w", err)
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, 0, err
 	}
 	// The /issues endpoint also returns PRs; drop anything that doesn't look
@@ -451,7 +468,11 @@ func (g *gitHubClient) createIssue(ctx context.Context, title, body string, labe
 		return 0, "", fmt.Errorf("github create: %s: %s", resp.Status, string(body))
 	}
 	var out ghIssue
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	respBody, err := readCappedBody(resp.Body, ghSmallBodyCap)
+	if err != nil {
+		return 0, "", fmt.Errorf("github create: %w", err)
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
 		return 0, "", err
 	}
 	return out.Number, out.HTMLURL, nil

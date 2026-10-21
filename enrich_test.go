@@ -4150,3 +4150,47 @@ func TestEnrichHealthyTargetNoIdentity(t *testing.T) {
 		t.Errorf("a healthy target with no failing container must not carry an identity line, got %v", en.PodID)
 	}
 }
+
+// TestKubeGetCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #210: an apiserver GET must fail rather than buffer a
+// body larger than kubeBodyCap, matching the metrics and logs read paths.
+func TestKubeGetCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := strings.Repeat("a", 64<<10)
+		for i := 0; i < 96; i++ { // 6 MiB total, well over the 4 MiB cap
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, token: "tok", hc: http.DefaultClient}
+	var out podList
+	err := k.get(context.Background(), "/api/v1/namespaces/ns/pods", &out)
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}
+
+// TestKubeGetStillDecodesUnderCap pins the success path through the capped
+// read: a normal pod list decodes exactly as it did before the cap landed.
+func TestKubeGetStillDecodesUnderCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"items":[{"metadata":{"name":"p1","namespace":"ns1"},"status":{"phase":"Failed"}}]}`))
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, token: "tok", hc: http.DefaultClient}
+	var out podList
+	if err := k.get(context.Background(), "/api/v1/namespaces/ns1/pods", &out); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(out.Items) != 1 || out.Items[0].Metadata.Name != "p1" {
+		t.Errorf("unexpected decode: %+v", out.Items)
+	}
+}

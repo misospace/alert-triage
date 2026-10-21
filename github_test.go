@@ -1465,3 +1465,48 @@ func TestResolveWorkloadPaths(t *testing.T) {
 		})
 	}
 }
+
+// TestListIssuesCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #210: a paginated issue list must fail rather than
+// buffer a body larger than ghListBodyCap.
+func TestListIssuesCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := strings.Repeat("a", 64<<10)
+		for i := 0; i < 96; i++ { // 6 MiB total, well over the 4 MiB cap
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	_, _, err := g.listIssues(context.Background(), 1, 50, "open")
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}
+
+// TestCreateIssueCapsOverSizeResponse guards against the unbounded-body
+// regression tracked in #210: an issue create reply is known-small, so a body
+// over ghSmallBodyCap must fail rather than buffer.
+func TestCreateIssueCapsOverSizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, strings.Repeat("a", ghSmallBodyCap+1))
+	}))
+	defer srv.Close()
+
+	g := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	_, _, err := g.createIssue(context.Background(), "title-x", "body-y", nil)
+	if err == nil {
+		t.Fatal("expected error for over-cap response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
+	}
+}

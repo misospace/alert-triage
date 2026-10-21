@@ -91,8 +91,22 @@ func (k *kube) get(ctx context.Context, path string, out any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s: %s", path, resp.Status)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	body, err := readCappedBody(resp.Body, kubeBodyCap)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
 }
+
+// kubeBodyCap bounds how much of an apiserver GET response (pods, events,
+// nodes, PVs) we'll buffer before failing the read. It aliases metricsBodyCap
+// (4 MiB) so the bulk read paths share one ceiling that cannot drift. An
+// uncapped list from a misbehaving API server or proxy would otherwise force
+// the whole body into memory on whichever goroutine gathered evidence.
+const kubeBodyCap = metricsBodyCap
 
 // podList is the pod collection for a namespace, carrying everything a
 // permission or storage hypothesis can be grounded in: the declared execution

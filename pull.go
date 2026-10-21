@@ -506,7 +506,11 @@ func (g *gitHubClient) listPRs(ctx context.Context, page, perPage int) ([]ghPR, 
 		return nil, 0, fmt.Errorf("github pr list: %s: %s", resp.Status, string(body))
 	}
 	var raw []ghPR
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	if err != nil {
+		return nil, 0, fmt.Errorf("github pr list: %w", err)
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, 0, err
 	}
 	next := 0
@@ -620,7 +624,11 @@ func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string,
 	var out struct {
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	body, err := readCappedBody(resp.Body, ghSmallBodyCap)
+	if err != nil {
+		return "", "", fmt.Errorf("github repo: %w", err)
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
 		return "", "", err
 	}
 	if out.DefaultBranch == "" {
@@ -647,7 +655,11 @@ func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string,
 			SHA string `json:"sha"`
 		} `json:"object"`
 	}
-	if err := json.NewDecoder(resp2.Body).Decode(&ref); err != nil {
+	body2, err := readCappedBody(resp2.Body, ghSmallBodyCap)
+	if err != nil {
+		return "", "", fmt.Errorf("github default ref: %w", err)
+	}
+	if err := json.Unmarshal(body2, &ref); err != nil {
 		return "", "", err
 	}
 	if ref.Object.SHA == "" {
@@ -655,6 +667,13 @@ func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string,
 	}
 	return out.DefaultBranch, ref.Object.SHA, nil
 }
+
+// ghFileBodyCap bounds how much of a Contents API response (the full file
+// whose patch we are about to adopt) we'll buffer before failing the read. It
+// aliases metricsBodyCap (4 MiB) so the bulk read paths share one ceiling that
+// cannot drift; the allowlisted files are far smaller, and a larger body is a
+// misbehaving endpoint, not a real reply.
+const ghFileBodyCap = metricsBodyCap
 
 // getFile returns the decoded contents and the blob SHA of a file on a branch.
 // The blob SHA is the precondition for the subsequent Contents PUT. It
@@ -687,7 +706,11 @@ func (g *gitHubClient) getFile(ctx context.Context, branch, file string) (conten
 		SHA      string `json:"sha"`
 		Encoding string `json:"encoding"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	body, err := readCappedBody(resp.Body, ghFileBodyCap)
+	if err != nil {
+		return "", "", fmt.Errorf("github get file: %w", err)
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
 		return "", "", err
 	}
 	if out.Type != "file" {
