@@ -79,19 +79,64 @@ func TestFluxListEmpty(t *testing.T) {
 }
 
 func TestStripSecrets(t *testing.T) {
+	fakeJWT := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
 	tests := []struct {
 		in, want string
 	}{
-		{"api_key=abc123", "api_key=[REDACTED]"},
-		{"password: mysecret", "password: [REDACTED]"},
-		{"token = xyz789", "token = [REDACTED]"},
+		// Bare keyword[=:] shapes: value consumed, but where the match
+		// starts mid-name a key fragment survives (GITHUB_, X-Vault-) —
+		// the value is what must not leak.
+		{"api_key=abc123", "[REDACTED]"},
+		{"password: mysecret", "[REDACTED]"},
+		{"token = xyz789", "[REDACTED]"},
+		{"env: GITHUB_TOKEN=ghp_faketoken123456", "env: GITHUB_[REDACTED]"},
+		{"X-Vault-Token: hvs.faketoken123", "X-Vault-[REDACTED]"},
+		{"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", "[REDACTED]"},
+		{"aws_secret_access_key: wJalrXUtnFEMIfake", "[REDACTED]"},
+		// Authorization header: space-separated Bearer token, name kept.
+		// Digit-bearing tokens are redacted from eight characters; seven
+		// survive the floor.
+		{"authorization: Bearer abc1234", "authorization: Bearer abc1234"},
+		{"authorization: Bearer abc12345", "authorization: [REDACTED]"},
+		{"authorization: Bearer abcdefghij123456", "authorization: [REDACTED]"},
+		// Hex runs are credential material even when every character is a
+		// letter, and case does not matter.
+		{"authorization: Bearer deadbeefdeadbeef", "authorization: [REDACTED]"},
+		{"Bearer DEADBEEF", "[REDACTED]"},
+		// Percent-encoding is part of the token: nothing left behind.
+		{"authorization: Bearer dXNlcjpwYXNzd29yZDEyMzQ%3Dextra", "authorization: [REDACTED]"},
+		// Letter-and-hyphen runs reaching beyond the hex alphabet are
+		// prose: the guard spares them, which also documents the accepted
+		// residual (a pure alphabetic+hyphen credential escapes).
+		{"Bearer token-expiry-validation-failed-check-logs", "Bearer token-expiry-validation-failed-check-logs"},
+		{"Bearer alpha-only-credential-string", "Bearer alpha-only-credential-string"},
+		{"authorization: Bearer " + fakeJWT, "authorization: [REDACTED]"},
+		// Quoted-key JSON with quoted value: key preserved, value gone.
+		// Prefixed keys (access_token, client_secret, db_password) are
+		// covered too and re-emitted intact.
+		{`error authenticating: {"password": "hunter2"} rejected`,
+			`error authenticating: {"password": "[REDACTED]"} rejected`},
+		{`{"access_token": "` + fakeJWT + `"}`, `{"access_token": "[REDACTED]"}`},
+		{`{"client_secret": "s3cr3tfake"}`, `{"client_secret": "[REDACTED]"}`},
+		{`{"db_password": "hunter2"}`, `{"db_password": "[REDACTED]"}`},
+		{`{"token": "tok_fake123456"}`, `{"token": "[REDACTED]"}`},
+		{`{"secret":"s3cr3tfake"}`, `{"secret":"[REDACTED]"}`},
+		{`{"api_key": "ak_fake123456"}`, `{"api_key": "[REDACTED]"}`},
+		{`{"aws_access_key_id": "AKIAIOSFODNN7EXAMPLE"}`,
+			`{"aws_access_key_id": "[REDACTED]"}`},
+		// Escaped quote inside the value must not leave a remnant.
+		{`{"password": "a\"b"}`, `{"password": "[REDACTED]"}`},
+		// Both shapes on one line: each pattern owns its half, no remnant.
+		{`password=abc {"token": "xyz"}`, `[REDACTED] {"token": "[REDACTED]"}`},
+		// Prose that must survive untouched.
 		{"no secrets here", "no secrets here"},
-		{"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", "AWS_ACCESS_KEY_ID=[REDACTED]"},
+		{"bearer authentication failed", "bearer authentication failed"},
+		{`{"note": "password policy updated"}`, `{"note": "password policy updated"}`},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
-		if strings.Contains(got, "abc123") || strings.Contains(got, "mysecret") || strings.Contains(got, "xyz789") || strings.Contains(got, "AKIAIOSFODNN7EXAMPLE") {
-			t.Errorf("stripSecrets(%q) = %q; secret not redacted", tt.in, got)
+		if got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
 		}
 	}
 }
