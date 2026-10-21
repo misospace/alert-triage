@@ -1725,6 +1725,13 @@ func isHexRun(s string) bool {
 	return true
 }
 
+// pctEncodedSeparator matches the percent-encoded forms of the separators
+// the Basic-scheme interstitial accepts — space, colon, equals — because
+// URL- and query-encoded auth values logged by proxies and web apps arrive
+// with the scheme word glued to the credential ("Basic%20<credential>").
+// It is spliced into patterns compiled with (?i), so both hex cases match.
+const pctEncodedSeparator = `(?:%20|%3a|%3d)+`
+
 // basicAuthHeaderPattern matches an Authorization-style header and the
 // credential it carries. The credential is base64("user-id:password")
 // (RFC 7617) and has no keyword[=:] shape, so no entry in secretPatterns can
@@ -1740,18 +1747,23 @@ func isHexRun(s string) bool {
 // characters that follow, but only when redaction fires and only up to a
 // token character, so a sentence-final "." after a credential survives. The
 // decode test sees the core only, because the tail is not base64.
-var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)\s+)?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)(?:\s+|` + pctEncodedSeparator + `))?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // basicAuthSchemePattern finds a Basic-scheme credential that no header name
 // introduces. Words between the scheme and the credential ("basic auth:
 // <payload>") are tolerated, because the scheme word alone does not say
 // that what follows it is a credential; the decode test decides that.
+// The separator right after the scheme word also comes in its
+// percent-encoded forms, for the same reason as in the header pattern; the
+// separators between the tolerated words do not, because there the greedy
+// word group would eat a real credential's "%3D" padding as a separator and
+// leave its tail as the core, which fails the decode test.
 // The core is the base64 alphabet; a glued "." or "%" tail is consumed too,
 // for the same reason as the header pattern — a strict base64 class stops at
 // those and left JWT segments and percent-encoded fragments next to
 // "[REDACTED]". The tail ends on a token character, so sentence punctuation
 // after a credential survives, and the decode test sees the core only.
-var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b[\s:=]*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b(?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // tailEndsInSchemeWord reports a tail that stops on a scheme or header word
 // ("core.basic <cred>"): a ReplaceAll pass cannot rescan what it emitted, so

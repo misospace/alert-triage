@@ -173,6 +173,19 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"basic auth dXNlcjpwYXNz", "basic auth [REDACTED]"},
 		{"basic: dXNlcjpwYXNz", "basic: [REDACTED]"},
 		{"basic dXNlcjpwYXNz,host=example", "basic [REDACTED],host=example"},
+		// Percent-encoded separator between the scheme word and the
+		// credential: URL- and query-encoded auth values logged by proxies
+		// and web apps. In a header the whole value is consumed; outside
+		// one the scheme word stays visible as context.
+		{"proxy-authorization: Basic%20Zm9vOmJhcg%3D%3D", "proxy-authorization: [REDACTED]"},
+		{"authorization=Basic%20dXNlcjpwYXNz", "authorization=[REDACTED]"},
+		{"basic%20Zm9vOmJhcg%3D%3D", "basic%20[REDACTED]"},
+		{"basic%3AdXNlcjpwYXNz", "basic%3A[REDACTED]"},
+		// Prose survives the encoded separators too: the decode gate still
+		// decides scheme-word-only matches, and a sentence containing the
+		// scheme word stays byte-identical.
+		{"basic%20authentication failed", "basic%20authentication failed"},
+		{"basic auth failed for basic.io keep this sentence", "basic auth failed for basic.io keep this sentence"},
 		// Prose survives. Words that also decode to bytes holding a colon
 		// ("open" decodes to bytes that start with one, "2006" to bytes
 		// whose user-id is not printable) are not credentials.
