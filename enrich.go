@@ -1749,6 +1749,35 @@ var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b(?:[\s:=]|` + pctE
 // Emitting the tail instead lets the fixed-point pass below redact it.
 var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$`)
 
+// safeTail returns a captured tail that is safe to re-emit (issue #217). A
+// tail that stops on a scheme word is emitted rather than consumed, because
+// consuming it strips the next credential's context and the credential
+// survives; the trailing scheme word therefore stays, since it is the
+// context the next credential needs.
+// Material ahead of that scheme word is redacted WHOLESALE, not selectively:
+// inside a tail a credential cannot be told apart from a file name, a version
+// string or a pod name, so picking out the segments that look like
+// credentials would leak the ones that do not. The cost is that this deletes
+// operator-visible evidence the previous code kept — a version string or a
+// pod name inside a tail is gone with the credential.
+// A tail that does not stop on a scheme word carries material too, so it is
+// redacted whole; the callers consume such a tail rather than emit it, which
+// makes that arm defensive.
+func safeTail(tail string) string {
+	loc := tailEndsInSchemeWord.FindStringIndex(tail)
+	if loc == nil {
+		return "[REDACTED]"
+	}
+	if loc[0] == 0 {
+		return tail
+	}
+	interior := tail[:loc[0]]
+	if interior[0] == '.' || interior[0] == '%' {
+		return interior[:1] + "[REDACTED]" + tail[loc[0]:]
+	}
+	return "[REDACTED]" + tail[loc[0]:]
+}
+
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
 // right after the scheme, so whatever sits there goes even when it is too
@@ -1762,7 +1791,9 @@ func stripBasicAuth(s string) string {
 	// ReplaceAll cannot rescan what it emitted, so run to a fixed point.
 	// It converges: each pass replaces at least one credential core with
 	// "[REDACTED]", which matches neither pattern, and inserts no new
-	// credential material.
+	// credential material. The re-emitted tail carries no credential
+	// material either — safeTail redacts its interior wholesale and only the
+	// trailing scheme word survives — so no pass can re-create work.
 	for {
 		once := s
 		s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
@@ -1776,8 +1807,10 @@ func stripBasicAuth(s string) string {
 			}
 			// The danger check runs only once redaction fires: a value
 			// that is no credential must survive untouched, tail or not.
+			// The tail is emitted so the next credential keeps its scheme
+			// word, but only once the material it carries is redacted.
 			if sub[5] != "" && tailEndsInSchemeWord.MatchString(sub[5]) {
-				return prefix + "[REDACTED]" + sub[5]
+				return prefix + "[REDACTED]" + safeTail(sub[5])
 			}
 			return prefix + "[REDACTED]"
 		})
@@ -1787,7 +1820,7 @@ func stripBasicAuth(s string) string {
 				return m
 			}
 			if sub[2] != "" && tailEndsInSchemeWord.MatchString(sub[2]) {
-				return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]" + sub[2]
+				return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]" + safeTail(sub[2])
 			}
 			// The scheme word stays visible: outside a header it is the only
 			// context that says a credential was here.
