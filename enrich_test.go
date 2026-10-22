@@ -228,6 +228,12 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// is no credential survives, and the glued credential behind the
 		// scheme word is still redacted by the scheme pass.
 		{"authorization: Negotiate.basic dXVpZDpwYXNz", "authorization: Negotiate.basic [REDACTED]"},
+		// The greedy word group used to swallow a credential that words
+		// follow and judge the word behind it, leaving the credential in
+		// plaintext (issue #224); each interlude run now faces the gate.
+		{"failed with basic dXNlcjpwYXNz in request", "failed with basic [REDACTED] in request"},
+		{"basic dXNlcjpwYXNz and dXVpZDpwYXNz", "basic [REDACTED] and [REDACTED]"},
+		{"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz", "basic [REDACTED]=basic [REDACTED]"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -287,6 +293,19 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			}
 		}
 	}
+	// The greedy word group used to swallow a credential that words follow and
+	// judge the word behind it (issue #224); both payloads must be gone.
+	for _, in := range []string{
+		"failed with basic dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz and dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 }
 
 // TestStripSecretsBasicAuthIdempotent pins that redacting an already
@@ -303,6 +322,9 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"Basic dXNlcjpwYXNz%3Dextra",
 		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 		"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"failed with basic dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz and dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {

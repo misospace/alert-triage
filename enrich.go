@@ -1750,20 +1750,36 @@ const pctEncodedSeparator = `(?:%20|%3a|%3d)+`
 var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)(?:\s+|` + pctEncodedSeparator + `))?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // basicAuthSchemePattern finds a Basic-scheme credential that no header name
-// introduces. Words between the scheme and the credential ("basic auth:
-// <payload>") are tolerated, because the scheme word alone does not say
-// that what follows it is a credential; the decode test decides that.
-// The separator right after the scheme word also comes in its
-// percent-encoded forms, for the same reason as in the header pattern; the
-// separators between the tolerated words do not, because there the greedy
-// word group would eat a real credential's "%3D" padding as a separator and
-// leave its tail as the core, which fails the decode test.
-// The core is the base64 alphabet; a glued "." or "%" tail is consumed too,
-// for the same reason as the header pattern — a strict base64 class stops at
-// those and left JWT segments and percent-encoded fragments next to
-// "[REDACTED]". The tail ends on a token character, so sentence punctuation
-// after a credential survives, and the decode test sees the core only.
-var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b(?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+// introduces. The interlude — separators plus tolerated words between the
+// scheme and the credential ("basic auth: <payload>") — is captured as group 1
+// so that every credential-shaped run in it can face the decode gate itself,
+// judged leftmost first: the leftmost run sits right after the scheme word, so
+// the strict form "basic <credential>" is tested before any word further back.
+// That ordering is what issue #224 needed. The greedy word group used to
+// swallow the credential itself — "basic dXNlcjpwYXNz in request" — and judge
+// the word behind it, which left the credential in plaintext. Prose still
+// survives, because words like "auth failed for" never decode to a
+// user:password pair, and a redacted run carries no base64 material, so the
+// fixed-point loop in stripBasicAuth still converges. The separator right
+// after the scheme word comes in its percent-encoded forms, for the same
+// reason as in the header pattern; the separators between the tolerated words
+// do not, because there the greedy word group would eat a real credential's
+// "%3D" padding as a separator. The core (group 2) is the base64 alphabet; a
+// glued "." or "%" tail (group 3) is consumed too, for the same reason as the
+// header pattern — a strict base64 class stops at those and left JWT segments
+// and percent-encoded fragments next to "[REDACTED]". The tail ends on a token
+// character, so sentence punctuation after a credential survives, and the
+// decode test sees the core only.
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b((?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*)([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+
+// basicAuthCredentialRun splits the interlude into credential-shaped runs so
+// each one can face the decode gate itself. The class omits "=": in the
+// interlude it is a separator the word group placed between runs, not
+// credential padding, so a run must stop at it. Keeping it in the class glued
+// a credential to that separator, and on the next fixed-point pass the run
+// decoded via the raw-base64 trim and the redaction swallowed the separator,
+// dropping a "key=value" join (issue #224).
+var basicAuthCredentialRun = regexp.MustCompile(`[A-Za-z0-9+/_-]+`)
 
 // tailEndsInSchemeWord reports a tail that stops on a scheme or header word
 // ("core.basic <cred>"): a ReplaceAll pass cannot rescan what it emitted, so
@@ -1805,15 +1821,29 @@ func stripBasicAuth(s string) string {
 		})
 		s = basicAuthSchemePattern.ReplaceAllStringFunc(s, func(m string) string {
 			sub := basicAuthSchemePattern.FindStringSubmatch(m)
-			if len(sub) != 3 || !decodesToBasicCredential(sub[1]) {
+			if len(sub) != 4 {
 				return m
 			}
-			if sub[2] != "" && tailEndsInSchemeWord.MatchString(sub[2]) {
-				return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]" + sub[2]
+			interlude, core, tail := sub[1], sub[2], sub[3]
+			prefix := strings.TrimSuffix(m, interlude+core+tail)
+			judged := basicAuthCredentialRun.ReplaceAllStringFunc(interlude, func(run string) string {
+				if decodesToBasicCredential(run) {
+					return "[REDACTED]"
+				}
+				return run
+			})
+			if !decodesToBasicCredential(core) {
+				if judged == interlude {
+					return m
+				}
+				return prefix + judged + core + tail
+			}
+			if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
+				return prefix + judged + "[REDACTED]" + tail
 			}
 			// The scheme word stays visible: outside a header it is the only
 			// context that says a credential was here.
-			return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]"
+			return prefix + judged + "[REDACTED]"
 		})
 		if s == once {
 			return s
