@@ -1781,6 +1781,35 @@ var basicAuthSchemePattern = regexp.MustCompile(`(?i)` + schemeWordLeftBoundary 
 // next pass reads the credential with.
 var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:(?:%20|%3a|%3d)+[^A-Za-z]?|[^A-Za-z])(?:basic|authorization)$`)
 
+// safeTail returns a captured tail that is safe to re-emit (issue #217). A
+// tail that stops on a scheme word is emitted rather than consumed, because
+// consuming it strips the next credential's context and the credential
+// survives; the trailing scheme word therefore stays, since it is the
+// context the next credential needs.
+// Material ahead of that scheme word is redacted WHOLESALE, not selectively:
+// inside a tail a credential cannot be told apart from a file name, a version
+// string or a pod name, so picking out the segments that look like
+// credentials would leak the ones that do not. The cost is that this deletes
+// operator-visible evidence the previous code kept — a version string or a
+// pod name inside a tail is gone with the credential.
+// A tail that does not stop on a scheme word carries material too, so it is
+// redacted whole; the callers consume such a tail rather than emit it, which
+// makes that arm defensive.
+func safeTail(tail string) string {
+	loc := tailEndsInSchemeWord.FindStringIndex(tail)
+	if loc == nil {
+		return "[REDACTED]"
+	}
+	if loc[0] == 0 {
+		return tail
+	}
+	interior := tail[:loc[0]]
+	if interior[0] == '.' || interior[0] == '%' {
+		return interior[:1] + "[REDACTED]" + tail[loc[0]:]
+	}
+	return "[REDACTED]" + tail[loc[0]:]
+}
+
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
 // right after the scheme, so whatever sits there goes even when it is too
@@ -1794,7 +1823,9 @@ func stripBasicAuth(s string) string {
 	// a pass cannot rescan what it emitted, so run to a fixed point.
 	// It converges: each pass replaces at least one credential core with
 	// "[REDACTED]", which matches neither pattern, and inserts no new
-	// credential material.
+	// credential material. The re-emitted tail carries no credential
+	// material either — safeTail redacts its interior wholesale and only the
+	// trailing scheme word survives — so no pass can re-create work.
 	for {
 		once := s
 		s = redactBasicHeader(s)
@@ -1803,20 +1834,6 @@ func stripBasicAuth(s string) string {
 			return s
 		}
 	}
-}
-
-// schemeWordOfTail returns the part of a tail that names the scheme of the
-// credential behind it — the glue and the scheme word — and nothing else.
-// The rest of the tail is credential material: it was matched with the
-// credential core and goes with it. Only the scheme word has to survive,
-// because it is the context the next pass reads the next credential with,
-// and keeping the rest of the tail would keep JWT segments and
-// percent-encoded fragments of the credential that was just redacted.
-func schemeWordOfTail(tail string) string {
-	if i := tailEndsInSchemeWord.FindStringIndex(tail); i != nil {
-		return tail[i[0]:]
-	}
-	return ""
 }
 
 // redactBasicHeader redacts the credential an Authorization-style header
@@ -1866,7 +1883,13 @@ func redactBasicHeader(s string) string {
 		// stripped.
 		out.WriteString(s[pos : pos+loc[3]])
 		out.WriteString("[REDACTED]")
-		out.WriteString(schemeWordOfTail(tail))
+		// A tail that stops on a scheme word is emitted, so the next
+		// credential keeps its context, but only once safeTail has
+		// redacted the credential material it carries (#217). A tail
+		// that stops on no scheme word goes with the credential.
+		if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
+			out.WriteString(safeTail(tail))
+		}
 		pos += loc[1]
 	}
 	out.WriteString(s[pos:])
@@ -1905,10 +1928,15 @@ func redactBasicScheme(s string) string {
 			continue
 		}
 		// The scheme word stays visible: outside a header it is the only
-		// context that says a credential was here.
+		// context that says a credential was here. A tail that stops on
+		// a scheme word is emitted only once safeTail has redacted the
+		// material it carries (#217); a tail that stops on no scheme
+		// word goes with the credential.
 		out.WriteString(s[pos : pos+loc[2]])
 		out.WriteString("[REDACTED]")
-		out.WriteString(schemeWordOfTail(tail))
+		if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
+			out.WriteString(safeTail(tail))
+		}
 		pos += loc[1]
 	}
 	out.WriteString(s[pos:])

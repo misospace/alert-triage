@@ -224,6 +224,26 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz", "authorization: [REDACTED].basic [REDACTED]"},
 		{"basic dXNlcjpwYXNz.authorization: Basic dXVpZDpwYXNz", "basic [REDACTED].authorization: [REDACTED]"},
 		{"basic dXNlcjpwYXNz.basic", "basic [REDACTED].basic"},
+		// A tail that carries credential material ahead of the trailing
+		// scheme word leaks it: the tail's character class swallows the
+		// credential and no later pass can consume it, so the interior is
+		// redacted (#217). The scheme word stays, so the next credential
+		// keeps its context.
+		{"authorization: Zm9vOmJhcg==.dXNlcjpwYXNz.basic", "authorization: [REDACTED].[REDACTED].basic"},
+		{"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic", "basic [REDACTED].[REDACTED].basic"},
+		// A JWT glued to the credential and stopped on a scheme word goes
+		// the same way: no segment of it survives.
+		{"authorization: Basic " + jwt + ".basic", "authorization: [REDACTED].[REDACTED].basic"},
+		// The same shape with a credential behind the trailing scheme word:
+		// the interior goes and the next credential is still redacted.
+		{"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz", "basic [REDACTED].[REDACTED].basic [REDACTED]"},
+		{"authorization: Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz", "authorization: [REDACTED].[REDACTED].basic [REDACTED]"},
+		// The JSON-quoted shape, which is how the header reaches a log in
+		// practice.
+		{`{"authorization": "Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic"}`, `{"authorization": "[REDACTED].[REDACTED].basic"}`},
+		// A long chain of scheme-word tails is one captured tail: it
+		// collapses in a single pass and its interior never leaks.
+		{"basic dXNlcjpwYXNz" + strings.Repeat(".basic", 500), "basic [REDACTED].[REDACTED].basic"},
 		// The danger tail must not redact on its own: a header value that
 		// is no credential survives, and the glued credential behind the
 		// scheme word is still redacted by the scheme pass.
@@ -341,6 +361,81 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 	}
 }
 
+// TestStripSecretsBasicAuthTailInteriorGone pins that credential material
+// carried inside a captured tail is redacted before the tail is re-emitted
+// (#217). The tail's character class swallows whole credential segments and
+// ReplaceAll cannot rescan what it emitted, so material ahead of the
+// trailing scheme word would survive every later pass and reach the digest.
+func TestStripSecretsBasicAuthTailInteriorGone(t *testing.T) {
+	for _, in := range []string{
+		"authorization: Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
+		"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
+		"authorization: Zm9vOmJhcg==.dXNlcjpwYXNz.authorization: Basic dXVpZDpwYXNz",
+	} {
+		got := stripSecrets(in)
+		if strings.Contains(got, "dXNlcjpwYXNz") {
+			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived in the tail", in, got)
+		}
+	}
+	// A JWT behind the scheme word goes with the rest of the tail: not one
+	// segment of it may survive.
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakesigvalue1234"
+	in := "authorization: Basic " + jwt + ".basic"
+	got := stripSecrets(in)
+	for _, seg := range []string{"eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJmYWtlIn0", "fakesigvalue1234"} {
+		if strings.Contains(got, seg) {
+			t.Errorf("stripSecrets(%q) = %q; JWT segment %q survived", in, got, seg)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthDeepTailChainTerminates pins that the fixed-point
+// loop converges on a 500-deep chain: every ".basic <credential>" link is
+// one more unit of work, so the loop has to keep passing until the whole
+// chain is redacted and then stop. The measured output is "basic
+// [REDACTED]" followed by ".basic [REDACTED]" once per link, 8516 bytes in
+// all.
+func TestStripSecretsBasicAuthDeepTailChainTerminates(t *testing.T) {
+	const links = 500
+	in := "basic dXNlcjpwYXNz" + strings.Repeat(".basic dXVpZDpwYXNz", links)
+	want := "basic [REDACTED]" + strings.Repeat(".basic [REDACTED]", links)
+	got := stripSecrets(in)
+	if got != want {
+		t.Errorf("stripSecrets(chain of %d links) = %d bytes with %d redactions; want %d bytes with %d redactions",
+			links, len(got), strings.Count(got, "[REDACTED]"), len(want), strings.Count(want, "[REDACTED]"))
+	}
+	if len(got) != 8516 {
+		t.Errorf("stripSecrets(chain of %d links) = %d bytes; want 8516", links, len(got))
+	}
+}
+
+// TestSafeTail pins safeTail's contract: what it returns is safe to
+// re-emit, and it fails closed. A tail that is exactly a scheme word is
+// emitted unchanged, because the next credential needs that word (#216); a
+// tail that stops on a scheme word loses everything ahead of it; a tail that
+// stops on no scheme word carries material too and is redacted whole.
+func TestSafeTail(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// Material ahead of the scheme word goes, and with it the
+		// separator that would otherwise introduce it.
+		{"dXNlcjpwYXNz.basic", "[REDACTED].basic"},
+		{".dXNlcjpwYXNz.basic", ".[REDACTED].basic"},
+		// The tail is exactly the scheme word: unchanged (#216).
+		{".basic", ".basic"},
+		{".basic.basic", ".[REDACTED].basic"},
+		// No scheme word: redacted whole, fail closed.
+		{"dXNlcjpwYXNz", "[REDACTED]"},
+		{"", "[REDACTED]"},
+	}
+	for _, tt := range tests {
+		if got := safeTail(tt.in); got != tt.want {
+			t.Errorf("safeTail(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestStripSecretsBasicAuthIdempotent pins that redacting an already
 // redacted line changes nothing: the digest is rendered from text that has
 // been through stripSecrets more than once.
@@ -363,6 +458,12 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"0basic%20dXNlcjpwYXNz",
 		"authorization dXVpZDpwYXNz",
 		"Authorization-foo.Authorization:dXNlcjpwYXNz",
+		"authorization: Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
+		"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
+		"authorization: Basic " + jwt + ".basic",
+		"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"authorization: Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		`{"authorization": "Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic"}`,
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
