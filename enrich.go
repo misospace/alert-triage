@@ -1750,22 +1750,43 @@ const schemeWordLeftBoundary = `(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})`
 var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*(?:[:=]\s*)?\s*"?)\s*((basic)(?:\s+|` + pctEncodedSeparator + `))?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // basicAuthSchemePattern finds a Basic-scheme credential that no header name
-// introduces. Words between the scheme and the credential ("basic auth:
-// <payload>") are tolerated, because the scheme word alone does not say
-// that what follows it is a credential; the decode test decides that.
-// The separator right after the scheme word also comes in its
-// percent-encoded forms, for the same reason as in the header pattern; the
-// separators between the tolerated words do not, because there the greedy
-// word group would eat a real credential's "%3D" padding as a separator and
-// leave its tail as the core, which fails the decode test.
-// The core is the base64 alphabet; a glued "." or "%" tail is consumed too,
-// for the same reason as the header pattern — a strict base64 class stops at
-// those and left JWT segments and percent-encoded fragments next to
-// "[REDACTED]". The tail ends on a token character, so sentence punctuation
-// after a credential survives, and the decode test sees the core only.
-// The scheme word starts on the left boundary above, which admits the
-// percent-encoded and digit-glued shapes a word boundary rejected.
-var basicAuthSchemePattern = regexp.MustCompile(`(?i)` + schemeWordLeftBoundary + `basic\b(?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+// basicAuthSchemePattern finds a Basic-scheme credential that no header name
+// introduces. The interlude between the scheme and the credential — the
+// separators (group 1) plus the tolerated words ("basic auth: <payload>",
+// group 2) — is captured so every credential-shaped run in the word chain can
+// face the decode gate itself, judged leftmost first: the leftmost run sits
+// right after the scheme separators, so the strict form "basic <credential>"
+// is tested before any word further back. That ordering is what issue #224
+// needed. The greedy word group used to swallow the credential itself —
+// "basic dXNlcjpwYXNz in request" — and judge the word behind it, which left
+// the credential in plaintext. Prose still survives, because words like "auth
+// failed for" never decode to a user:password pair, and a redacted run
+// carries no base64 material, so the fixed-point loop in stripBasicAuth still
+// converges. The leading separators are captured apart from the word chain,
+// and only the chain is split into judged runs: percent-encoded separators
+// carry digits ("%20"), and splitting across them would glue "20" onto the
+// leftmost credential — "basic%20dXNlcjpwYXNz in request" — and break its
+// decode, while a word chain can never hold separator residue because its
+// words are letters and hyphens. The separators between the tolerated words
+// do not come in percent-encoded forms, because there the greedy word group
+// would eat a real credential's "%3D" padding as a separator. The core
+// (group 3) is the base64 alphabet; a glued "." or "%" tail (group 4) is
+// consumed too, for the same reason as in the header pattern — a strict
+// base64 class stops at those and left JWT segments and percent-encoded
+// fragments next to "[REDACTED]". The tail ends on a token character, so
+// sentence punctuation after a credential survives, and the decode test sees
+// the core only. The scheme word starts on the left boundary above, which
+// admits the percent-encoded and digit-glued shapes a word boundary rejected.
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)` + schemeWordLeftBoundary + `basic\b((?:[\s:=]|` + pctEncodedSeparator + `)*)((?:[A-Za-z][A-Za-z-]*[\s:=]+)*)([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+
+// basicAuthCredentialRun splits the word-chain part of the interlude into
+// credential-shaped runs so each one can face the decode gate itself. The
+// class omits "=": there it is a separator the word group placed between
+// runs, not credential padding, so a run must stop at it. Keeping it in the
+// class glued a credential to that separator, and on the next fixed-point
+// pass the run decoded via the raw-base64 trim and the redaction swallowed
+// the separator, dropping a "key=value" join (issue #224).
+var basicAuthCredentialRun = regexp.MustCompile(`[A-Za-z0-9+/_-]+`)
 
 // tailEndsInSchemeWord reports a tail that stops on a scheme or header word
 // ("core.basic <cred>"): a pass cannot rescan what it emitted, so
@@ -1826,11 +1847,14 @@ func safeTail(tail string) string {
 func stripBasicAuth(s string) string {
 	// A consumed tail can stop exactly on the next credential's scheme word;
 	// a pass cannot rescan what it emitted, so run to a fixed point.
-	// It converges: each pass replaces at least one credential core with
-	// "[REDACTED]", which matches neither pattern, and inserts no new
-	// credential material. The re-emitted tail carries no credential
-	// material either — safeTail redacts its interior wholesale and only the
-	// trailing scheme word survives — so no pass can re-create work.
+	// It converges: every mutating pass replaces at least one credential-
+	// alphabet run — a core in either pass, a word-chain run in the scheme
+	// pass — with "[REDACTED]", whose brackets match neither pattern's
+	// classes and cannot join runs, so the amount of credential material
+	// strictly drops and no pass can splice new credential material together.
+	// Re-emitted tails carry no credential material either: safeTail redacts
+	// each tail's interior wholesale and only the trailing scheme word
+	// survives, so no pass can re-create work.
 	for {
 		once := s
 		s = redactBasicHeader(s)
@@ -1917,19 +1941,39 @@ func redactBasicScheme(s string) string {
 		if loc == nil {
 			break
 		}
-		core := s[pos+loc[2] : pos+loc[3]]
+		// Groups: 1 = the separators after the scheme word, 2 = the
+		// tolerated word chain, 3 = the core, 4 = the tail.
+		words := s[pos+loc[4] : pos+loc[5]]
+		core := s[pos+loc[6] : pos+loc[7]]
 		tail := ""
-		if loc[4] >= 0 {
-			tail = s[pos+loc[4] : pos+loc[5]]
+		if loc[8] >= 0 {
+			tail = s[pos+loc[8] : pos+loc[9]]
 		}
+		// Every credential-shaped run in the word chain faces the gate
+		// itself, leftmost first, so the strict form "basic <credential>"
+		// is judged before any word behind it — the greedy chain used to
+		// swallow the credential and judge the word after it (#224).
+		judged := basicAuthCredentialRun.ReplaceAllStringFunc(words, func(run string) string {
+			if decodesToBasicCredential(run) {
+				return "[REDACTED]"
+			}
+			return run
+		})
 		if !decodesToBasicCredential(core) {
 			// The scheme word alone does not say that what follows it is
-			// a credential; the decode test decides that. Nothing is
-			// redacted here, and the core stays unread: it can be the
-			// next credential's own scheme word ("basic Basic%3D<cred>"),
-			// and a swallowed one orphans that credential.
-			out.WriteString(s[pos : pos+loc[2]])
-			pos += loc[2]
+			// a credential; the decode test decides that. The core stays
+			// unread and in play: it can be the next credential's own
+			// scheme word ("basic Basic%3D<cred>"), and a swallowed one
+			// orphans that credential. A word run that did decode is
+			// written redacted; the rest of the chain stays behind the
+			// resume point untouched.
+			if judged != words {
+				out.WriteString(s[pos : pos+loc[4]])
+				out.WriteString(judged)
+			} else {
+				out.WriteString(s[pos : pos+loc[6]])
+			}
+			pos += loc[6]
 			continue
 		}
 		// The scheme word stays visible: outside a header it is the only
@@ -1937,7 +1981,8 @@ func redactBasicScheme(s string) string {
 		// a scheme word is emitted only once safeTail has redacted the
 		// material it carries (#217); a tail that stops on no scheme
 		// word goes with the credential.
-		out.WriteString(s[pos : pos+loc[2]])
+		out.WriteString(s[pos : pos+loc[4]])
+		out.WriteString(judged)
 		out.WriteString("[REDACTED]")
 		if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
 			out.WriteString(safeTail(tail))

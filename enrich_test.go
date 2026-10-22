@@ -288,6 +288,22 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// not one because letters are glued to it.
 		{"0basic Basic%3DdXNlcjpwYXNz", "0basic Basic%3D[REDACTED]"},
 		{"basic dXNlcjpwYXNz.subbasic dXVpZDpwYXNz", "basic [REDACTED] dXVpZDpwYXNz"},
+		// The greedy word group used to swallow a credential that words
+		// follow and judge the word behind it, leaving the credential in
+		// plaintext (issue #224); each interlude run now faces the gate.
+		{"failed with basic dXNlcjpwYXNz in request", "failed with basic [REDACTED] in request"},
+		{"basic dXNlcjpwYXNz and dXVpZDpwYXNz", "basic [REDACTED] and [REDACTED]"},
+		{"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz", "basic [REDACTED]=basic [REDACTED]"},
+		// The leading separators are judged apart from the word chain, so a
+		// percent-encoded one cannot glue its digits onto the leftmost run,
+		// and the scheme word keeps its case in the output.
+		{"basic%20dXNlcjpwYXNz in request", "basic%20[REDACTED] in request"},
+		{"BASIC dXNlcjpwYXNz in request", "BASIC [REDACTED] in request"},
+		// Accepted trade: the word chain cannot tell a credential's "="
+		// padding from the "=" separator it matched, so the padding residue
+		// survives after "[REDACTED]" rather than a swallowed join. The
+		// payload itself never does, and the residue decodes to nothing.
+		{"basic dXNlcjpwYXNz== and more", "basic [REDACTED]== and more"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -360,6 +376,22 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+	// The greedy word group used to swallow a credential that words follow and
+	// judge the word behind it (issue #224); both payloads must be gone.
+	for _, in := range []string{
+		"failed with basic dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz and dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz",
+		"basic%20dXNlcjpwYXNz in request",
+		"BASIC dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz== and more",
 	} {
 		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
 			if got := stripSecrets(in); strings.Contains(got, p) {
@@ -461,11 +493,18 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3fbasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%20basic dXVpZDpwYXNz",
 		"%3Dbasic%20dXNlcjpwYXNz",
 		"0basic%20dXNlcjpwYXNz",
 		"authorization dXVpZDpwYXNz",
 		"Authorization-foo.Authorization:dXNlcjpwYXNz",
+		"failed with basic dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz and dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz",
+		"basic%20dXNlcjpwYXNz in request",
+		"BASIC dXNlcjpwYXNz in request",
+		"basic dXNlcjpwYXNz== and more",
 		"authorization: Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
 		"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic",
 		"authorization: Basic " + jwt + ".basic",
