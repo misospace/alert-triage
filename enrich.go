@@ -1774,12 +1774,17 @@ var basicAuthSchemePattern = regexp.MustCompile(`(?i)` + schemeWordLeftBoundary 
 // The glue counts in its percent-encoded form as well: a percent-encoded
 // separator ends in a hex digit ("core%3Dbasic"), which the literal glue
 // alone did not recognise, so the tail was consumed and the credential
-// behind it kept its plaintext. The scheme word has to start where the
-// scheme pass looks for one — after a non-letter, or after a
-// percent-encoded token — so a word glued to letters is not a scheme word
-// ("core.subbasic"). The match starts at the glue, which is the context the
-// next pass reads the credential with.
-var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:(?:%20|%3a|%3d)+[^A-Za-z]?|[^A-Za-z])(?:basic|authorization)$`)
+// behind it kept its plaintext. The token arm must accept ANY percent token,
+// not just the encoded separators, because the two rules read the same word:
+// schemeWordLeftBoundary recognises a scheme word after any percent token,
+// so a tail ending in a word behind an unenumerated one ("%3fbasic", the
+// encoding of "?") is context the next pass will honour, and consuming it
+// orphans the credential behind that word just as the literal glue did.
+// The scheme word has to start where the scheme pass looks for one — after a
+// non-letter, or after a percent-encoded token — so a word glued to letters
+// is not a scheme word ("core.subbasic"). The match starts at the glue,
+// which is the context the next pass reads the credential with.
+var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:(?:%[0-9A-Fa-f]{2})+[^A-Za-z]?|[^A-Za-z])(?:basic|authorization)$`)
 
 // safeTail returns a captured tail that is safe to re-emit (issue #217). A
 // tail that stops on a scheme word is emitted rather than consumed, because

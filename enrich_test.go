@@ -256,6 +256,14 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// digit, because no word boundary fires there.
 		{"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz", "basic [REDACTED]%3Dbasic [REDACTED]"},
 		{"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz", "basic [REDACTED]%3abasic [REDACTED]"},
+		// The tail rule must honour every percent token the scheme-word
+		// boundary honours, not just the encoded separators: the scheme
+		// pass reads a scheme word after ANY percent token, so a tail
+		// ending behind an unenumerated one ("%3f" is the encoding of
+		// "?") is context the next pass will use, and consuming it
+		// orphaned the credential behind that word.
+		{"basic dXNlcjpwYXNz%3fbasic dXVpZDpwYXNz", "basic [REDACTED]%3fbasic [REDACTED]"},
+		{"basic Zm9vOmJhcg==.dXNlcjpwYXNz%3fbasic dXVpZDpwYXNz", "basic [REDACTED].[REDACTED]%3fbasic [REDACTED]"},
 		// The header word in the tail names the scheme of the value that
 		// follows it, but the header pass could not read it back without a
 		// separator, so the credential behind it kept its plaintext.
