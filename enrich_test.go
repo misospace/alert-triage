@@ -294,6 +294,49 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"failed with basic dXNlcjpwYXNz in request", "failed with basic [REDACTED] in request"},
 		{"basic dXNlcjpwYXNz and dXVpZDpwYXNz", "basic [REDACTED] and [REDACTED]"},
 		{"basic dXNlcjpwYXNz=basic dXVpZDpwYXNz", "basic [REDACTED]=basic [REDACTED]"},
+		// A credential glued to a following scheme word is one token to
+		// the core class: it stops at "." but neither at "=" nor at a
+		// letter, so the decode gate failed on the combined run and the
+		// credential survived next to the word (issue #227). The
+		// credential goes and the word stays, so a credential behind it
+		// keeps the context the next pass reads.
+		{"basic dXVpZDpwYXNz=basic", "basic [REDACTED]=basic"},
+		{"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz", "basic [REDACTED]basic [REDACTED]"},
+		{"basic dXVpZDpwYXNzbasic", "basic [REDACTED]basic"},
+		// A digit-bearing credential cannot enter the word chain, so the
+		// core swallows its "=" glue together with the glued word.
+		{"basic dXNlcjE6cA=basic", "basic [REDACTED]basic"},
+		{"basic dXNlcjE6cA=basic dXVpZDpwYXNz", "basic [REDACTED]basic [REDACTED]"},
+		// The header twin: the value class glued word and credential into
+		// one run, the gate failed, and the value survived unread.
+		{"authorization: dXVpZDpwYXNzbasic", "authorization: [REDACTED]basic"},
+		{"authorization: dXVpZDpwYXNzauthorization dXVpZDpwYXNz", "authorization: [REDACTED]authorization [REDACTED]"},
+		// Prose that ends on the scheme word without a credential ahead
+		// of it survives the cut.
+		{"basic authorization", "basic authorization"},
+		{"authorization: Negotiate basic", "authorization: Negotiate basic"},
+		// A "+" glued to a scheme word the following word's first letters
+		// were base64 alphabet chars, so the split's glue set "=_-" came
+		// up short and the part before the word failed the gate (issue
+		// #240). The glue set grew by "+/" and the split fires again. The
+		// credential goes and the word and the following credential keep
+		// their context.
+		{"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=", "Basic: [REDACTED]authorization [REDACTED]"},
+		// A scheme word inside the run's middle is not at either end, so
+		// splitGluedSchemeWord's suffix walk never saw it: every credential
+		// around the word survived. The segments the word splits face the
+		// gate on their own, the words stay as context.
+		{"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz", "authorization: [REDACTED]authorization=[REDACTED]"},
+		{"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		// A word-shaped fragment ahead of the glued word is prose: no
+		// segment before the word decodes, so only the payload behind the
+		// two goes and the prose keeps its text.
+		{"basic sub-basic-dXNlcjpwYXNz", "basic sub-basic-[REDACTED]"},
+		// Prose whose fragments carry scheme words stays readable: no
+		// segment around any occurrence decodes.
+		{"basic subbasic", "basic subbasic"},
+		{"basic offbasic", "basic offbasic"},
 		// The leading separators are judged apart from the word chain, so a
 		// percent-encoded one cannot glue its digits onto the leftmost run,
 		// and the scheme word keeps its case in the output.
@@ -394,6 +437,37 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 		"basic dXNlcjpwYXNz== and more",
 	} {
 		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+	// A credential glued to a following scheme word was one token to the
+	// core class, and the gate failing on the combined run spared the
+	// whole thing (issue #227); no payload may survive, glued form
+	// included.
+	for _, in := range []string{
+		"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz",
+		"basic dXNlcjE6cA=basic dXVpZDpwYXNz",
+		"authorization: dXVpZDpwYXNzbasic authorization dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz", "dXNlcjE6cA"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+	// A "+" or "/" gluing one credential to a following scheme word, and a
+	// scheme word inside a run with credentials on either side, kept their
+	// plaintext on main (issue #240): no payload of any of the shapes may
+	// survive, glued or mid-run.
+	for _, in := range []string{
+		"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=",
+		"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz",
+		"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz",
+		"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz",
+	} {
+		for _, p := range []string{payload, "Zm9vOmJhcg", "dXVpZDpwYXNz", "dXNlcjpwYXNz", "dXNlcjE6cA"} {
 			if got := stripSecrets(in); strings.Contains(got, p) {
 				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
 			}
@@ -511,6 +585,16 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 		"authorization: Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 		`{"authorization": "Basic Zm9vOmJhcg==.dXNlcjpwYXNz.basic"}`,
+		"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz",
+		"basic dXNlcjE6cA=basic dXVpZDpwYXNz",
+		"authorization: dXVpZDpwYXNzbasic authorization dXVpZDpwYXNz",
+		// The "+/-glued" and mid-run shapes (issue #240).
+		"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=",
+		"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz",
+		"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz",
+		"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz",
+		"basic subbasic",
+		"basic sub-basic-dXNlcjpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
