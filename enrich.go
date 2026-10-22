@@ -1308,42 +1308,20 @@ func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient,
 		rel.Reason = "no Kubernetes client available for this cluster"
 		return rel
 	}
-	var kuz struct {
-		Spec struct {
-			Path      string `json:"path"`
-			SourceRef struct {
-				Name string `json:"name"`
-				Kind string `json:"kind"`
-			} `json:"sourceRef"`
-			Components []string `json:"components"`
-		} `json:"spec"`
-		Status struct {
-			LastAppliedRevision string `json:"lastAppliedRevision"`
-		} `json:"status"`
-	}
-	p := "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + ns + "/kustomizations/" + name
-	if err := k.get(ctx, p, &kuz); err != nil {
+	kuz, revision, err := k.fluxKustomization(ctx, ns, name)
+	if err != nil {
 		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
 		return rel
 	}
-	srcKind := kuz.Spec.SourceRef.Kind
-	if srcKind == "" {
-		srcKind = "GitRepository"
-	}
-	var src struct {
-		Spec struct {
-			URL string `json:"url"`
-		} `json:"spec"`
-	}
-	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
-	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	if err != nil || srcURL == "" {
 		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
 		return rel
 	}
-	rel.RepoURL = src.Spec.URL
-	rel.WorkloadPath = kuz.Spec.Path
-	rel.ComponentPaths = kuz.Spec.Components
-	rel.Revision = kuz.Status.LastAppliedRevision
+	rel.RepoURL = srcURL
+	rel.WorkloadPath = kuz.Path
+	rel.ComponentPaths = kuz.Components
+	rel.Revision = revision
 	return classifyCommit(ctx, gh, rel.RepoURL, rel.Revision, rel.WorkloadPath, rel.ComponentPaths)
 }
 
@@ -2462,8 +2440,8 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 			continue
 		}
 		seen[key] = true
-		spec, ok := k.fluxKustomization(ctx, ns, kustom)
-		if !ok {
+		spec, _, err := k.fluxKustomization(ctx, ns, kustom)
+		if err != nil {
 			continue
 		}
 		var src string
@@ -2573,26 +2551,28 @@ type kustomizationSpec struct {
 	} `json:"dependsOn"`
 }
 
-// fluxKustomization reads one Flux Kustomization and reports it with a
-// success flag. Callers that only want the repo+path should go through
-// fluxPath, so a failed lookup is never re-issued as a second identical
-// kustomization GET.
-func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, bool) {
+// fluxKustomization reads one Flux Kustomization and returns its spec plus
+// the status revision it currently reconciles at. Callers that only want the
+// repo+path pair should go through fluxPath, so a failed lookup is never
+// re-issued as a second identical kustomization GET.
+func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, string, error) {
 	var kuz struct {
-		Spec kustomizationSpec `json:"spec"`
+		Spec   kustomizationSpec `json:"spec"`
+		Status struct {
+			LastAppliedRevision string `json:"lastAppliedRevision"`
+		} `json:"status"`
 	}
 	if err := k.get(ctx, "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil {
-		return kustomizationSpec{}, false
+		return kustomizationSpec{}, "", err
 	}
-	return kuz.Spec, true
+	return kuz.Spec, kuz.Status.LastAppliedRevision, nil
 }
 
-func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
-	kuz, ok := k.fluxKustomization(ctx, ns, name)
-	if !ok || kuz.Path == "" {
-		return "", "", false
-	}
-	srcKind := kuz.SourceRef.Kind
+// fluxSourceURL reads the source object a Kustomization's sourceRef names and
+// returns its spec.url. An empty kind defaults to GitRepository, matching the
+// sourceRef default Flux applies. The empty-URL case is left to callers: for
+// relevance it degrades to "not readable", for repo+path lookups to no path.
+func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
 	if srcKind == "" {
 		srcKind = "GitRepository"
 	}
@@ -2601,11 +2581,23 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 			URL string `json:"url"`
 		} `json:"spec"`
 	}
-	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.SourceRef.Name
-	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+	p := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + srcName
+	if err := k.get(ctx, p, &src); err != nil {
+		return "", err
+	}
+	return src.Spec.URL, nil
+}
+
+func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
+	kuz, _, err := k.fluxKustomization(ctx, ns, name)
+	if err != nil || kuz.Path == "" {
 		return "", "", false
 	}
-	return src.Spec.URL, kuz.Path, true
+	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	if err != nil || srcURL == "" {
+		return "", "", false
+	}
+	return srcURL, kuz.Path, true
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
