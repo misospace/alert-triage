@@ -1836,6 +1836,41 @@ func safeTail(tail string) string {
 	return "[REDACTED]" + tail[loc[0]:]
 }
 
+// gluedSchemeWordSuffix matches a run that ends on a scheme or header word,
+// the shape splitGluedSchemeWord cuts. The word list must stay in step with
+// tailEndsInSchemeWord, which reads the same words at a tail's end.
+var gluedSchemeWordSuffix = regexp.MustCompile(`(?i)(?:basic|authorization)$`)
+
+// splitGluedSchemeWord cuts a credential-alphabet run into a credential and
+// a scheme or header word glued to its end ("dXVpZDpwYXNzbasic",
+// "dXVpZDpwYXNz=basic"), returning the index where the word starts. The core
+// class of both Basic patterns stops at "." but not at "=", "_" or a letter,
+// so the word is swallowed into the core, the decode gate fails on the
+// combined run, and the credential survived next to the word (issue #227).
+// Callers redact everything before the index and keep the word: trailing
+// glue goes with the credential because it is its padding or the separator
+// the word hung on, and the word stays because "[REDACTED]" ends on a
+// non-letter, the boundary schemeWordLeftBoundary requires, so the next pass
+// still reads the word as the context of whatever follows it. Words are cut
+// from the right one at a time so a chain of glued words
+// ("cred basicbasic") cuts at the leftmost word behind which the remainder
+// still decodes. A run that is only scheme words never cuts: there is no
+// credential ahead of the word, and prose ("subbasic", the word chain's own
+// "basic") must survive the gate.
+func splitGluedSchemeWord(run string) (int, bool) {
+	end := len(run)
+	for {
+		loc := gluedSchemeWordSuffix.FindStringIndex(run[:end])
+		if loc == nil || loc[0] == 0 {
+			return 0, false
+		}
+		if decodesToBasicCredential(strings.TrimRight(run[:loc[0]], "=_-")) {
+			return loc[0], true
+		}
+		end = loc[0]
+	}
+}
+
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
 // right after the scheme, so whatever sits there goes even when it is too
@@ -1852,9 +1887,10 @@ func stripBasicAuth(s string) string {
 	// pass — with "[REDACTED]", whose brackets match neither pattern's
 	// classes and cannot join runs, so the amount of credential material
 	// strictly drops and no pass can splice new credential material together.
-	// Re-emitted tails carry no credential material either: safeTail redacts
-	// each tail's interior wholesale and only the trailing scheme word
-	// survives, so no pass can re-create work.
+	// Re-emitted tails and glued-word cuts carry no credential material
+	// either: safeTail redacts each tail's interior wholesale and only the
+	// trailing scheme word survives, and splitGluedSchemeWord re-emits just
+	// the scheme word it refused to redact, so no pass can re-create work.
 	for {
 		once := s
 		s = redactBasicHeader(s)
@@ -1901,6 +1937,18 @@ func redactBasicHeader(s string) string {
 		// that was kept.
 		if !decodesToBasicCredential(value) &&
 			(scheme == "" || !strings.ContainsAny(prefix, ":=")) {
+			if cut, ok := splitGluedSchemeWord(value); ok {
+				// The value is a credential with a scheme or header word
+				// glued to its end: the value class swallowed both, the
+				// gate failed on the combined run, and the credential
+				// survived (#227). Redact the credential part and resume
+				// at the glued word, which keeps the context of whatever
+				// follows it.
+				out.WriteString(s[pos : pos+loc[8]])
+				out.WriteString("[REDACTED]")
+				pos += loc[8] + cut
+				continue
+			}
 			// Not a credential. The value and the tail stay in play: a
 			// later header can hide in them.
 			out.WriteString(s[pos : pos+loc[8]])
@@ -1957,9 +2005,29 @@ func redactBasicScheme(s string) string {
 			if decodesToBasicCredential(run) {
 				return "[REDACTED]"
 			}
+			if cut, ok := splitGluedSchemeWord(run); ok {
+				// The run is a credential with a scheme word glued to
+				// its end: the gate fails on the combined run, so redact
+				// the credential part and re-emit the word, which the
+				// next pass reads as context (#227).
+				return "[REDACTED]" + run[cut:]
+			}
 			return run
 		})
 		if !decodesToBasicCredential(core) {
+			if cut, ok := splitGluedSchemeWord(core); ok {
+				// The core is a credential with a scheme word glued to
+				// its end — no separator for the word chain to catch, or
+				// digits in the credential keeping it out of the chain.
+				// Redact the credential part and resume the scan at the
+				// glued word, so a credential behind it is read while
+				// its context stands (#227).
+				out.WriteString(s[pos : pos+loc[4]])
+				out.WriteString(judged)
+				out.WriteString("[REDACTED]")
+				pos += loc[6] + cut
+				continue
+			}
 			// The scheme word alone does not say that what follows it is
 			// a credential; the decode test decides that. The core stays
 			// unread and in play: it can be the next credential's own
