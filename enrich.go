@@ -1803,11 +1803,11 @@ var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$
 func stripBasicAuth(s string) string {
 	// A consumed tail can stop exactly on the next credential's scheme word;
 	// ReplaceAll cannot rescan what it emitted, so run to a fixed point.
-	// It converges: a mutating pass replaces at least one gate-passing run —
-	// a core or a word-chain run — with "[REDACTED]", whose brackets match
-	// neither pattern's classes and block adjacency to letters, so the count
-	// of judgeable credential material strictly drops and no pass can splice
-	// new credential material together.
+	// It converges: every mutating pass replaces at least one credential-
+	// alphabet run — a core in either pass, a word-chain run in the scheme
+	// pass — with "[REDACTED]", whose brackets match neither pattern's
+	// classes and cannot join runs, so the amount of credential material
+	// strictly drops and no pass can splice new credential material together.
 	for {
 		once := s
 		s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
