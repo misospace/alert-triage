@@ -1308,42 +1308,20 @@ func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient,
 		rel.Reason = "no Kubernetes client available for this cluster"
 		return rel
 	}
-	var kuz struct {
-		Spec struct {
-			Path      string `json:"path"`
-			SourceRef struct {
-				Name string `json:"name"`
-				Kind string `json:"kind"`
-			} `json:"sourceRef"`
-			Components []string `json:"components"`
-		} `json:"spec"`
-		Status struct {
-			LastAppliedRevision string `json:"lastAppliedRevision"`
-		} `json:"status"`
-	}
-	p := "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + ns + "/kustomizations/" + name
-	if err := k.get(ctx, p, &kuz); err != nil {
+	kuz, revision, err := k.fluxKustomization(ctx, ns, name)
+	if err != nil {
 		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
 		return rel
 	}
-	srcKind := kuz.Spec.SourceRef.Kind
-	if srcKind == "" {
-		srcKind = "GitRepository"
-	}
-	var src struct {
-		Spec struct {
-			URL string `json:"url"`
-		} `json:"spec"`
-	}
-	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.Spec.SourceRef.Name
-	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	if err != nil || srcURL == "" {
 		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
 		return rel
 	}
-	rel.RepoURL = src.Spec.URL
-	rel.WorkloadPath = kuz.Spec.Path
-	rel.ComponentPaths = kuz.Spec.Components
-	rel.Revision = kuz.Status.LastAppliedRevision
+	rel.RepoURL = srcURL
+	rel.WorkloadPath = kuz.Path
+	rel.ComponentPaths = kuz.Components
+	rel.Revision = revision
 	return classifyCommit(ctx, gh, rel.RepoURL, rel.Revision, rel.WorkloadPath, rel.ComponentPaths)
 }
 
@@ -1792,6 +1770,35 @@ var basicAuthCredentialRun = regexp.MustCompile(`[A-Za-z0-9+/_-]+`)
 // Emitting the tail instead lets the fixed-point pass below redact it.
 var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$`)
 
+// safeTail returns a captured tail that is safe to re-emit (issue #217). A
+// tail that stops on a scheme word is emitted rather than consumed, because
+// consuming it strips the next credential's context and the credential
+// survives; the trailing scheme word therefore stays, since it is the
+// context the next credential needs.
+// Material ahead of that scheme word is redacted WHOLESALE, not selectively:
+// inside a tail a credential cannot be told apart from a file name, a version
+// string or a pod name, so picking out the segments that look like
+// credentials would leak the ones that do not. The cost is that this deletes
+// operator-visible evidence the previous code kept — a version string or a
+// pod name inside a tail is gone with the credential.
+// A tail that does not stop on a scheme word carries material too, so it is
+// redacted whole; the callers consume such a tail rather than emit it, which
+// makes that arm defensive.
+func safeTail(tail string) string {
+	loc := tailEndsInSchemeWord.FindStringIndex(tail)
+	if loc == nil {
+		return "[REDACTED]"
+	}
+	if loc[0] == 0 {
+		return tail
+	}
+	interior := tail[:loc[0]]
+	if interior[0] == '.' || interior[0] == '%' {
+		return interior[:1] + "[REDACTED]" + tail[loc[0]:]
+	}
+	return "[REDACTED]" + tail[loc[0]:]
+}
+
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
 // right after the scheme, so whatever sits there goes even when it is too
@@ -1808,6 +1815,9 @@ func stripBasicAuth(s string) string {
 	// pass — with "[REDACTED]", whose brackets match neither pattern's
 	// classes and cannot join runs, so the amount of credential material
 	// strictly drops and no pass can splice new credential material together.
+	// Re-emitted tails carry no credential material either: safeTail redacts
+	// each tail's interior wholesale and only the trailing scheme word
+	// survives, so no pass can re-create work.
 	for {
 		once := s
 		s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
@@ -1821,8 +1831,10 @@ func stripBasicAuth(s string) string {
 			}
 			// The danger check runs only once redaction fires: a value
 			// that is no credential must survive untouched, tail or not.
+			// The tail is emitted so the next credential keeps its scheme
+			// word, but only once the material it carries is redacted.
 			if sub[5] != "" && tailEndsInSchemeWord.MatchString(sub[5]) {
-				return prefix + "[REDACTED]" + sub[5]
+				return prefix + "[REDACTED]" + safeTail(sub[5])
 			}
 			return prefix + "[REDACTED]"
 		})
@@ -1846,7 +1858,7 @@ func stripBasicAuth(s string) string {
 				return prefix + seps + judged + core + tail
 			}
 			if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
-				return prefix + seps + judged + "[REDACTED]" + tail
+				return prefix + seps + judged + "[REDACTED]" + safeTail(tail)
 			}
 			// The scheme word stays visible: outside a header it is the only
 			// context that says a credential was here.
@@ -2499,8 +2511,8 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 			continue
 		}
 		seen[key] = true
-		spec, ok := k.fluxKustomization(ctx, ns, kustom)
-		if !ok {
+		spec, _, err := k.fluxKustomization(ctx, ns, kustom)
+		if err != nil {
 			continue
 		}
 		var src string
@@ -2610,26 +2622,28 @@ type kustomizationSpec struct {
 	} `json:"dependsOn"`
 }
 
-// fluxKustomization reads one Flux Kustomization and reports it with a
-// success flag. Callers that only want the repo+path should go through
-// fluxPath, so a failed lookup is never re-issued as a second identical
-// kustomization GET.
-func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, bool) {
+// fluxKustomization reads one Flux Kustomization and returns its spec plus
+// the status revision it currently reconciles at. Callers that only want the
+// repo+path pair should go through fluxPath, so a failed lookup is never
+// re-issued as a second identical kustomization GET.
+func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, string, error) {
 	var kuz struct {
-		Spec kustomizationSpec `json:"spec"`
+		Spec   kustomizationSpec `json:"spec"`
+		Status struct {
+			LastAppliedRevision string `json:"lastAppliedRevision"`
+		} `json:"status"`
 	}
 	if err := k.get(ctx, "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/"+ns+"/kustomizations/"+name, &kuz); err != nil {
-		return kustomizationSpec{}, false
+		return kustomizationSpec{}, "", err
 	}
-	return kuz.Spec, true
+	return kuz.Spec, kuz.Status.LastAppliedRevision, nil
 }
 
-func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
-	kuz, ok := k.fluxKustomization(ctx, ns, name)
-	if !ok || kuz.Path == "" {
-		return "", "", false
-	}
-	srcKind := kuz.SourceRef.Kind
+// fluxSourceURL reads the source object a Kustomization's sourceRef names and
+// returns its spec.url. An empty kind defaults to GitRepository, matching the
+// sourceRef default Flux applies. The empty-URL case is left to callers: for
+// relevance it degrades to "not readable", for repo+path lookups to no path.
+func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
 	if srcKind == "" {
 		srcKind = "GitRepository"
 	}
@@ -2638,11 +2652,23 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 			URL string `json:"url"`
 		} `json:"spec"`
 	}
-	srcPath := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + kuz.SourceRef.Name
-	if err := k.get(ctx, srcPath, &src); err != nil || src.Spec.URL == "" {
+	p := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + srcName
+	if err := k.get(ctx, p, &src); err != nil {
+		return "", err
+	}
+	return src.Spec.URL, nil
+}
+
+func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
+	kuz, _, err := k.fluxKustomization(ctx, ns, name)
+	if err != nil || kuz.Path == "" {
 		return "", "", false
 	}
-	return src.Spec.URL, kuz.Path, true
+	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	if err != nil || srcURL == "" {
+		return "", "", false
+	}
+	return srcURL, kuz.Path, true
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
