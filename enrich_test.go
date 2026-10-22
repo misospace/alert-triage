@@ -228,6 +228,38 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// is no credential survives, and the glued credential behind the
 		// scheme word is still redacted by the scheme pass.
 		{"authorization: Negotiate.basic dXVpZDpwYXNz", "authorization: Negotiate.basic [REDACTED]"},
+		// Percent-encoded glue hides the next credential's scheme word from
+		// the tail rule: the tail was consumed, so the scheme word went
+		// with it and the credential behind it kept its plaintext. The
+		// tail rule has to count the encoded glue, and the scheme word has
+		// to be recognised where a percent-encoded token ends in a hex
+		// digit, because no word boundary fires there.
+		{"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz", "basic [REDACTED]%3Dbasic [REDACTED]"},
+		{"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz", "basic [REDACTED]%3abasic [REDACTED]"},
+		// The header word in the tail names the scheme of the value that
+		// follows it, but the header pass could not read it back without a
+		// separator, so the credential behind it kept its plaintext.
+		{"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz", "basic [REDACTED]%3D.authorization [REDACTED]"},
+		// A scheme word glued to a percent-encoded token or to a digit is
+		// still a scheme word.
+		{"%3Dbasic%20dXNlcjpwYXNz", "%3Dbasic%20[REDACTED]"},
+		{"0basic%20dXNlcjpwYXNz", "0basic%20[REDACTED]"},
+		// A header that lost its separator still names the header, so the
+		// value behind it goes when it decodes to a credential.
+		{"authorization dXVpZDpwYXNz", "authorization [REDACTED]"},
+		// Prose around the header word survives: without a separator the
+		// header word says nothing about what follows it, so the value has
+		// to decode to a credential before the line is touched.
+		{"Authorization Basic scheme is deprecated", "Authorization Basic scheme is deprecated"},
+		{"authorization failed", "authorization failed"},
+		// A header word that is not a header must not swallow the header
+		// behind it: the value of the first one is no credential, so the
+		// pass has to keep reading to find the second header.
+		{"Authorization-foo.Authorization:dXNlcjpwYXNz", "Authorization-foo.Authorization:[REDACTED]"},
+		// A scheme word behind a swallowed one, and a scheme word that is
+		// not one because letters are glued to it.
+		{"0basic Basic%3DdXNlcjpwYXNz", "0basic Basic%3D[REDACTED]"},
+		{"basic dXNlcjpwYXNz.subbasic dXVpZDpwYXNz", "basic [REDACTED] dXVpZDpwYXNz"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -247,6 +279,20 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 		`{"authorization": "Basic ` + payload + `"}`,
 		"basic " + payload,
 		"authorization: " + payload,
+		// The scheme word glued to a percent-encoded token or to a digit:
+		// no word boundary fires there, so the credential behind it used
+		// to survive.
+		"%3Dbasic%20" + payload,
+		"0basic%20" + payload,
+		// A header that lost its separator, and a header word that is not
+		// a header standing in front of a real one.
+		"authorization dXNpZDpwYXNz",
+		"Authorization-foo.Authorization:" + payload,
+		// A scheme word glued to a digit or a percent-encoded token, with
+		// a second scheme word behind it: the first match swallows the
+		// second scheme word, and the credential behind it must still go.
+		"0basic Basic%3D" + payload,
+		"authorization " + payload + ".re-basic dXNpZDpwYXNz",
 	} {
 		if got := stripSecrets(in); strings.Contains(got, payload) {
 			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived", in, got)
@@ -278,8 +324,14 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 	}
 	// Two adjacent credentials separated by ".": the second one leaked when
 	// the tail swallowed its scheme word, so check both payloads per input.
+	// The same chain with the glue percent-encoded leaked the same way: the
+	// tail rule did not see the encoded separator, so the scheme word of
+	// the second credential was swallowed with the tail.
 	for _, in := range []string{
 		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
 	} {
 		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
 			if got := stripSecrets(in); strings.Contains(got, p) {
@@ -303,6 +355,14 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"Basic dXNlcjpwYXNz%3Dextra",
 		"basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
 		"authorization: Basic dXNlcjpwYXNz.basic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%20basic dXVpZDpwYXNz",
+		"%3Dbasic%20dXNlcjpwYXNz",
+		"0basic%20dXNlcjpwYXNz",
+		"authorization dXVpZDpwYXNz",
+		"Authorization-foo.Authorization:dXNlcjpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
@@ -2815,16 +2875,23 @@ func TestEnrichBackendLogsTargetPodIsPrimary(t *testing.T) {
 // subject, not a direct stripSecrets call — and into the digest evidence the
 // model is given. Each captured credential shape must arrive redacted, the
 // prose line must survive byte-identical, and no captured credential byte may
-// reach the evidence either way.
+// reach the evidence either way. The chain shapes from #221 come along
+// because a credential hidden behind another one used to survive the same
+// path.
 func TestEnrichBackendLogsCapturedBasicAuthShapes(t *testing.T) {
-	captured := []string{
+	shapes := []string{
 		"proxy-authorization: Basic%20Zm9vOmJhcg%3D%3D",
 		"authorization=Basic%20dXNlcjpwYXNz",
 		"basic%20Zm9vOmJhcg%3D%3D",
 		"basic auth failed for basic.io keep this sentence",
+		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
+		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
+		"%3Dbasic%20dXNlcjpwYXNz",
+		"0basic%20dXNlcjpwYXNz",
 	}
-	entries := make([]string, len(captured))
-	for i, line := range captured {
+	entries := make([]string, len(shapes))
+	for i, line := range shapes {
 		entries[i] = fmt.Sprintf(`{"stream":{"pod":"web-fallback-1","namespace":"default"},"values":[["1",%q]]}`, line)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2861,12 +2928,12 @@ func TestEnrichBackendLogsCapturedBasicAuthShapes(t *testing.T) {
 	if !en.BackendScoped {
 		t.Errorf("a resolved target pod must mark the backend query subject-scoped")
 	}
-	if len(en.BackendLogs) != len(captured) {
-		t.Fatalf("expected %d backend log lines, got %d: %v", len(captured), len(en.BackendLogs), en.BackendLogs)
+	if len(en.BackendLogs) != len(shapes) {
+		t.Fatalf("expected %d backend log lines, got %d: %v", len(shapes), len(en.BackendLogs), en.BackendLogs)
 	}
 	evidence := renderEvidence(Report{Cfg: &Config{}, Group: g, Enrichment: en})
 	const prose = "basic auth failed for basic.io keep this sentence"
-	leakTokens := []string{"Zm9vOmJhcg%3D%3D", "dXNlcjpwYXNz"}
+	leakTokens := []string{"Zm9vOmJhcg%3D%3D", "dXNlcjpwYXNz", "dXVpZDpwYXNz"}
 	for _, sink := range []struct {
 		where string
 		lines []string

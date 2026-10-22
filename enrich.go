@@ -1732,6 +1732,19 @@ func isHexRun(s string) bool {
 // It is spliced into patterns compiled with (?i), so both hex cases match.
 const pctEncodedSeparator = `(?:%20|%3a|%3d)+`
 
+// schemeWordLeftBoundary matches what may precede the Basic scheme word: the
+// start of the text, a non-letter, or a percent-encoded token. A word
+// boundary is the wrong rule there. A percent-encoded separator ends in a hex
+// digit ("%3Dbasic") and a digit can abut the scheme word ("0basic"), so \b
+// never fired on either shape and the credential behind the scheme word
+// survived. A letter still disqualifies the scheme word ("subbasic" is
+// prose), which is what the word boundary was there for.
+// The start-of-text alternative is what a scan that resumes mid-line sees:
+// the resume point follows a separator, so it is a valid left boundary even
+// when the character before it is a letter (the hex digit of a
+// percent-encoded separator).
+const schemeWordLeftBoundary = `(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})`
+
 // basicAuthHeaderPattern matches an Authorization-style header and the
 // credential it carries. The credential is base64("user-id:password")
 // (RFC 7617) and has no keyword[=:] shape, so no entry in secretPatterns can
@@ -1747,7 +1760,16 @@ const pctEncodedSeparator = `(?:%20|%3a|%3d)+`
 // characters that follow, but only when redaction fires and only up to a
 // token character, so a sentence-final "." after a credential survives. The
 // decode test sees the core only, because the tail is not base64.
-var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?)\s*((basic)(?:\s+|` + pctEncodedSeparator + `))?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+//
+// The separator between the header name and the value may be missing: a log
+// line that lost its colon still names the header, and the emitted tail of a
+// credential chain ("<cred>.authorization <cred>") is such a line. Without
+// it the chain's second credential kept its plaintext, because the tail
+// says which scheme the value belongs to but the header pass could not read
+// it back. The value still has to decode to a credential in that form, so
+// prose around the header word survives; a header that kept its separator
+// may also be redacted on the scheme word alone.
+var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?\s*(?:[:=]\s*)?\s*"?)\s*((basic)(?:\s+|` + pctEncodedSeparator + `))?([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // basicAuthSchemePattern finds a Basic-scheme credential that no header name
 // introduces. Words between the scheme and the credential ("basic auth:
@@ -1763,13 +1785,23 @@ var basicAuthHeaderPattern = regexp.MustCompile(`(?i)((?:proxy-)?authorization"?
 // those and left JWT segments and percent-encoded fragments next to
 // "[REDACTED]". The tail ends on a token character, so sentence punctuation
 // after a credential survives, and the decode test sees the core only.
-var basicAuthSchemePattern = regexp.MustCompile(`(?i)\bbasic\b(?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
+// The scheme word starts on the left boundary above, which admits the
+// percent-encoded and digit-glued shapes a word boundary rejected.
+var basicAuthSchemePattern = regexp.MustCompile(`(?i)` + schemeWordLeftBoundary + `basic\b(?:[\s:=]|` + pctEncodedSeparator + `)*(?:[A-Za-z][A-Za-z-]*[\s:=]+)*([A-Za-z0-9+/=_-]+)([.%][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/_-])?`)
 
 // tailEndsInSchemeWord reports a tail that stops on a scheme or header word
-// ("core.basic <cred>"): a ReplaceAll pass cannot rescan what it emitted, so
+// ("core.basic <cred>"): a pass cannot rescan what it emitted, so
 // consuming that tail strips the NEXT credential's context and it survives.
 // Emitting the tail instead lets the fixed-point pass below redact it.
-var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$`)
+// The glue counts in its percent-encoded form as well: a percent-encoded
+// separator ends in a hex digit ("core%3Dbasic"), which the literal glue
+// alone did not recognise, so the tail was consumed and the credential
+// behind it kept its plaintext. The scheme word has to start where the
+// scheme pass looks for one — after a non-letter, or after a
+// percent-encoded token — so a word glued to letters is not a scheme word
+// ("core.subbasic"). The match starts at the glue, which is the context the
+// next pass reads the credential with.
+var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:(?:%20|%3a|%3d)+[^A-Za-z]?|[^A-Za-z])(?:basic|authorization)$`)
 
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
@@ -1781,44 +1813,128 @@ var tailEndsInSchemeWord = regexp.MustCompile(`(?i)[=.%](?:basic|authorization)$
 // authentication failed" is not a credential and must stay readable.
 func stripBasicAuth(s string) string {
 	// A consumed tail can stop exactly on the next credential's scheme word;
-	// ReplaceAll cannot rescan what it emitted, so run to a fixed point.
+	// a pass cannot rescan what it emitted, so run to a fixed point.
 	// It converges: each pass replaces at least one credential core with
 	// "[REDACTED]", which matches neither pattern, and inserts no new
 	// credential material.
 	for {
 		once := s
-		s = basicAuthHeaderPattern.ReplaceAllStringFunc(s, func(m string) string {
-			sub := basicAuthHeaderPattern.FindStringSubmatch(m)
-			if len(sub) != 6 {
-				return m
-			}
-			prefix, scheme, value := sub[1], sub[3], sub[4]
-			if scheme == "" && !decodesToBasicCredential(value) {
-				return m
-			}
-			// The danger check runs only once redaction fires: a value
-			// that is no credential must survive untouched, tail or not.
-			if sub[5] != "" && tailEndsInSchemeWord.MatchString(sub[5]) {
-				return prefix + "[REDACTED]" + sub[5]
-			}
-			return prefix + "[REDACTED]"
-		})
-		s = basicAuthSchemePattern.ReplaceAllStringFunc(s, func(m string) string {
-			sub := basicAuthSchemePattern.FindStringSubmatch(m)
-			if len(sub) != 3 || !decodesToBasicCredential(sub[1]) {
-				return m
-			}
-			if sub[2] != "" && tailEndsInSchemeWord.MatchString(sub[2]) {
-				return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]" + sub[2]
-			}
-			// The scheme word stays visible: outside a header it is the only
-			// context that says a credential was here.
-			return strings.TrimSuffix(m, sub[1]+sub[2]) + "[REDACTED]"
-		})
+		s = redactBasicHeader(s)
+		s = redactBasicScheme(s)
 		if s == once {
 			return s
 		}
 	}
+}
+
+// schemeWordOfTail returns the part of a tail that names the scheme of the
+// credential behind it — the glue and the scheme word — and nothing else.
+// The rest of the tail is credential material: it was matched with the
+// credential core and goes with it. Only the scheme word has to survive,
+// because it is the context the next pass reads the next credential with,
+// and keeping the rest of the tail would keep JWT segments and
+// percent-encoded fragments of the credential that was just redacted.
+func schemeWordOfTail(tail string) string {
+	if i := tailEndsInSchemeWord.FindStringIndex(tail); i != nil {
+		return tail[i[0]:]
+	}
+	return ""
+}
+
+// redactBasicHeader redacts the credential an Authorization-style header
+// carries. The scan is by hand for the same reason as the scheme scan: a
+// match that fails the decode gate must not swallow the text behind it,
+// because that text can hold a header of its own with a credential in it
+// ("Authorization-foo.Authorization:<credential>"). The scan continues from
+// the value, so the later header is still read.
+func redactBasicHeader(s string) string {
+	var out strings.Builder
+	pos := 0
+	for pos < len(s) {
+		loc := basicAuthHeaderPattern.FindStringSubmatchIndex(s[pos:])
+		if loc == nil {
+			break
+		}
+		// Groups: 1 = the prefix, 2 = the scheme group, 3 = the scheme
+		// word, 4 = the value, 5 = the tail.
+		prefix := s[pos+loc[2] : pos+loc[3]]
+		scheme := ""
+		if loc[6] >= 0 {
+			scheme = s[pos+loc[6] : pos+loc[7]]
+		}
+		value := s[pos+loc[8] : pos+loc[9]]
+		tail := ""
+		if loc[10] >= 0 {
+			tail = s[pos+loc[10] : pos+loc[11]]
+		}
+		// A header that kept its separator says the value is a header
+		// value, so the scheme word may speak for it: a mangled credential
+		// still authenticates as much as a whole one. A header separated
+		// from its value by whitespace alone says less — "Authorization
+		// Basic scheme is deprecated" is prose — so that form has to earn
+		// the redaction on the value alone. The header name is a fixed
+		// literal, so a ":" or "=" in the prefix can only be the separator
+		// that was kept.
+		if !decodesToBasicCredential(value) &&
+			(scheme == "" || !strings.ContainsAny(prefix, ":=")) {
+			// Not a credential. The value and the tail stay in play: a
+			// later header can hide in them.
+			out.WriteString(s[pos : pos+loc[8]])
+			pos += loc[8]
+			continue
+		}
+		// The text before the match and the prefix itself stay: the
+		// header name is what tells the operator that a credential was
+		// stripped.
+		out.WriteString(s[pos : pos+loc[3]])
+		out.WriteString("[REDACTED]")
+		out.WriteString(schemeWordOfTail(tail))
+		pos += loc[1]
+	}
+	out.WriteString(s[pos:])
+	return out.String()
+}
+
+// redactBasicScheme redacts a Basic-scheme credential that no header name
+// introduces. The scan is by hand because a match that fails the decode gate
+// must not swallow the tail behind it: the tail can carry the next
+// credential's scheme word ("basic <not-a-credential>.basic <credential>"),
+// and a swallowed scheme word orphans that credential, because the
+// fixed-point pass cannot see it any more — the line looks unchanged, so
+// the loop stops. The tail is therefore kept in play when the core is no
+// credential, and the scan continues from it.
+func redactBasicScheme(s string) string {
+	var out strings.Builder
+	pos := 0
+	for pos < len(s) {
+		loc := basicAuthSchemePattern.FindStringSubmatchIndex(s[pos:])
+		if loc == nil {
+			break
+		}
+		core := s[pos+loc[2] : pos+loc[3]]
+		tail := ""
+		if loc[4] >= 0 {
+			tail = s[pos+loc[4] : pos+loc[5]]
+		}
+		if !decodesToBasicCredential(core) {
+			// The scheme word alone does not say that what follows it is
+			// a credential; the decode test decides that. Nothing is
+			// redacted here, and the core stays unread: it can be the
+			// next credential's own scheme word ("basic Basic%3D<cred>"),
+			// and a swallowed one orphans that credential.
+			out.WriteString(s[pos : pos+loc[2]])
+			pos += loc[2]
+			continue
+		}
+		// The scheme word stays visible: outside a header it is the only
+		// context that says a credential was here.
+		out.WriteString(s[pos : pos+loc[2]])
+		out.WriteString("[REDACTED]")
+		out.WriteString(schemeWordOfTail(tail))
+		pos += loc[1]
+	}
+	out.WriteString(s[pos:])
+	return out.String()
 }
 
 // decodesToBasicCredential reports whether cand is base64 of a
