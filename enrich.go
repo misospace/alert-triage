@@ -1960,6 +1960,30 @@ func redactBasicScheme(s string) string {
 			return run
 		})
 		if !decodesToBasicCredential(core) {
+			// A credential glued to a following token by "=" cannot decode
+			// as a whole, because an interior "=" is not valid base64, so
+			// the core was rejected and the credential kept its plaintext
+			// (issue #230). The scheme word says the slot right after it
+			// holds a credential, so the part before the join faces the
+			// gate on its own. The join stays readable, so the shape of
+			// the line survives, and a "key=value" whose key is no
+			// credential is left alone: the gate decides, not the "=".
+			if left, rest, ok := strings.Cut(core, "="); ok && decodesToBasicCredential(left) {
+				out.WriteString(s[pos : pos+loc[4]])
+				out.WriteString(judged)
+				out.WriteString("[REDACTED]=")
+				out.WriteString(rest)
+				// The tail carries credential material as readily as the
+				// core does, so it follows the same rule as a redacted
+				// core: a tail that stops on a scheme word is emitted
+				// once safeTail has redacted what it carries, and a tail
+				// that stops on no scheme word goes with the credential.
+				if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
+					out.WriteString(safeTail(tail))
+				}
+				pos += loc[1]
+				continue
+			}
 			// The scheme word alone does not say that what follows it is
 			// a credential; the decode test decides that. The core stays
 			// unread and in play: it can be the next credential's own
