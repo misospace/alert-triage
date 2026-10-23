@@ -452,6 +452,13 @@ func TestEscapeLabelValue(t *testing.T) {
 		{`multi"ple"quotes`, `multi\"ple\"quotes`},
 		{`foo\bar`, `foo\\bar`},
 		{`foo\\bar`, `foo\\\\bar`},
+		{"a\nb", `a\nb`},
+		{"a\rb", `a\rb`},
+		{"a\r\nb", `a\r\nb`},
+		// Issue #203: all four hazardous bytes in one value. The input is
+		// a, ", \, newline, CR, z; the want is the literal text
+		// a\"\\\n\rz with backslash-n and backslash-r as two characters each.
+		{"a\"\\\n\rz", `a\"\\\n\rz`},
 	}
 	for _, tt := range tests {
 		if got := escapeLabelValue(tt.in); got != tt.want {
