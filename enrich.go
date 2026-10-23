@@ -1883,6 +1883,68 @@ func cutGluedSchemeWord(run string) (word, rest string, ok bool) {
 	return "", "", false
 }
 
+// judgeTail redacts the credential material a captured tail carries
+// (#226). A match the decode test declines leaves its tail in play raw,
+// and no later pass can read a credential that sits before the scheme
+// word the pass looks for first, so the tail's material survived every
+// pass and reached the digest. Judging it on the way out replaces every
+// piece of credential alphabet that decodes to a user:password pair with
+// "[REDACTED]". Inside a tail a piece that decodes to a credential cannot
+// be told apart from a file name that decodes to one, so the piece goes
+// whole — the trade-off #217 accepted for the re-emission path, at piece
+// granularity. The glue between pieces (dots, equals signs, percent
+// tokens) and the pieces that decode to nothing survive: prose, file
+// names and the separator context later passes may still need stay readable, which is
+// why the pieces are judged instead of redacting the interior wholesale.
+// The pieces are split by hand, not with basicAuthCredentialRun, for the
+// same reason the scheme pass captures the encoded separators apart from
+// its word chain: a token's hex digits would glue onto the run behind a
+// percent-encoded separator ("%3DdXNlcjpwYXNz" reads as one run) and
+// break the candidate's decode, so material behind a percent-encoded
+// glue survived.
+func judgeTail(tail string) string {
+	var out strings.Builder
+	for i := 0; i < len(tail); {
+		if c := tail[i]; c == '.' || c == '%' || c == '=' {
+			// Glue: a dot and an equals sign separate tokens (the latter
+			// is a separator a key=value join placed before the piece
+			// behind it, not padding — the word chain stops at one for
+			// the same reason, issue #224), and a token's hex digits are
+			// what a percent-encoded separator looks like to the next
+			// pass ("%3D" names "="); all are copied verbatim and start
+			// no piece, so the pieces behind them keep their own decode.
+			if c == '%' && i+2 < len(tail) && isHexDigit(tail[i+1]) && isHexDigit(tail[i+2]) {
+				out.WriteString(tail[i : i+3])
+				i += 3
+				continue
+			}
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		end := i
+		for end < len(tail) {
+			if c := tail[end]; c == '.' || c == '%' || c == '=' {
+				break
+			}
+			end++
+		}
+		if decodesToBasicCredential(tail[i:end]) {
+			out.WriteString("[REDACTED]")
+		} else {
+			out.WriteString(tail[i:end])
+		}
+		i = end
+	}
+	return out.String()
+}
+
+// isHexDigit reports whether c is one of the hex digits a
+// percent-encoded token's second and third bytes are made of.
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'A' <= c && c <= 'F' || 'a' <= c && c <= 'f'
+}
+
 // stripBasicAuth redacts HTTP basic-auth credentials. A header that names
 // the Basic scheme is redacted on its context: RFC 7235 puts the credential
 // right after the scheme, so whatever sits there goes even when it is too
@@ -1904,7 +1966,8 @@ func stripBasicAuth(s string) string {
 	// plus a strict subset of the consumed run — a non-empty head that
 	// decoded is dropped and never restored — so the credential material
 	// outside the inert "[REDACTED]" tokens strictly drops on every mutating
-	// pass and the loop terminates.
+	// pass and the loop terminates. Declined-match tails are also judged by
+	// judgeTail before any credential-bearing pieces can be re-emitted.
 	for {
 		once := s
 		s = redactBasicHeader(s)
@@ -1951,8 +2014,25 @@ func redactBasicHeader(s string) string {
 		// that was kept.
 		if !decodesToBasicCredential(value) &&
 			(scheme == "" || !strings.ContainsAny(prefix, ":=")) {
-			// Not a credential. The value and the tail stay in play: a
-			// later header can hide in them.
+			// Not a credential: the value is prose, a file name or the
+			// value another scheme gave the header, and it stays
+			// readable. The tail, though, its character class swallows
+			// whole credential segments, and a declined match leaves its
+			// tail in play raw — no later pass can read a credential that
+			// sits before the scheme word it looks for first, so the tail
+			// is judged before it stays (#226). The match is then
+			// consumed, because the tail has been written already.
+			if tail != "" {
+				if judged := judgeTail(tail); judged != tail {
+					out.WriteString(s[pos : pos+loc[8]])
+					out.WriteString(value)
+					out.WriteString(judged)
+					pos += loc[1]
+					continue
+				}
+			}
+			// A tail with nothing to redact changes nothing, so the value
+			// and the tail stay in play: a later header can hide in them.
 			out.WriteString(s[pos : pos+loc[8]])
 			pos += loc[8]
 			continue
@@ -2048,6 +2128,20 @@ func redactBasicScheme(s string) string {
 				out.WriteString(judged)
 			} else {
 				out.WriteString(s[pos : pos+loc[6]])
+			}
+			// The tail a declined match leaves in play raw carries
+			// credentials no later pass can reach, so it is judged
+			// (#226) first; the core was written along the match and the
+			// match is consumed. A tail with nothing to redact keeps the
+			// core in play, as it can be the next credential's own scheme
+			// word (see above).
+			if tail != "" {
+				if judged := judgeTail(tail); judged != tail {
+					out.WriteString(core)
+					out.WriteString(judged)
+					pos += loc[1]
+					continue
+				}
 			}
 			pos += loc[6]
 			continue
