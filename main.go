@@ -307,6 +307,19 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bounds the whole request, body included: a client that sends
+		// valid headers then stalls or dribbles a 4 MiB payload is reaped
+		// instead of holding a goroutine indefinitely. 30s covers a slow
+		// link for that payload; nothing legitimate waits longer.
+		ReadTimeout: 30 * time.Second,
+		// Bounds the response cycle per request. Handlers only ack or
+		// encode in-memory state — /healthz is a two-byte fast path — so
+		// it stays reachable and triage (the slow part) never runs under
+		// this deadline; it happens after the response in the flush loop.
+		WriteTimeout: 30 * time.Second,
+		// Reaps idle keep-alive connections. Alertmanager reuses them, so
+		// 120s sits far above any normal reuse gap.
+		IdleTimeout: 120 * time.Second,
 	}
 
 	// Graceful shutdown: catch SIGTERM/SIGINT so buffered alerts are flushed
