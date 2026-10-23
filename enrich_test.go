@@ -332,6 +332,15 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// tail that stops on no scheme word goes with the credential.
 		{"basic Zm9vOmJhcg=request.basic dXVpZDpwYXNz", "basic [REDACTED]=request.basic [REDACTED]"},
 		{"basic Zm9vOmJhcg=request.dXNlcjpwYXNz", "basic [REDACTED]=request"},
+		// #238: credentials in both positions of key=value joins are redacted.
+		{"basic abc1=Zm9vOmJhcg", "basic abc1=[REDACTED]"},
+		{"basic key1=Zm9vOmJhcg", "basic key1=[REDACTED]"},
+		{"basic x9=Ym9vdGFpbjpzZWNyZXQ", "basic x9=[REDACTED]"},
+		{"basic Zm9vOmJhcg=Zm9vOmJhcg", "basic [REDACTED]=[REDACTED]"},
+		// Prose-only join segments survive.
+		{"basic id2=user123", "basic id2=user123"},
+		{"basic a1=b2", "basic a1=b2"},
+		{"basic abc1=deadbeef", "basic abc1=deadbeef"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -585,6 +594,11 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic key1=value",
 		"basic Zm9vOmJhcg=request.basic dXVpZDpwYXNz",
 		"basic Zm9vOmJhcg=request.dXNlcjpwYXNz",
+		"basic abc1=Zm9vOmJhcg",
+		"basic key1=Zm9vOmJhcg",
+		"basic x9=Ym9vdGFpbjpzZWNyZXQ",
+		"basic Zm9vOmJhcg=Zm9vOmJhcg",
+		"basic id2=user123",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
