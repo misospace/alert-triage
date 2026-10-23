@@ -613,6 +613,78 @@ func TestStripSecretsBasicAuthLayerInteraction(t *testing.T) {
 	}
 }
 
+// TestStripSecretsBasicAuthGluedWordInDecodedRun pins #242: a scheme word
+// glued to a credential with base64-alphabet glue sits inside the run that
+// passes the decode gate, so wholesale redaction swallows the word and
+// orphans the credential behind it, which then keeps its plaintext. The word
+// is cut out of that run and re-emitted with a real space, which is the
+// context the following credential is read with.
+func TestStripSecretsBasicAuthGluedWordInDecodedRun(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// The word is glued with "+": the whole run decodes to a credential,
+		// the gate passes, and the word inside it is cut out and re-emitted,
+		// so the second credential is read and redacted on the next pass.
+		{"basic dXVpZDpwYXNz+basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED]"},
+		// "_" glue: same shape, same cut.
+		{"basic dXVpZDpwYXNz_basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED]"},
+		// The header form consumes the value on the header's context, but the
+		// word glued inside it is still cut out for the credential behind it.
+		{"authorization: dXVpZDpwYXNzbasic/ dXNlcjpwYXNz", "authorization: [REDACTED] basic [REDACTED]"},
+		// Three credentials: the cut lands on the first, the second is
+		// redacted on the next pass, and its tail re-emits the third's scheme
+		// word as context, so the third is redacted too. The trailing
+		// ".basic" is that context, kept by safeTail; once the credential it
+		// names is already "[REDACTED]" it is inert, so it stays rather than
+		// being stripped a second time.
+		{"basic dXNlcjpwYXNz+basic dXVpZDpwYXNz.basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED].basic [REDACTED]"},
+		// "-" is a word-chain character, so the word lands in the tolerated
+		// word chain rather than the core. The word chain is judged per run
+		// and redacted whole, so the word does not re-emit here; every
+		// payload still goes, and the leading scheme word plus the safeTail
+		// context keep any following credential covered.
+		{"basic dXVpZDpwYXNz-basic dXNlcjE6cA=", "basic [REDACTED] [REDACTED]"},
+		// A digit glued after the word makes the remainder undecodable, so no
+		// cut: cutting would ship the credential behind it in plaintext. The
+		// run keeps its wholesale redaction, as before the cut arm.
+		{"basic dXVpZDpwYXNz+basic12dXNlcjpwYXNz", "basic [REDACTED]"},
+		// The mirror case: the remainder behind the word still decodes to a
+		// credential, so the cut is taken — the word is re-emitted and the
+		// remainder is redacted on the next pass.
+		{"basic dTpwbasic+dTpw", "basic [REDACTED] basic [REDACTED]"},
+		// Prose: nothing decodes to a user:password pair, so the line is
+		// byte-identical.
+		{"subbasic", "subbasic"},
+		{"basic authorization", "basic authorization"},
+		{"basic authentication failed", "basic authentication failed"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The cut re-emits a scheme word, so a second pass must leave the output
+	// unchanged: the digest is rendered from text already through the
+	// function once.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	// Whatever the context words do, no credential payload may reach the
+	// digest.
+	for _, tt := range tests {
+		got := stripSecrets(tt.in)
+		for _, p := range []string{"dXVpZDpwYXNz", "dXNlcjpwYXNz", "dXNlcjE6cA", "dTpw"} {
+			if strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", tt.in, got, p)
+			}
+		}
+	}
+}
+
 func TestFetchPodLogs_empty(t *testing.T) {
 	k := &kube{}
 	got, _ := k.fetchPodLogs(context.Background(), nil, DefaultPodLogConcurrency)
