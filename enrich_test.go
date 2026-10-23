@@ -472,6 +472,57 @@ func TestStripSecretsBasicAuthGluedByEqualsGone(t *testing.T) {
 	}
 }
 
+// TestStripSecretsBasicAuthVetoedTailJudged pins that a match the decode
+// test declines still loses the credentials its captured tail carries
+// (#226). The tail's character class swallows whole credential segments,
+// and no pass can rescan what it left in play — a credential sitting
+// before the scheme word a pass looks for first is never matched — so the
+// tail is judged on its way out. Glue and runs that decode to nothing
+// (prose, the scheme word) survive, so redaction stays confined to the
+// material; a tail that carries nothing to redact keeps its match
+// byte-identical.
+func TestStripSecretsBasicAuthVetoedTailJudged(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"authorization: Negotiate.dXNlcjpwYXNz.basic", "authorization: Negotiate.[REDACTED].basic"},
+		{"authorization: Negotiate.dXNlcjpwYXNz", "authorization: Negotiate.[REDACTED]"},
+		{"basic Basic.dXNlcjpwYXNz", "basic Basic.[REDACTED]"},
+		{"basic Basic.dXNlcjpwYXNz.basic", "basic Basic.[REDACTED].basic"},
+		// The glue a later pass may need survives the judgement, so a
+		// percent-encoded separator between the declined core and its
+		// credential keeps the match's own shape.
+		{"0basic Basic%3DdXNlcjpwYXNz", "0basic Basic%3D[REDACTED]"},
+		// A tail that carries no decoding piece is untouched: the declined
+		// value and the tail both stay readable.
+		{"authorization: Negotiate.slow-connection.timeout", "authorization: Negotiate.slow-connection.timeout"},
+		// A credential behind a percent-encoded glue inside the tail is one
+		// of the pieces: the glue's hex digits must not break a piece's
+		// decode (the scheme pass captures the encoded separators apart
+		// from its word chain for the same reason).
+		{"authorization: Negotiate.dXNlcjpwYXNz%3adXVpZDpwYXNz", "authorization: Negotiate.[REDACTED]%3a[REDACTED]"},
+		// Several credentials in one tail all go, and the padding of a
+		// credential that stops on "=" survives as residue.
+		{"authorization: Negotiate.dXNlcjpwYXNz.dXVpZDpwYXNz", "authorization: Negotiate.[REDACTED].[REDACTED]"},
+		{"authorization: Negotiate.dXNlcjpwYXNzd29yZA==.basic", "authorization: Negotiate.[REDACTED]==.basic"},
+		// A key=value join in the tail carries a credential behind the
+		// separator, not after the piece; the join survives, the credential
+		// does not.
+		{"authorization: Negotiate.key=dXNlcjpwYXNz", "authorization: Negotiate.key=[REDACTED]"},
+		// The next credential behind a judged tail keeps its context and is
+		// still redacted.
+		{"authorization: Negotiate.dXNlcjpwYXNz.basic dXVpZDpwYXNz", "authorization: Negotiate.[REDACTED].basic [REDACTED]"},
+		{"authorization: Negotiate.dXNlcjpwYXNz.authorization: dXNpZDpwYXNz", "authorization: Negotiate.[REDACTED].authorization: [REDACTED]"},
+		// The JSON-quoted shape, which is how the header reaches a log in
+		// practice.
+		{`{"authorization": "Negotiate.dXNlcjpwYXNz.basic"}`, `{"authorization": "Negotiate.[REDACTED].basic"}`},
+	}
+	for _, tt := range tests {
+		got := stripSecrets(tt.in)
+		if got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestStripSecretsBasicAuthTailInteriorGone pins that credential material
 // carried inside a captured tail is redacted before the tail is re-emitted
 // (#217). The tail's character class swallows whole credential segments and
@@ -599,6 +650,11 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic x9=Ym9vdGFpbjpzZWNyZXQ",
 		"basic Zm9vOmJhcg=Zm9vOmJhcg",
 		"basic id2=user123",
+		"authorization: Negotiate.dXNlcjpwYXNz.basic",
+		"authorization: Negotiate.dXNlcjpwYXNz",
+		"basic Basic.dXNlcjpwYXNz.basic",
+		"authorization: Negotiate.dXNlcjpwYXNz%3adXVpZDpwYXNz",
+		"authorization: Negotiate.key=dXNlcjpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
