@@ -29,16 +29,27 @@ func decodeQuantity(s string) (float64, bool) {
 		if err != nil {
 			return 0, false
 		}
-		return v * multiplier(m[2]), true
+		return scaleBytes(v, multiplier(m[2]))
 	}
 	if m := plainRe.FindStringSubmatch(s); m != nil {
 		v, err := strconv.ParseFloat(m[1], 64)
 		if err != nil {
 			return 0, false
 		}
-		return v, true
+		return scaleBytes(v, 1)
 	}
 	return 0, false
+}
+
+// scaleBytes applies a suffix multiplier and rejects a non-finite result: an
+// infinite byte count is not a usable memory limit, and a finite mantissa can
+// still overflow once the suffix is applied.
+func scaleBytes(v, m float64) (float64, bool) {
+	product := v * m
+	if math.IsInf(product, 0) || math.IsNaN(product) {
+		return 0, false
+	}
+	return product, true
 }
 
 // scaleWithinBounds returns the smallest standard memory bump that fits the

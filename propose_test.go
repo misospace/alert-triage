@@ -195,14 +195,102 @@ func TestDecodeQuantityRejects(t *testing.T) {
 			t.Errorf("decodeQuantity(%q) = %v, true; want rejected", in, got)
 		}
 	}
+	// A finite mantissa that only overflows once the suffix is applied must
+	// be rejected too: an infinite byte count is not a usable memory limit.
+	finiteMantissa := strings.Repeat("9", 291) + "Ei"
+	overflowing := []string{
+		strings.Repeat("9", 300) + "Ei",
+		strings.Repeat("9", 300) + "E",
+		finiteMantissa,
+	}
+	for _, in := range overflowing {
+		if got, ok := decodeQuantity(in); ok {
+			t.Errorf("decodeQuantity(%q) = %v, true; want rejected", in, got)
+		}
+	}
 }
 
-// The fall-through multiplier is unreachable through decodeQuantity as long as
-// decimalRe and this switch agree; pin it so a regex widening stays visible.
+// An unknown unit falls through to a multiplier of 1, i.e. raw bytes. The set
+// of suffixes the regex accepts is pinned by TestDecimalSuffixesMatchMultiplier.
 func TestMultiplierUnknownUnit(t *testing.T) {
 	if got := multiplier("Qi"); got != 1 {
 		t.Fatalf("multiplier(Qi) = %v; want 1", got)
 	}
+}
+
+// The suffixes decimalRe accepts must be exactly the ones the multiplier
+// switch knows: a suffix the regex admits but the switch does not would decode
+// a petabyte-scale limit as raw bytes (#204). The accepted set is derived from
+// the regex over a candidate list that includes multi-letter suffixes, so
+// widening or narrowing the regex fails this test.
+func TestDecimalSuffixesMatchMultiplier(t *testing.T) {
+	want := map[string]float64{
+		"K":  1000,
+		"Ki": 1024,
+		"M":  1000 * 1000,
+		"Mi": 1024 * 1024,
+		"G":  1000 * 1000 * 1000,
+		"Gi": 1024 * 1024 * 1024,
+		"T":  1000 * 1000 * 1000 * 1000,
+		"Ti": 1024 * 1024 * 1024 * 1024,
+		"P":  1000 * 1000 * 1000 * 1000 * 1000,
+		"Pi": 1024 * 1024 * 1024 * 1024 * 1024,
+		"E":  1000 * 1000 * 1000 * 1000 * 1000 * 1000,
+		"Ei": 1024 * 1024 * 1024 * 1024 * 1024 * 1024,
+	}
+	derived := map[string]bool{}
+	for _, suffix := range candidateSuffixes() {
+		if decimalRe.MatchString("1" + suffix) {
+			derived[suffix] = true
+		}
+	}
+	if len(derived) != len(want) {
+		t.Fatalf("decimalRe accepts %d suffixes %v; want %d", len(derived), derived, len(want))
+	}
+	for suffix, wantScale := range want {
+		if !derived[suffix] {
+			t.Errorf("decimalRe rejects %q; want it accepted", suffix)
+			continue
+		}
+		if got := multiplier(suffix); got != wantScale {
+			t.Errorf("multiplier(%q) = %v; want %v", suffix, got, wantScale)
+			continue
+		}
+		v, ok := decodeQuantity("1" + suffix)
+		if !ok || v != multiplier(suffix) {
+			t.Errorf("decodeQuantity(%q) = %v, %v; want %v, true", "1"+suffix, v, ok, multiplier(suffix))
+		}
+	}
+}
+
+// plainRe must stay suffix-free: a suffix it accepted would fall through the
+// multiplier switch and decode as raw bytes, the same mis-scale #204 is about.
+func TestPlainReAcceptsNoSuffix(t *testing.T) {
+	for _, suffix := range candidateSuffixes() {
+		if plainRe.MatchString("1" + suffix) {
+			t.Errorf("plainRe accepts %q; a suffix there decodes as raw bytes", suffix)
+		}
+	}
+}
+
+// candidateSuffixes lists the suffix strings worth probing against the
+// quantity regexes: every ASCII letter run of one or two characters, with and
+// without a trailing "i".
+func candidateSuffixes() []string {
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	var out []string
+	add := func(s string) {
+		out = append(out, s, s+"i")
+	}
+	for _, a := range letters {
+		add(string(a))
+	}
+	for _, a := range letters {
+		for _, b := range letters {
+			add(string(a) + string(b))
+		}
+	}
+	return out
 }
 
 func TestQuantityRoundTrip(t *testing.T) {
