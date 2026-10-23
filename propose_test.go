@@ -338,7 +338,10 @@ func TestEncodeQuantityRejectsNonFinite(t *testing.T) {
 }
 
 // End to end: a memory value that decodes finite but overflows when doubled
-// must kill the proposal, not render "+InfEi" as if it were a real bump.
+// must kill the proposal. scaleWithinBounds skips the overflowed candidate and
+// hands the current value back, so the must-be-larger guard drops the
+// proposal; encodeQuantity refusing a non-finite value is the last line of
+// defence behind it. No diff is emitted and no "+InfEi" reaches the manifest.
 func TestProposeRefusesOverflowingMemory(t *testing.T) {
 	manifest := strings.Replace(multiContainerManifest,
 		"memory: 64Mi", "memory: "+strings.Repeat("9", 290)+"Ei", 1)
@@ -351,14 +354,15 @@ func TestProposeRefusesOverflowingMemory(t *testing.T) {
 
 // A mantissa that parses finite but overflows once the suffix is applied is
 // rejected by the decoder (#204), so the proposal guards never see an infinite
-// byte count. A caller that handed one over anyway must still have it dropped
-// rather than compared past (NaN-safe: +Inf <= +Inf is true).
-func TestProposeRefusesMemoryOverflowingToInfinity(t *testing.T) {
+// byte count. scaleWithinBounds still returns an infinite current unchanged;
+// the proposal path stops earlier, at the decoder, but the passthrough is what
+// keeps the must-be-larger guard from comparing past such a value.
+func TestProposeRefusesMemoryThatOverflowsOnDecode(t *testing.T) {
 	if v, ok := decodeQuantity(strings.Repeat("9", 300) + "Ei"); ok {
 		t.Fatalf("expected the overflowing value to be rejected, got %v ok=%v", v, ok)
 	}
 	if got := scaleWithinBounds(math.Inf(1), maxMultiplier); !math.IsInf(got, 1) {
-		t.Fatalf("expected +Inf passed through unchanged for the not-greater guard, got %v", got)
+		t.Fatalf("expected +Inf passed through unchanged, got %v", got)
 	}
 	manifest := strings.Replace(multiContainerManifest,
 		"memory: 64Mi", "memory: "+strings.Repeat("9", 300)+"Ei", 1)
