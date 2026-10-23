@@ -310,15 +310,19 @@ func main() {
 		// Bounds the whole request, body included: a client that sends
 		// valid headers then stalls or dribbles a 4 MiB payload is reaped
 		// instead of holding a goroutine indefinitely. 30s covers a slow
-		// link for that payload; nothing legitimate waits longer.
+		// link for that payload; nothing legitimate waits longer. A body
+		// outliving the deadline is reaped mid-read, so the client sees a
+		// closed connection rather than a prepared error response — the
+		// goal (no goroutine squatting) still holds.
 		ReadTimeout: 30 * time.Second,
 		// Bounds the response cycle per request. Handlers only ack or
 		// encode in-memory state — /healthz is a two-byte fast path — so
 		// it stays reachable and triage (the slow part) never runs under
 		// this deadline; it happens after the response in the flush loop.
 		WriteTimeout: 30 * time.Second,
-		// Reaps idle keep-alive connections. Alertmanager reuses them, so
-		// 120s sits far above any normal reuse gap.
+		// Reaps idle keep-alive connections. A queue can pause longer
+		// than 120s, but clients just re-establish on the next burst, so
+		// the gap bounds memory, not delivery.
 		IdleTimeout: 120 * time.Second,
 	}
 
