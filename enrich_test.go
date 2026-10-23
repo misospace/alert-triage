@@ -304,9 +304,11 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz", "basic [REDACTED]basic [REDACTED]"},
 		{"basic dXVpZDpwYXNzbasic", "basic [REDACTED]basic"},
 		// A digit-bearing credential cannot enter the word chain, so the
-		// core swallows its "=" glue together with the glued word.
-		{"basic dXNlcjE6cA=basic", "basic [REDACTED]basic"},
-		{"basic dXNlcjE6cA=basic dXVpZDpwYXNz", "basic [REDACTED]basic [REDACTED]"},
+		// core swallows its "=" glue together with the glued word. The
+		// "="-join keeps its separator, so the output shows the join
+		// just as the letter form's chain does.
+		{"basic dXNlcjE6cA=basic", "basic [REDACTED]=basic"},
+		{"basic dXNlcjE6cA=basic dXVpZDpwYXNz", "basic [REDACTED]=basic [REDACTED]"},
 		// The header twin: the value class glued word and credential into
 		// one run, the gate failed, and the value survived unread.
 		{"authorization: dXVpZDpwYXNzbasic", "authorization: [REDACTED]basic"},
@@ -325,6 +327,34 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// survives after "[REDACTED]" rather than a swallowed join. The
 		// payload itself never does, and the residue decodes to nothing.
 		{"basic dXNlcjpwYXNz== and more", "basic [REDACTED]== and more"},
+		// A credential that carries digits cannot enter the word chain, and
+		// glued to a following token by "=" it cannot decode as a whole
+		// either, because an interior "=" is not valid base64 — so the core
+		// was rejected and the credential kept its plaintext (issue #230).
+		// The part before the join faces the gate on its own, and the join
+		// stays readable.
+		{"basic Zm9vOmJhcg=request", "basic [REDACTED]=request"},
+		{"basic Zm9vOmJhcg=trailing", "basic [REDACTED]=trailing"},
+		{"basic%20Zm9vOmJhcg=request", "basic%20[REDACTED]=request"},
+		{"basic auth Zm9vOmJhcg=request", "basic auth [REDACTED]=request"},
+		// The credential's own "=" padding and the join are two separators:
+		// both stay, because neither is credential material.
+		{"basic YWRtaW46YWRtaW4==trailing", "basic [REDACTED]==trailing"},
+		// A header names the scheme of its value, so the whole value goes.
+		{"authorization: Basic Zm9vOmJhcg=request", "authorization: [REDACTED]"},
+		// A "key=value" shape whose key is no credential is prose, and the
+		// join alone must not turn it into one. The key carries a digit
+		// here, so the word chain cannot swallow it and the join really
+		// reaches the gate.
+		{"basic auth=failed", "basic auth=failed"},
+		{"basic key=value", "basic key=value"},
+		{"basic key1=value", "basic key1=value"},
+		// A tail on a glued credential follows the rule of a tail on a
+		// redacted core: a tail that stops on a scheme word is emitted, so
+		// the credential behind it keeps its context and is redacted, and a
+		// tail that stops on no scheme word goes with the credential.
+		{"basic Zm9vOmJhcg=request.basic dXVpZDpwYXNz", "basic [REDACTED]=request.basic [REDACTED]"},
+		{"basic Zm9vOmJhcg=request.dXNlcjpwYXNz", "basic [REDACTED]=request"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -433,6 +463,40 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			if got := stripSecrets(in); strings.Contains(got, p) {
 				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
 			}
+		}
+	}
+	// A credential that carries digits cannot enter the word chain, so a
+	// digit-bearing payload glued to a following token by "=" reached the
+	// digest in plaintext (issue #230). The payload must go whatever the
+	// join is.
+	const digitPayload = "Zm9vOmJhcg"
+	for _, in := range []string{
+		"basic " + digitPayload + "=request",
+		"basic " + digitPayload + "=trailing",
+		"basic%20" + digitPayload + "=request",
+		"basic auth " + digitPayload + "=request",
+		"authorization: Basic " + digitPayload + "=request",
+	} {
+		if got := stripSecrets(in); strings.Contains(got, digitPayload) {
+			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived", in, got)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthGluedByEqualsGone pins that the credential in
+// the scheme word's slot is redacted whatever token follows the join, and
+// that the token itself survives: the join is what makes the core
+// undecodable, so the credential has to be judged on its own (issue #230).
+func TestStripSecretsBasicAuthGluedByEqualsGone(t *testing.T) {
+	const cred = "Zm9vOmJhcg"
+	for _, join := range []string{"request", "trailing", "more", "a=b", "x", "1234"} {
+		in := "basic " + cred + "=" + join
+		got := stripSecrets(in)
+		if strings.Contains(got, cred) {
+			t.Errorf("stripSecrets(%q) = %q; credential survived", in, got)
+		}
+		if !strings.Contains(got, join) {
+			t.Errorf("stripSecrets(%q) = %q; the joined token %q did not survive", in, got, join)
 		}
 	}
 }
@@ -550,6 +614,18 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz",
 		"basic dXNlcjE6cA=basic dXVpZDpwYXNz",
 		"authorization: dXVpZDpwYXNzbasic authorization dXVpZDpwYXNz",
+		// A credential glued to a following token by "=" (issue #230).
+		"basic Zm9vOmJhcg=request",
+		"basic Zm9vOmJhcg=trailing",
+		"basic%20Zm9vOmJhcg=request",
+		"basic auth Zm9vOmJhcg=request",
+		"basic YWRtaW46YWRtaW4==trailing",
+		"authorization: Basic Zm9vOmJhcg=request",
+		"basic auth=failed",
+		"basic key=value",
+		"basic key1=value",
+		"basic Zm9vOmJhcg=request.basic dXVpZDpwYXNz",
+		"basic Zm9vOmJhcg=request.dXNlcjpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
@@ -574,6 +650,78 @@ func TestStripSecretsBasicAuthLayerInteraction(t *testing.T) {
 	for _, tt := range tests {
 		if got := stripSecrets(tt.in); got != tt.want {
 			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthGluedWordInDecodedRun pins #242: a scheme word
+// glued to a credential with base64-alphabet glue sits inside the run that
+// passes the decode gate, so wholesale redaction swallows the word and
+// orphans the credential behind it, which then keeps its plaintext. The word
+// is cut out of that run and re-emitted with a real space, which is the
+// context the following credential is read with.
+func TestStripSecretsBasicAuthGluedWordInDecodedRun(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// The word is glued with "+": the whole run decodes to a credential,
+		// the gate passes, and the word inside it is cut out and re-emitted,
+		// so the second credential is read and redacted on the next pass.
+		{"basic dXVpZDpwYXNz+basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED]"},
+		// "_" glue: same shape, same cut.
+		{"basic dXVpZDpwYXNz_basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED]"},
+		// The header form consumes the value on the header's context, but the
+		// word glued inside it is still cut out for the credential behind it.
+		{"authorization: dXVpZDpwYXNzbasic/ dXNlcjpwYXNz", "authorization: [REDACTED] basic [REDACTED]"},
+		// Three credentials: the cut lands on the first, the second is
+		// redacted on the next pass, and its tail re-emits the third's scheme
+		// word as context, so the third is redacted too. The trailing
+		// ".basic" is that context, kept by safeTail; once the credential it
+		// names is already "[REDACTED]" it is inert, so it stays rather than
+		// being stripped a second time.
+		{"basic dXNlcjpwYXNz+basic dXVpZDpwYXNz.basic dXNlcjE6cA=", "basic [REDACTED] basic [REDACTED].basic [REDACTED]"},
+		// "-" is a word-chain character, so the word lands in the tolerated
+		// word chain rather than the core. The word chain is judged per run
+		// and redacted whole, so the word does not re-emit here; every
+		// payload still goes, and the leading scheme word plus the safeTail
+		// context keep any following credential covered.
+		{"basic dXVpZDpwYXNz-basic dXNlcjE6cA=", "basic [REDACTED] [REDACTED]"},
+		// A digit glued after the word makes the remainder undecodable, so no
+		// cut: cutting would ship the credential behind it in plaintext. The
+		// run keeps its wholesale redaction, as before the cut arm.
+		{"basic dXVpZDpwYXNz+basic12dXNlcjpwYXNz", "basic [REDACTED]"},
+		// The mirror case: the remainder behind the word still decodes to a
+		// credential, so the cut is taken — the word is re-emitted and the
+		// remainder is redacted on the next pass.
+		{"basic dTpwbasic+dTpw", "basic [REDACTED] basic [REDACTED]"},
+		// Prose: nothing decodes to a user:password pair, so the line is
+		// byte-identical.
+		{"subbasic", "subbasic"},
+		{"basic authorization", "basic authorization"},
+		{"basic authentication failed", "basic authentication failed"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The cut re-emits a scheme word, so a second pass must leave the output
+	// unchanged: the digest is rendered from text already through the
+	// function once.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	// Whatever the context words do, no credential payload may reach the
+	// digest.
+	for _, tt := range tests {
+		got := stripSecrets(tt.in)
+		for _, p := range []string{"dXVpZDpwYXNz", "dXNlcjpwYXNz", "dXNlcjE6cA", "dTpw"} {
+			if strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", tt.in, got, p)
+			}
 		}
 	}
 }
