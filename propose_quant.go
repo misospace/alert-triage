@@ -17,7 +17,8 @@ var (
 )
 
 // decodeQuantity parses a Kubernetes resource quantity string into a raw byte
-// count. Supported suffixes are the standard Ki/Mi/Gi/Ti/Pi/Ei set.
+// count. Supported suffixes are the standard binary Ki/Mi/Gi/Ti/Pi/Ei and
+// decimal SI K/M/G/T/P/E sets.
 func decodeQuantity(s string) (float64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -28,16 +29,27 @@ func decodeQuantity(s string) (float64, bool) {
 		if err != nil {
 			return 0, false
 		}
-		return v * multiplier(m[2]), true
+		return scaleBytes(v, multiplier(m[2]))
 	}
 	if m := plainRe.FindStringSubmatch(s); m != nil {
 		v, err := strconv.ParseFloat(m[1], 64)
 		if err != nil {
 			return 0, false
 		}
-		return v, true
+		return scaleBytes(v, 1)
 	}
 	return 0, false
+}
+
+// scaleBytes applies a suffix multiplier and rejects a non-finite result: an
+// infinite byte count is not a usable memory limit, and a finite mantissa can
+// still overflow once the suffix is applied.
+func scaleBytes(v, m float64) (float64, bool) {
+	product := v * m
+	if math.IsInf(product, 0) || math.IsNaN(product) {
+		return 0, false
+	}
+	return product, true
 }
 
 // scaleWithinBounds returns the smallest standard memory bump that fits the
@@ -83,7 +95,14 @@ func multiplier(unit string) float64 {
 		return 1000 * 1000 * 1000
 	case "T":
 		return 1000 * 1000 * 1000 * 1000
+	case "P":
+		return 1000 * 1000 * 1000 * 1000 * 1000
+	case "E":
+		return 1000 * 1000 * 1000 * 1000 * 1000 * 1000
 	}
+	// Anything reaching here falls through with a multiplier of 1. decimalRe
+	// must never accept a suffix this switch does not know: an unknown suffix
+	// would silently decode a petabyte-scale limit as raw bytes (#204).
 	return 1
 }
 
