@@ -17,7 +17,8 @@ var (
 )
 
 // decodeQuantity parses a Kubernetes resource quantity string into a raw byte
-// count. Supported suffixes are the standard Ki/Mi/Gi/Ti/Pi/Ei set.
+// count. Supported suffixes are the standard binary Ki/Mi/Gi/Ti/Pi/Ei and
+// decimal SI K/M/G/T/P/E sets.
 func decodeQuantity(s string) (float64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -77,7 +78,14 @@ func multiplier(unit string) float64 {
 		return 1000 * 1000 * 1000
 	case "T":
 		return 1000 * 1000 * 1000 * 1000
+	case "P":
+		return 1000 * 1000 * 1000 * 1000 * 1000
+	case "E":
+		return 1000 * 1000 * 1000 * 1000 * 1000 * 1000
 	}
+	// Anything reaching here falls through with a multiplier of 1. decimalRe
+	// must never accept a suffix this switch does not know: an unknown suffix
+	// would silently decode a petabyte-scale limit as raw bytes (#204).
 	return 1
 }
 

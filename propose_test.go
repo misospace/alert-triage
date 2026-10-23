@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const multiContainerManifest = `apiVersion: apps/v1
 kind: Deployment
@@ -147,6 +150,73 @@ func TestScaleWithinBounds(t *testing.T) {
 	// If the smallest candidate trips maxMultiplier, we fall back to current.
 	if got := scaleWithinBounds(64*1024*1024, 1.5); got != 64*1024*1024 {
 		t.Fatalf("expected fallback to current, got %v", got)
+	}
+}
+
+// Every suffix decimalRe advertises must decode to its Kubernetes-quantity
+// scale, decimal P and E included (#204: they used to fall through to 1).
+func TestDecodeQuantitySuffixes(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+	}{
+		{"1Ki", 1024},
+		{"1Mi", 1024 * 1024},
+		{"1Gi", 1024 * 1024 * 1024},
+		{"1Ti", 1024 * 1024 * 1024 * 1024},
+		{"1Pi", 1024 * 1024 * 1024 * 1024 * 1024},
+		{"1Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024},
+		{"1K", 1000},
+		{"1M", 1000 * 1000},
+		{"1G", 1000 * 1000 * 1000},
+		{"1T", 1000 * 1000 * 1000 * 1000},
+		{"1P", 1000 * 1000 * 1000 * 1000 * 1000},
+		{"1E", 1000 * 1000 * 1000 * 1000 * 1000 * 1000},
+		{"2P", 2 * 1000 * 1000 * 1000 * 1000 * 1000},
+		{"1.5Gi", 1.5 * 1024 * 1024 * 1024},
+		{" 64Mi ", 64 * 1024 * 1024},
+		{"1024", 1024},
+		{"0.5", 0.5},
+	}
+	for _, c := range cases {
+		got, ok := decodeQuantity(c.in)
+		if !ok || got != c.want {
+			t.Errorf("decodeQuantity(%q) = %v, %v; want %v, true", c.in, got, ok, c.want)
+		}
+	}
+}
+
+func TestDecodeQuantityRejects(t *testing.T) {
+	// A 400-digit run matches the regexes but overflows float64, so it must
+	// be rejected rather than decoded to +Inf.
+	huge := strings.Repeat("9", 400)
+	for _, in := range []string{"", "   ", "abc", "Mi", "1Qi", "1mi", "-1Mi", "1.2.3", "1e3", "64MiB", huge, huge + "Mi"} {
+		if got, ok := decodeQuantity(in); ok {
+			t.Errorf("decodeQuantity(%q) = %v, true; want rejected", in, got)
+		}
+	}
+}
+
+// The fall-through multiplier is unreachable through decodeQuantity as long as
+// decimalRe and this switch agree; pin it so a regex widening stays visible.
+func TestMultiplierUnknownUnit(t *testing.T) {
+	if got := multiplier("Qi"); got != 1 {
+		t.Fatalf("multiplier(Qi) = %v; want 1", got)
+	}
+}
+
+func TestQuantityRoundTrip(t *testing.T) {
+	for _, in := range []string{"128Mi", "2Gi", "512Mi"} {
+		v, ok := decodeQuantity(in)
+		if !ok {
+			t.Fatalf("decodeQuantity(%q) rejected", in)
+		}
+		if got := encodeQuantity(v); got != in {
+			t.Errorf("round trip of %q = %q", in, got)
+		}
+	}
+	if got := encodeQuantity(999); got != "999" {
+		t.Errorf("encodeQuantity(999) = %q; want 999", got)
 	}
 }
 
