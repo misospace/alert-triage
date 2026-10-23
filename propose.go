@@ -137,8 +137,13 @@ func buildMemoryPatch(relPath, original string) (string, bool) {
 		log.Printf("propose: dropped, proposed value not greater for %s", cleanPath)
 		return "", false
 	}
+	encoded, ok := encodeQuantity(proposed)
+	if !ok {
+		log.Printf("propose: dropped, proposed value not encodable for %s", cleanPath)
+		return "", false
+	}
 
-	target.child.Value = encodeQuantity(proposed)
+	target.child.Value = encoded
 
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
