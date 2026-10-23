@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -299,12 +300,71 @@ func TestQuantityRoundTrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("decodeQuantity(%q) rejected", in)
 		}
-		if got := encodeQuantity(v); got != in {
-			t.Errorf("round trip of %q = %q", in, got)
+		got, ok := encodeQuantity(v)
+		if !ok || got != in {
+			t.Errorf("round trip of %q = %q (ok=%v)", in, got, ok)
 		}
 	}
-	if got := encodeQuantity(999); got != "999" {
-		t.Errorf("encodeQuantity(999) = %q; want 999", got)
+	if got, ok := encodeQuantity(999); !ok || got != "999" {
+		t.Errorf("encodeQuantity(999) = %q (ok=%v); want 999", got, ok)
+	}
+}
+
+// A finite value near math.MaxFloat64 overflows on the first doubled
+// candidate; scaleWithinBounds must skip the overflowed candidates and return
+// current unchanged rather than hand back +Inf (#255).
+func TestScaleWithinBoundsSkipsOverflow(t *testing.T) {
+	nearMax, ok := decodeQuantity(strings.Repeat("9", 290) + "Ei")
+	if !ok || math.IsInf(nearMax, 0) || math.IsNaN(nearMax) {
+		t.Fatalf("fixture must decode to a finite value, got %v ok=%v", nearMax, ok)
+	}
+	if got := scaleWithinBounds(nearMax, maxMultiplier); got != nearMax {
+		t.Fatalf("expected current returned when every candidate overflows, got %v", got)
+	}
+	if got := scaleWithinBounds(nearMax, 1.5); math.IsInf(got, 0) || math.IsNaN(got) {
+		t.Fatalf("expected a finite result, got %v", got)
+	}
+}
+
+func TestEncodeQuantityRejectsNonFinite(t *testing.T) {
+	for _, v := range []float64{math.Inf(1), math.Inf(-1), math.NaN()} {
+		if got, ok := encodeQuantity(v); ok || got != "" {
+			t.Fatalf("expected no encoding for %v, got %q ok=%v", v, got, ok)
+		}
+	}
+	if got, ok := encodeQuantity(128 * 1024 * 1024); !ok || got != "128Mi" {
+		t.Fatalf("expected 128Mi, got %q ok=%v", got, ok)
+	}
+}
+
+// End to end: a memory value that decodes finite but overflows when doubled
+// must kill the proposal, not render "+InfEi" as if it were a real bump.
+func TestProposeRefusesOverflowingMemory(t *testing.T) {
+	manifest := strings.Replace(multiContainerManifest,
+		"memory: 64Mi", "memory: "+strings.Repeat("9", 290)+"Ei", 1)
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest)
+	if diff != "" {
+		t.Fatalf("expected no proposal when the bump overflows, got %q", diff)
+	}
+}
+
+// A mantissa that parses finite but overflows once the suffix is applied is
+// rejected by the decoder (#204), so the proposal guards never see an infinite
+// byte count. A caller that handed one over anyway must still have it dropped
+// rather than compared past (NaN-safe: +Inf <= +Inf is true).
+func TestProposeRefusesMemoryOverflowingToInfinity(t *testing.T) {
+	if v, ok := decodeQuantity(strings.Repeat("9", 300) + "Ei"); ok {
+		t.Fatalf("expected the overflowing value to be rejected, got %v ok=%v", v, ok)
+	}
+	if got := scaleWithinBounds(math.Inf(1), maxMultiplier); !math.IsInf(got, 1) {
+		t.Fatalf("expected +Inf passed through unchanged for the not-greater guard, got %v", got)
+	}
+	manifest := strings.Replace(multiContainerManifest,
+		"memory: 64Mi", "memory: "+strings.Repeat("9", 300)+"Ei", 1)
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	if diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest); diff != "" {
+		t.Fatalf("expected no proposal when the value overflows to infinity, got %q", diff)
 	}
 }
 
