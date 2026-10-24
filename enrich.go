@@ -1977,10 +1977,23 @@ func redactGluedWordSegments(run string) (string, bool) {
 // emitGluedWordSegment writes seg, judging it by the decode gate with the
 // glue on its edge trimmed off. A segment that decodes redacts its payload
 // and trailing glue and keeps the leading glue visible; anything else is
-// written verbatim. Reports whether the segment was redacted.
+// written verbatim — unless the trimmed segment still carries an "=" join
+// (issue #240, join review): "key=<credential>_<word>" reaches this arm
+// undecoded whole, so every join face of the trimmed segment is judged
+// like redactJoinSegments judges a core, with the segment's own glue
+// written outside the judged part. Reports whether the segment was
+// redacted.
 func emitGluedWordSegment(out *strings.Builder, seg string) bool {
 	trimmed := strings.Trim(seg, schemeGlue)
 	if trimmed == "" || !decodesToBasicCredential(trimmed) {
+		if trimmed != "" {
+			if joined, ok := redactJoinSegments(trimmed); ok {
+				lead := seg[:len(seg)-len(strings.TrimLeft(seg, schemeGlue))]
+				trail := seg[len(strings.TrimRight(seg, schemeGlue)):]
+				out.WriteString(lead + joined + trail)
+				return true
+			}
+		}
 		out.WriteString(seg)
 		return false
 	}

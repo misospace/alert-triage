@@ -352,6 +352,16 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// word split, with the glue left of the word going with the
 		// credential.
 		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz.more", "basic [REDACTED]basic-[REDACTED]"},
+		// A trailing-glued word behind an "=" join (issue #240, review):
+		// redactJoinSegments judged the segment "dXVpZDpwYXNzbasic" whole
+		// and re-emitted it verbatim, its payload surviving next to the
+		// word; the word-segment judgement below covers the segment.
+		{"basic key1=dXVpZDpwYXNzbasic", "basic key1=[REDACTED]basic"},
+		// The same residual nested in an "="-joined header value: the
+		// segment "key=dXVpZDpwYXNz_basicdXVpZDpwYXNz" fails the gate
+		// whole, so the join inside the segment judges both slots and the
+		// credential behind the trailing word goes (#240, review).
+		{"authorization: key=dXVpZDpwYXNz_basicdXVpZDpwYXNz", "authorization: key=[REDACTED]_basic[REDACTED]"},
 		// The leading separators are judged apart from the word chain, so a
 		// percent-encoded one cannot glue its digits onto the leftmost run,
 		// and the scheme word keeps its case in the output.
