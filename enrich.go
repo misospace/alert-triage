@@ -2302,13 +2302,40 @@ func redactJoinSegments(core string) (string, bool) {
 	redacted := false
 	for i, part := range parts {
 		if decodesToBasicCredential(part) {
-			parts[i] = "[REDACTED]"
+			// The part decodes, but a scheme word may be glued inside it
+			// and be the context a following credential is read with:
+			// cutting it the way the gate-passing value and core arms cut
+			// (#242) keeps that context, and redacting the part wholesale
+			// would orphan the credential behind the word.
+			if word, rest, ok := cutGluedSchemeWord(part); ok {
+				parts[i] = "[REDACTED] " + word
+				if rest != "" {
+					parts[i] += " " + rest
+				}
+			} else {
+				parts[i] = "[REDACTED]"
+			}
 			redacted = true
 			continue
 		}
 		if cut, ok := splitGluedSchemeWord(part); ok {
 			head := strings.TrimRight(part[:cut], "=_-")
 			parts[i] = "[REDACTED]" + part[len(head):]
+			redacted = true
+			continue
+		}
+		if word, rest, ok := cutGluedSchemeWord(part); ok {
+			// A word the "=_-" trim cannot reach — glue like "+" or "/"
+			// leads it, and the glue-only decode test in
+			// splitGluedSchemeWord refuses the head. The #242 cut drops
+			// the glue and re-emits the word with a real space, the
+			// context the credential behind it is read with on the next
+			// pass; redacting the part wholesale would swallow that word
+			// and orphan the credential.
+			parts[i] = "[REDACTED] " + word
+			if rest != "" {
+				parts[i] += " " + rest
+			}
 			redacted = true
 			continue
 		}

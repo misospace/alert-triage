@@ -554,6 +554,10 @@ func TestStripSecretsBasicAuthJoinSegmentCutsGone(t *testing.T) {
 		{"authorization: key=-dXVpZDpwYXNz", "authorization: key=-[REDACTED]"},
 		// Two joins: every credential-bearing segment is judged on its own.
 		{"authorization: a=dXNlcjpwYXNz=dXVpZDpwYXNz", "authorization: a=[REDACTED]=[REDACTED]"},
+		// A "+"-glued word inside a segment that decodes whole: the word is
+		// cut out with a real space (the #242 cut), so the credential behind
+		// it keeps its scheme-word context and is redacted on the next pass.
+		{"authorization: key=dXVpZDpwYXNz+basic dXNlcjpwYXNz", "authorization: key=[REDACTED] basic [REDACTED]"},
 		// Prose: a segment that decodes to nothing is untouched, and a
 		// value with no decodable segment is returned unchanged.
 		{"authorization: key=value", "authorization: key=value"},
