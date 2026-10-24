@@ -2464,7 +2464,9 @@ func redactBasicScheme(s string) string {
 // way an accepted run does, so the credential behind the word stays
 // reachable to a later pass (#246). A segment that fails the gate on its
 // own is not re-emitted verbatim either: it can still lose the glued
-// scheme word or the leading glue it carries (issue #259). It reports false
+// scheme word or the leading glue it carries (issue #259). A join that
+// produced a redaction anywhere also judges the gate-failing segments the
+// cuts left whole for a scheme word in their middle (#240). It reports false
 // when the core carries no "=" or when no segment produces a redaction, so
 // a plain prose "key=value" is returned
 // unchanged and the caller leaves it in play.
@@ -2473,22 +2475,10 @@ func redactJoinSegments(core string) (string, bool) {
 		return core, false
 	}
 	parts := strings.Split(core, "=")
+	// touched marks the parts the arms below already judged, so the second
+	// sweep re-judges only what they left whole.
+	touched := make([]bool, len(parts))
 	redacted := false
-	// A join whose every segment the gate declines reports no credential
-	// (the loop's own no-redaction semantics), so its segments stay whole
-	// for the caller's judgement — the header arm's word-split judgement
-	// needs exactly that to keep a join's key slot intact when no part
-	// decodes ("key=<cred><word>…", issue #240). A join with one decoding
-	// segment holds a credential somewhere, so a gate-declining part still
-	// faces the middle-word judgement, which is what releases
-	// "<cred>=<word>-<cred>" behind the word (#240).
-	anyDecodes := false
-	for _, part := range parts {
-		if decodesToBasicCredential(part) {
-			anyDecodes = true
-			break
-		}
-	}
 	for i, part := range parts {
 		if !decodesToBasicCredential(part) {
 			// A segment that fails the gate on its own is not re-emitted
@@ -2497,6 +2487,7 @@ func redactJoinSegments(core string) (string, bool) {
 			if cut, ok := splitGluedSchemeWord(part); ok {
 				head := strings.TrimRight(part[:cut], "=_-")
 				parts[i] = "[REDACTED]" + part[len(head):]
+				touched[i] = true
 				redacted = true
 				continue
 			}
@@ -2512,6 +2503,7 @@ func redactJoinSegments(core string) (string, bool) {
 				if rest != "" {
 					parts[i] += " " + rest
 				}
+				touched[i] = true
 				redacted = true
 				continue
 			}
@@ -2530,20 +2522,12 @@ func redactJoinSegments(core string) (string, bool) {
 				} else {
 					parts[i] = glue + "[REDACTED]"
 				}
+				touched[i] = true
 				redacted = true
 				continue
 			}
-			if anyDecodes {
-				if segOut, changed := redactGluedWordSegments(part); changed {
-					// A part that carries a scheme word faces the
-					// middle-word judgement (#240): a credential beside the
-					// word goes while the word and any gasping join face
-					// stay readable, which the part-fitting gate reading
-					// the whole part leaves in play.
-					parts[i] = segOut
-					redacted = true
-				}
-			}
+			// No cut fired: the part keeps its text for the second sweep
+			// below, or for the caller if the join never redacts.
 			continue
 		}
 		// The segment goes whole, but a scheme word glued inside it is
@@ -2560,7 +2544,35 @@ func redactJoinSegments(core string) (string, bool) {
 		} else {
 			parts[i] = "[REDACTED]"
 		}
+		touched[i] = true
 		redacted = true
+	}
+	// A join that redacted anywhere holds a credential, so the gate-declining
+	// parts the cuts left whole still face the middle-word judgement (#240):
+	// a credential beside the word goes while the word stays readable. The
+	// sweep runs after the cuts because a cut can expose the credential only
+	// in a later part ("+<cred>=<word>-<cred>", #240 review): the glue the
+	// cut trims keeps the whole-part decode test from seeing the credential,
+	// so judging during the first pass — keyed on whole-part decodes, as the
+	// pre-scan this sweep replaces was — skipped the word-split for the part
+	// behind the cut and shipped its payload. A join nothing above redacted
+	// reports no credential: its segments stay whole for the caller's
+	// judgement, which keeps a join's key slot intact when nothing in it
+	// decodes ("key=<cred><word>…", issue #240).
+	if redacted {
+		for i, part := range parts {
+			if touched[i] {
+				continue
+			}
+			if segOut, changed := redactGluedWordSegments(part); changed {
+				// A part that carries a scheme word faces the
+				// middle-word judgement (#240): a credential beside the
+				// word goes while the word and any gasping join face
+				// stay readable, which the part-fitting gate reading
+				// the whole part leaves in play.
+				parts[i] = segOut
+			}
+		}
 	}
 	if !redacted {
 		return core, false

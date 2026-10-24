@@ -678,6 +678,44 @@ func TestStripSecretsBasicAuthJoinSegmentCutsGone(t *testing.T) {
 	}
 }
 
+// TestStripSecretsBasicAuthJoinCutExposesMidWordGone pins that a #259 cut
+// on one join part puts the whole join's remaining gate-failing segments in
+// front of the mid-word judgement (#240 review): a cut can expose the
+// join's credential only in a later part — leading glue hides it from the
+// whole-part decode test — so judging the word-split during the first pass
+// skipped the segment behind the cut and shipped its payload.
+func TestStripSecretsBasicAuthJoinCutExposesMidWordGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// Leading glue hides the first segment's credential from the
+		// whole-part decode test: the glue-trim cut redacts it, and the
+		// segment behind the cut — the reason the join holds a credential
+		// at all — faces the mid-word judgement in the second sweep.
+		{"basic +dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "basic +[REDACTED]=basic-[REDACTED]"},
+		{"authorization: +dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "authorization: +[REDACTED]=basic-[REDACTED]"},
+		// The "/" glue the same way.
+		{"basic /dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "basic /[REDACTED]=basic-[REDACTED]"},
+		// The cut in the later part: the sweep still reaches the segment
+		// before it, so the judgement does not depend on part order.
+		{"authorization: basic-dXNlcjpwYXNz=+dXVpZDpwYXNz", "authorization: basic-[REDACTED]=+[REDACTED]"},
+		// A word whose residue decodes to nothing is prose: the sweep runs,
+		// the gate decides, nothing is redacted.
+		{"authorization: -dXVpZDpwYXNz=basic-words", "authorization: -[REDACTED]=basic-words"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The sweep re-emits glue and scheme words as context, so a second pass
+	// must leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+}
+
 // TestStripSecretsBasicAuthVetoedTailJudged pins that a match the decode
 // test declines still loses the credentials its captured tail carries
 // (#226). The tail's character class swallows whole credential segments,
