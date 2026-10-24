@@ -1970,9 +1970,10 @@ func redactGluedWordSegments(run string) (string, bool) {
 		// word decodes on its own ("…basic<cred>"): an undecodable
 		// residue would orphan the credential inside it — the never-
 		// decodable-again shape #217 guards the tail against — so the
-		// occurrence is skipped then and the run keeps its wholesale
-		// treatment; a decodable residue earns the split and the
-		// residue's redaction.
+		// occurrence is skipped then and no segment around it is judged;
+		// the run keeps whatever its caller does with undecodable runs.
+		// A decodable residue earns the split and the residue's
+		// redaction.
 		if l[1] < len(run) {
 			c := run[l[1]]
 			if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
