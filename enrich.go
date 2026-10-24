@@ -2340,7 +2340,20 @@ func redactJoinSegments(core string) (string, bool) {
 			continue
 		}
 		if trimmed := strings.TrimLeft(part, "+/=-_"); trimmed != "" && decodesToBasicCredential(trimmed) {
-			parts[i] = part[:len(part)-len(trimmed)] + "[REDACTED]"
+			// The glue ran before the gate, but the part behind it may
+			// still carry a glued scheme word a following credential is
+			// read with: cut the way the decodable arm cuts before
+			// redacting the trimmed part wholesale, or the word goes with
+			// the redaction and the credential behind it is orphaned.
+			glue := part[:len(part)-len(trimmed)]
+			if word, rest, ok := cutGluedSchemeWord(trimmed); ok {
+				parts[i] = glue + "[REDACTED] " + word
+				if rest != "" {
+					parts[i] += " " + rest
+				}
+			} else {
+				parts[i] = glue + "[REDACTED]"
+			}
 			redacted = true
 		}
 	}
