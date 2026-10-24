@@ -372,14 +372,22 @@ func contextMetricQueries(ns, pod string) []struct {
 	}
 }
 
-// escapeLabelValue escapes backslashes and double quotes in a label value
-// for safe embedding in PromQL string literals. The backslash pass runs first:
-// escaping quotes first would let its pass double the backslashes it inserted,
-// and an unescaped backslash is read by the backend as the start of an escape
-// sequence, breaking the query.
+// escapeLabelValue escapes backslashes, double quotes, newlines and carriage
+// returns in a label value for safe embedding in PromQL string literals.
+// The backslash pass runs first: escaping quotes first would let its pass
+// double the backslashes it inserted, and an unescaped backslash is read by
+// the backend as the start of an escape sequence, breaking the query. The
+// newline and carriage-return passes must also run after it, and PromQL
+// string literals cannot contain a raw line break at all, so a label value
+// carrying one (label values are arbitrary UTF-8; the alert source, not
+// Kubernetes name validation, decides what arrives) yields a selector the
+// parser rejects and the group loses all metric context (issue #203, same
+// failure mode as the backslash case in issue #161).
 func escapeLabelValue(v string) string {
 	v = strings.ReplaceAll(v, `\`, `\\`)
-	return strings.ReplaceAll(v, `"`, `\"`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	v = strings.ReplaceAll(v, "\n", `\n`)
+	return strings.ReplaceAll(v, "\r", `\r`)
 }
 
 // metricsBodyCap bounds how much of a Prometheus response we'll buffer before

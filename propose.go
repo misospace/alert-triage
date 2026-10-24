@@ -129,7 +129,10 @@ func buildMemoryPatch(relPath, original string) (string, bool) {
 
 	currentValue, ok := decodeQuantity(target.child.Value)
 	if !ok {
-		log.Printf("propose: dropped, unparsable memory value %q", target.child.Value)
+		// "Unusable" covers a value that does not parse and one whose
+		// suffix overflows float64 (#204): neither is a byte count the
+		// guardrails below can reason about.
+		log.Printf("propose: dropped, unusable memory value %q", target.child.Value)
 		return "", false
 	}
 	proposed := scaleWithinBounds(currentValue, maxMultiplier)
@@ -137,8 +140,13 @@ func buildMemoryPatch(relPath, original string) (string, bool) {
 		log.Printf("propose: dropped, proposed value not greater for %s", cleanPath)
 		return "", false
 	}
+	encoded, ok := encodeQuantity(proposed)
+	if !ok {
+		log.Printf("propose: dropped, proposed value not encodable for %s", cleanPath)
+		return "", false
+	}
 
-	target.child.Value = encodeQuantity(proposed)
+	target.child.Value = encoded
 
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
