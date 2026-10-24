@@ -304,7 +304,6 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"basic dXVpZDpwYXNzbasic dXVpZDpwYXNz", "basic [REDACTED]basic [REDACTED]"},
 		{"basic dXVpZDpwYXNzbasic", "basic [REDACTED]basic"},
 		// A digit-bearing credential cannot enter the word chain, so the
-		// A digit-bearing credential cannot enter the word chain, so the
 		// core swallows its "=" glue together with the glued word. The
 		// "="-join keeps its separator, so the output shows the join
 		// just as the letter form's chain does.
@@ -322,10 +321,10 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// were base64 alphabet chars, so the split's glue set "=_-" came
 		// up short and the part before the word failed the gate (issue
 		// #240). The glue set grew by "+/" and the split fires again. The
-		// credential and its glue go; the word and the following
-		// credential keep their context. The "="-join residue before the
-		// concrete word stays readable, as it does for the digit joins
-		// (#230, #238).
+		// credential goes; the word and the following credential keep
+		// their context. The "="-join residue before the word stays
+		// readable, exactly as the digit joins' separators do (#230,
+		// #238).
 		{"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=", "Basic: [REDACTED]==+authorization [REDACTED]"},
 		// A scheme word inside the run's middle is not at either end, so
 		// splitGluedSchemeWord's suffix walk never saw it: every credential
