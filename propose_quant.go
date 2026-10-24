@@ -17,7 +17,8 @@ var (
 )
 
 // decodeQuantity parses a Kubernetes resource quantity string into a raw byte
-// count. Supported suffixes are the standard Ki/Mi/Gi/Ti/Pi/Ei set.
+// count. Supported suffixes are the standard binary Ki/Mi/Gi/Ti/Pi/Ei and
+// decimal SI K/M/G/T/P/E sets.
 func decodeQuantity(s string) (float64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -28,26 +29,43 @@ func decodeQuantity(s string) (float64, bool) {
 		if err != nil {
 			return 0, false
 		}
-		return v * multiplier(m[2]), true
+		return scaleBytes(v, multiplier(m[2]))
 	}
 	if m := plainRe.FindStringSubmatch(s); m != nil {
 		v, err := strconv.ParseFloat(m[1], 64)
 		if err != nil {
 			return 0, false
 		}
-		return v, true
+		return scaleBytes(v, 1)
 	}
 	return 0, false
 }
 
+// scaleBytes applies a suffix multiplier and rejects a non-finite result: an
+// infinite byte count is not a usable memory limit, and a finite mantissa can
+// still overflow once the suffix is applied.
+func scaleBytes(v, m float64) (float64, bool) {
+	product := v * m
+	if math.IsInf(product, 0) || math.IsNaN(product) {
+		return 0, false
+	}
+	return product, true
+}
+
 // scaleWithinBounds returns the smallest standard memory bump that fits the
-// alert and stays below maxMultiplier of the current value.
+// alert and stays below maxMultiplier of the current value. A bump that
+// overflows a finite current reaches +Inf and is no proposal at all, so it is
+// skipped; when no candidate fits, current is returned unchanged and the
+// caller's must-be-larger guard drops the proposal.
 func scaleWithinBounds(current, max float64) float64 {
 	if current <= 0 || math.IsNaN(current) || math.IsInf(current, 0) {
 		return current
 	}
-	candidates := []float64{current * 2, current * 4, current * 8}
-	for _, c := range candidates {
+	for _, factor := range []float64{2, 4, 8} {
+		c := current * factor
+		if math.IsNaN(c) || math.IsInf(c, 0) {
+			continue
+		}
 		if c <= current*max {
 			return c
 		}
@@ -77,12 +95,25 @@ func multiplier(unit string) float64 {
 		return 1000 * 1000 * 1000
 	case "T":
 		return 1000 * 1000 * 1000 * 1000
+	case "P":
+		return 1000 * 1000 * 1000 * 1000 * 1000
+	case "E":
+		return 1000 * 1000 * 1000 * 1000 * 1000 * 1000
 	}
+	// Anything reaching here falls through with a multiplier of 1. decimalRe
+	// must never accept a suffix this switch does not know: an unknown suffix
+	// would silently decode a petabyte-scale limit as raw bytes (#204).
 	return 1
 }
 
 // encodeQuantity formats a byte count back into a Kubernetes memory string.
-func encodeQuantity(v float64) string {
+// A non-finite count has no valid quantity: reporting ok=false keeps callers
+// from writing an "+InfEi" literal into a diff, which the API server would
+// reject while the diff still reads as a plausible bump.
+func encodeQuantity(v float64) (string, bool) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "", false
+	}
 	steps := []struct {
 		unit string
 		size float64
@@ -96,8 +127,8 @@ func encodeQuantity(v float64) string {
 	}
 	for _, s := range steps {
 		if v >= s.size {
-			return fmt.Sprintf("%s%s", strconv.FormatFloat(v/s.size, 'f', -1, 64), s.unit)
+			return fmt.Sprintf("%s%s", strconv.FormatFloat(v/s.size, 'f', -1, 64), s.unit), true
 		}
 	}
-	return strconv.FormatFloat(v, 'f', -1, 64)
+	return strconv.FormatFloat(v, 'f', -1, 64), true
 }
