@@ -351,6 +351,11 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// word split, with the glue left of the word going with the
 		// credential.
 		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz.more", "basic [REDACTED]basic-[REDACTED]"},
+		// The "/" glue, whose shape is the same "+"-family one: the base64
+		// alphabet char nothing later can read goes with the redacted
+		// credential, the word and everything behind it stay.
+		{"basic Zm9vOmJhcg/basic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		{"basic dXVpZDpwYXNz/basic", "basic [REDACTED] basic"},
 		// A trailing-glued word behind an "=" join (issue #240, review):
 		// redactJoinSegments judged the segment "dXVpZDpwYXNzbasic" whole
 		// and re-emitted it verbatim, its payload surviving next to the
