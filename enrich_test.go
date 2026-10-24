@@ -317,6 +317,55 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		// of it survives the cut.
 		{"basic authorization", "basic authorization"},
 		{"authorization: Negotiate basic", "authorization: Negotiate basic"},
+		// A "+" glued to a scheme word: the following word's first letters
+		// were base64 alphabet chars, so the split's glue set "=_-" came
+		// up short and the part before the word failed the gate (issue
+		// #240). The glue set grew by "+/" and the split fires again. The
+		// credential goes; the word and the following credential keep
+		// their context. The "="-join residue before the word stays
+		// readable, exactly as the digit joins' separators do (#230,
+		// #238).
+		{"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=", "Basic: [REDACTED]==+authorization [REDACTED]"},
+		// A scheme word inside the run's middle is not at either end, so
+		// splitGluedSchemeWord's suffix walk never saw it: every credential
+		// around the word survived. The segments the word splits face the
+		// gate on their own, the words stay as context.
+		{"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz", "authorization: [REDACTED]authorization=[REDACTED]"},
+		{"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		// A word-shaped fragment ahead of the glued word is prose: no
+		// segment before the word decodes, so only the payload behind the
+		// two goes and the prose keeps its text.
+		{"basic sub-basic-dXNlcjpwYXNz", "basic sub-basic-[REDACTED]"},
+		// Prose whose fragments carry scheme words stays readable: no
+		// segment around any occurrence decodes.
+		{"basic subbasic", "basic subbasic"},
+		{"basic offbasic", "basic offbasic"},
+		// A credential joined by "=" to a token whose other side carries a
+		// mid-run scheme word: the join's left slot is redacted by the
+		// key-slot rule (#238) and the word-split judgement covers the
+		// credential behind the word (#240).
+		{"basic Zm9vOmJhcg=basic-dXNlcjpwYXNz", "basic [REDACTED]=basic-[REDACTED]"},
+		{"basic Zm9vOmJhcg=authorization-dXNlcjpwYXNz", "basic [REDACTED]=authorization-[REDACTED]"},
+		// A "+"/"/"-glued run the "=" join cannot cut on still sees its
+		// word split, with the glue left of the word going with the
+		// credential.
+		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz.more", "basic [REDACTED]basic-[REDACTED]"},
+		// The "/" glue, whose shape is the same "+"-family one: the base64
+		// alphabet char nothing later can read goes with the redacted
+		// credential, the word and everything behind it stay.
+		{"basic Zm9vOmJhcg/basic-dXNlcjpwYXNz", "basic [REDACTED]basic-[REDACTED]"},
+		{"basic dXVpZDpwYXNz/basic", "basic [REDACTED] basic"},
+		// A trailing-glued word behind an "=" join (issue #240, review):
+		// redactJoinSegments judged the segment "dXVpZDpwYXNzbasic" whole
+		// and re-emitted it verbatim, its payload surviving next to the
+		// word; the word-segment judgement below covers the segment.
+		{"basic key1=dXVpZDpwYXNzbasic", "basic key1=[REDACTED]basic"},
+		// The same residual nested in an "="-joined header value: the
+		// segment "key=dXVpZDpwYXNz_basicdXVpZDpwYXNz" fails the gate
+		// whole, so the join inside the segment judges both slots and the
+		// credential behind the trailing word goes (#240, review).
+		{"authorization: key=dXVpZDpwYXNz_basicdXVpZDpwYXNz", "authorization: key=[REDACTED]_basic[REDACTED]"},
 		// The leading separators are judged apart from the word chain, so a
 		// percent-encoded one cannot glue its digits onto the leftmost run,
 		// and the scheme word keeps its case in the output.
@@ -485,6 +534,22 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			}
 		}
 	}
+	// A "+" or "/" gluing one credential to a following scheme word, and a
+	// scheme word inside a run with credentials on either side, kept their
+	// plaintext on main (issue #240): no payload of any of the shapes may
+	// survive, glued or mid-run.
+	for _, in := range []string{
+		"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=",
+		"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz",
+		"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz",
+		"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz",
+	} {
+		for _, p := range []string{payload, "Zm9vOmJhcg", "dXVpZDpwYXNz", "dXNlcjpwYXNz", "dXNlcjE6cA"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 	// A gate-failing "=" segment was re-emitted verbatim, so a scheme word
 	// glued to its end or a glue run leading it kept the segment's payload
 	// (issue #259); the segment is judged on its own now, so every payload
@@ -609,6 +674,44 @@ func TestStripSecretsBasicAuthJoinSegmentCutsGone(t *testing.T) {
 			if strings.Contains(got, p) {
 				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
 			}
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthJoinCutExposesMidWordGone pins that a #259 cut
+// on one join part puts the whole join's remaining gate-failing segments in
+// front of the mid-word judgement (#240 review): a cut can expose the
+// join's credential only in a later part — leading glue hides it from the
+// whole-part decode test — so judging the word-split during the first pass
+// skipped the segment behind the cut and shipped its payload.
+func TestStripSecretsBasicAuthJoinCutExposesMidWordGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// Leading glue hides the first segment's credential from the
+		// whole-part decode test: the glue-trim cut redacts it, and the
+		// segment behind the cut — the reason the join holds a credential
+		// at all — faces the mid-word judgement in the second sweep.
+		{"basic +dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "basic +[REDACTED]=basic-[REDACTED]"},
+		{"authorization: +dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "authorization: +[REDACTED]=basic-[REDACTED]"},
+		// The "/" glue the same way.
+		{"basic /dXVpZDpwYXNz=basic-dXNlcjpwYXNz", "basic /[REDACTED]=basic-[REDACTED]"},
+		// The cut in the later part: the sweep still reaches the segment
+		// before it, so the judgement does not depend on part order.
+		{"authorization: basic-dXNlcjpwYXNz=+dXVpZDpwYXNz", "authorization: basic-[REDACTED]=+[REDACTED]"},
+		// A word whose residue decodes to nothing is prose: the sweep runs,
+		// the gate decides, nothing is redacted.
+		{"authorization: -dXVpZDpwYXNz=basic-words", "authorization: -[REDACTED]=basic-words"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The sweep re-emits glue and scheme words as context, so a second pass
+	// must leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
 		}
 	}
 }
@@ -866,6 +969,13 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic Basic.dXNlcjpwYXNz.basic",
 		"authorization: Negotiate.dXNlcjpwYXNz%3adXVpZDpwYXNz",
 		"authorization: Negotiate.key=dXNlcjpwYXNz",
+		// The "+/-glued" and mid-run shapes (issue #240).
+		"Basic: Zm9vOmJhcg==+authorization dXNlcjE6cA=",
+		"authorization: dXVpZDpwYXNzauthorization=dXVpZDpwYXNz",
+		"basic dXVpZDpwYXNzbasic-dXNlcjpwYXNz",
+		"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz",
+		"basic subbasic",
+		"basic sub-basic-dXNlcjpwYXNz",
 		// A credential folded into a declined header value by "=" (#246).
 		"authorization: Negotiate=dXNlcjpwYXNz",
 		"authorization: dXNlcjpwYXNz=key=dXVpZDpwYXNz",
