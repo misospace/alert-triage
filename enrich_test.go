@@ -474,6 +474,24 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			}
 		}
 	}
+	// A gate-failing "=" segment was re-emitted verbatim, so a scheme word
+	// glued to its end or a glue run leading it kept the segment's payload
+	// (issue #259); the segment is judged on its own now, so every payload
+	// goes while the word and the glue survive as context.
+	for _, in := range []string{
+		"authorization: dXNlcjpwYXNz=dXVpZDpwYXNzbasic",
+		"authorization: dXNlcjpwYXNz=-dXVpZDpwYXNz",
+		"authorization: key=dXVpZDpwYXNzbasic",
+		"authorization: key=-dXVpZDpwYXNz",
+		"basic dXNlcjE6cA=dXVpZDpwYXNzbasic",
+		"basic dXNlcjE6cA=-dXVpZDpwYXNz",
+	} {
+		for _, p := range []string{payload, "dXVpZDpwYXNz", "dXNlcjE6cA"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 	// A credential that carries digits cannot enter the word chain, so a
 	// digit-bearing payload glued to a following token by "=" reached the
 	// digest in plaintext (issue #230). The payload must go whatever the
@@ -506,6 +524,72 @@ func TestStripSecretsBasicAuthGluedByEqualsGone(t *testing.T) {
 		}
 		if !strings.Contains(got, join) {
 			t.Errorf("stripSecrets(%q) = %q; the joined token %q did not survive", in, got, join)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthJoinSegmentCutsGone pins the segment-level
+// residues of a declined "="-joined value (issue #259): a segment that
+// fails the decode gate on its own is not re-emitted verbatim. A scheme
+// word glued to a gate-failing segment is cut the way the #227 cuts cut
+// it, and a leading glue run the gate fails on is trimmed before the gate
+// is faced again, the glue staying where the line carried it. The payload
+// goes in the header arm and the scheme core alike, the key slot and the
+// word stay readable as context, prose survives, and the output is stable
+// under a second pass.
+func TestStripSecretsBasicAuthJoinSegmentCutsGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// A trailing scheme word glued to a gate-failing segment kept the
+		// segment's payload (issue #259, shape 1).
+		{"authorization: dXNlcjpwYXNz=dXVpZDpwYXNzbasic", "authorization: [REDACTED]=[REDACTED]basic"},
+		{"basic dXNlcjE6cA=dXVpZDpwYXNzbasic", "basic [REDACTED]=[REDACTED]basic"},
+		// A leading glue run the gate fails on kept the segment's payload
+		// (issue #259, shape 2): the glue is trimmed for the gate and stays
+		// in place.
+		{"authorization: dXNlcjpwYXNz=-dXVpZDpwYXNz", "authorization: [REDACTED]=-[REDACTED]"},
+		{"basic dXNlcjE6cA=-dXVpZDpwYXNz", "basic [REDACTED]=-[REDACTED]"},
+		// The same cuts with a non-credential key in the first slot: the
+		// key and the glue it carries stay readable, the payload does not.
+		{"authorization: key=dXVpZDpwYXNzbasic", "authorization: key=[REDACTED]basic"},
+		{"authorization: key=-dXVpZDpwYXNz", "authorization: key=-[REDACTED]"},
+		// Two joins: every credential-bearing segment is judged on its own.
+		{"authorization: a=dXNlcjpwYXNz=dXVpZDpwYXNz", "authorization: a=[REDACTED]=[REDACTED]"},
+		// Prose: a segment that decodes to nothing is untouched, and a
+		// value with no decodable segment is returned unchanged.
+		{"authorization: key=value", "authorization: key=value"},
+		{"authorization: key=-value", "authorization: key=-value"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The cuts re-emit glue and a scheme word as context, so a second pass
+	// must leave the output unchanged: the digest is rendered from text
+	// that has been through the function once.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	// Whatever the joins carry, no credential payload may reach the digest.
+	for _, in := range []string{
+		"authorization: dXNlcjpwYXNz=dXVpZDpwYXNzbasic",
+		"authorization: dXNlcjpwYXNz=-dXVpZDpwYXNz",
+		"basic dXNlcjE6cA=dXVpZDpwYXNzbasic",
+		"basic dXNlcjE6cA=-dXVpZDpwYXNz",
+		"authorization: key=dXVpZDpwYXNzbasic",
+		"authorization: key=-dXVpZDpwYXNz",
+		"authorization: key=dXNlcjpwYXNz=-dXVpZDpwYXNz",
+		"authorization: key=_dXVpZDpwYXNz",
+		`{"authorization": "dXNlcjpwYXNz=dXVpZDpwYXNzbasic"}`,
+	} {
+		got := stripSecrets(in)
+		for _, p := range []string{"dXVpZDpwYXNz", "dXNlcjpwYXNz", "dXNlcjE6cA"} {
+			if strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
 		}
 	}
 }
@@ -691,6 +775,13 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic x9=Ym9vdGFpbjpzZWNyZXQ",
 		"basic Zm9vOmJhcg=Zm9vOmJhcg",
 		"basic id2=user123",
+		// A gate-failing "=" segment with a glued scheme word or a leading
+		// glue run (issue #259): the segment cut re-emits the word, and the
+		// glue stays where the line carried it.
+		"authorization: dXNlcjpwYXNz=dXVpZDpwYXNzbasic",
+		"authorization: dXNlcjpwYXNz=-dXVpZDpwYXNz",
+		"basic dXNlcjE6cA=dXVpZDpwYXNzbasic",
+		"basic dXNlcjE6cA=-dXVpZDpwYXNz",
 		"authorization: Negotiate.dXNlcjpwYXNz.basic",
 		"authorization: Negotiate.dXNlcjpwYXNz",
 		"basic Basic.dXNlcjpwYXNz.basic",
