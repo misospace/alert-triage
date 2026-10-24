@@ -383,6 +383,9 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 		`{"authorization": "Basic ` + payload + `"}`,
 		"basic " + payload,
 		"authorization: " + payload,
+		// An "=" join inside a declined header value folds the
+		// credential into one undecodable value (#246).
+		"authorization: Negotiate=" + payload,
 		// The scheme word glued to a percent-encoded token or to a digit:
 		// no word boundary fires there, so the credential behind it used
 		// to survive.
@@ -436,6 +439,14 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3abasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
+		// Two credentials joined by "=" in one declined header value:
+		// every segment faces the gate, not just the one that first
+		// consumes the match (#246).
+		"authorization: dXNlcjpwYXNz=key=dXVpZDpwYXNz",
+		// A scheme word glued inside a join segment must survive as the
+		// trailing credential's context, not be swallowed with the
+		// segment (#246).
+		"authorization: key=dXVpZDpwYXNz_basic dXVpZDpwYXNz",
 	} {
 		for _, p := range []string{payload, "dXVpZDpwYXNz"} {
 			if got := stripSecrets(in); strings.Contains(got, p) {
@@ -552,6 +563,66 @@ func TestStripSecretsBasicAuthVetoedTailJudged(t *testing.T) {
 		// The JSON-quoted shape, which is how the header reaches a log in
 		// practice.
 		{`{"authorization": "Negotiate.dXNlcjpwYXNz.basic"}`, `{"authorization": "Negotiate.[REDACTED].basic"}`},
+	}
+	for _, tt := range tests {
+		got := stripSecrets(tt.in)
+		if got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthVetoedValueJoinJudged pins that a declined header
+// match still loses the credential its value carries behind an "=" join
+// (#246). The value's character class folds an equality-joined credential
+// into one undecodable value, and the tail group needs a "." or "%" opener,
+// so the folded credential is never a piece either gate reaches: each
+// segment of the value has to face the decode gate on its own, as the
+// scheme core's segments already do (#238). A value with no credential
+// stays byte-identical — prose, and key=value joins that hold none.
+func TestStripSecretsBasicAuthVetoedValueJoinJudged(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// The reproduction from the issue: a non-Basic scheme name
+		// joins the header value to a credential.
+		{"authorization: Negotiate=dXNlcjpwYXNz", "authorization: Negotiate=[REDACTED]"},
+		{"authorization: Negotiate=dXVpZDpwYXNz", "authorization: Negotiate=[REDACTED]"},
+		// Multi-"=" joins: one decoding segment is not enough to consume
+		// the match, every segment is judged.
+		{"authorization: dXNlcjpwYXNz=key=dXVpZDpwYXNz", "authorization: [REDACTED]=key=[REDACTED]"},
+		{"authorization: key=dXNlcjpwYXNz", "authorization: key=[REDACTED]"},
+		// The whitespace-separated header form declines the scheme word's
+		// warranty too, and judges the value's segments the same way.
+		{"authorization Basic key=dXNlcjpwYXNz", "authorization Basic key=[REDACTED]"},
+		// The credential's own "=" padding and the join are two
+		// separators; both survive as residue, the payload does not.
+		{"authorization: Negotiate=dXNlcjpwYXNzd29yZA==", "authorization: Negotiate=[REDACTED]=="},
+		// Text behind the value is outside the match and survives.
+		{"authorization: Negotiate=dXNlcjpwYXNz in request", "authorization: Negotiate=[REDACTED] in request"},
+		// A tail on a join-declined value is judged with the value in the
+		// same match.
+		{"authorization: Negotiate=dXNlcjpwYXNz.dXVpZDpwYXNz", "authorization: Negotiate=[REDACTED].[REDACTED]"},
+		// Only the value is consumed by the judgement, so a later header
+		// hiding in the tail is still read.
+		{"authorization: Negotiate=dXNlcjpwYXNz.authorization: dXVpZDpwYXNz", "authorization: Negotiate=[REDACTED].authorization: [REDACTED]"},
+		// The next credential behind a judged value keeps its context and
+		// is redacted by the scheme pass.
+		{"authorization: Negotiate=dXNlcjpwYXNz basic dXVpZDpwYXNz", "authorization: Negotiate=[REDACTED] basic [REDACTED]"},
+		// The JSON-quoted shape, which is how the header reaches a log in
+		// practice.
+		{`{"authorization": "Negotiate=dXNlcjpwYXNz"}`, `{"authorization": "Negotiate=[REDACTED]"}`},
+		// A gate-passing segment may carry a scheme word glued inside it
+		// ("_basic" is base64-url alphabet): the word is the next
+		// credential's context and is re-emitted, as it is behind an
+		// accepted run — swallowing it would orphan the trailing
+		// credential (#246). The join arm is shared with the scheme
+		// core, which gets the same judgement.
+		{"authorization: key=dXVpZDpwYXNz_basic dXVpZDpwYXNz", "authorization: key=[REDACTED] basic [REDACTED]"},
+		{"basic key12=dXVpZDpwYXNz_basic dXVpZDpwYXNz", "basic key12=[REDACTED] basic [REDACTED]"},
+		// A value with no credential is untouched: the join alone must
+		// not turn prose into one.
+		{"authorization: Negotiate=algorithm", "authorization: Negotiate=algorithm"},
+		{"authorization: key=value", "authorization: key=value"},
+		{"authorization: id2=user123", "authorization: id2=user123"},
 	}
 	for _, tt := range tests {
 		got := stripSecrets(tt.in)
@@ -696,6 +767,13 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"basic Basic.dXNlcjpwYXNz.basic",
 		"authorization: Negotiate.dXNlcjpwYXNz%3adXVpZDpwYXNz",
 		"authorization: Negotiate.key=dXNlcjpwYXNz",
+		// A credential folded into a declined header value by "=" (#246).
+		"authorization: Negotiate=dXNlcjpwYXNz",
+		"authorization: dXNlcjpwYXNz=key=dXVpZDpwYXNz",
+		"authorization: Negotiate=dXNlcjpwYXNz.dXVpZDpwYXNz",
+		"authorization: Negotiate=dXNlcjpwYXNzd29yZA==",
+		"authorization: key=dXVpZDpwYXNz_basic dXVpZDpwYXNz",
+		"basic key12=dXVpZDpwYXNz_basic dXVpZDpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
@@ -3288,6 +3366,7 @@ func TestEnrichBackendLogsCapturedBasicAuthShapes(t *testing.T) {
 		"proxy-authorization: Basic%20Zm9vOmJhcg%3D%3D",
 		"authorization=Basic%20dXNlcjpwYXNz",
 		"basic%20Zm9vOmJhcg%3D%3D",
+		"authorization: Negotiate=dXNlcjpwYXNz",
 		"basic auth failed for basic.io keep this sentence",
 		"basic dXNlcjpwYXNz%3Dbasic dXVpZDpwYXNz",
 		"basic dXNlcjpwYXNz%3D.authorization dXVpZDpwYXNz",
@@ -3360,6 +3439,7 @@ func TestEnrichBackendLogsCapturedBasicAuthShapes(t *testing.T) {
 		"proxy-authorization: [REDACTED]",
 		"authorization=[REDACTED]",
 		"basic%20[REDACTED]",
+		"authorization: Negotiate=[REDACTED]",
 	}
 	for _, want := range wantRedacted {
 		if !strings.Contains(strings.Join(en.BackendLogs, "\n"), want) {

@@ -2006,7 +2006,12 @@ func stripBasicAuth(s string) string {
 	// and never restored — so the credential material outside the inert
 	// "[REDACTED]" tokens strictly drops on every mutating pass and no pass
 	// can re-create work. Declined-match tails are also judged by
-	// judgeTail before any credential-bearing pieces can be re-emitted.
+	// judgeTail before any credential-bearing pieces can be re-emitted, and
+	// a declined join arm replaces a gate-passing segment with
+	// "[REDACTED]" plus only what cutGluedSchemeWord would re-emit — the
+	// split word and a strict subset of the segment — so neither arm can
+	// re-arrange credential material into a run the next pass would
+	// misjudge.
 	for {
 		once := s
 		s = redactBasicHeader(s)
@@ -2053,31 +2058,20 @@ func redactBasicHeader(s string) string {
 		// that was kept.
 		if !decodesToBasicCredential(value) &&
 			(scheme == "" || !strings.ContainsAny(prefix, ":=")) {
-			// The value can be a credential joined to the token after it
-			// by "=": an interior "=" is no valid base64, the gate failed
-			// on the joined run, and the credential kept its plaintext
-			// (issue #230). Without a scheme word in the match the
-			// scheme pass cannot read the same slot, so the part before
-			// the join faces the gate here; the join stays readable for
-			// the same reason the scheme pass keeps it. A match that
-			// carries the scheme word stays in play instead: the scheme
-			// pass sees the same slot and its passes keep the following
-			// credential's context alive.
+			// A value joined to another token by "=" folds the credential
+			// into one undecodable value: an interior "=" is no valid
+			// base64, the gate failed on the joined run, and the
+			// credential kept its plaintext (issues #230, #246). The
+			// join segments below face the gate one by one — the same
+			// mechanism the scheme core's joins use (#238) — so every
+			// credential in the join goes, not only the segment that
+			// first consumed the match. A single "=" with a decodable
+			// head is the two-segment case of that judge, so the scan
+			// does not cut the join by hand here: the hand cut consumed
+			// the whole match and left a third segment
+			// ("<credential>=key=<credential>") in plaintext behind the
+			// "[REDACTED]" the next pass can no longer reach.
 			if scheme == "" {
-				if left, rest, ok := strings.Cut(value, "="); ok && decodesToBasicCredential(left) {
-					out.WriteString(s[pos : pos+loc[8]])
-					out.WriteString("[REDACTED]=")
-					if decodesToBasicCredential(rest) {
-						out.WriteString("[REDACTED]")
-					} else {
-						out.WriteString(rest)
-					}
-					if tail != "" && tailEndsInSchemeWord.MatchString(tail) {
-						out.WriteString(safeTail(tail))
-					}
-					pos += loc[1]
-					continue
-				}
 				if cut, ok := splitGluedSchemeWord(value); ok {
 					// The value is a credential with a scheme or header
 					// word glued to its end: the value class swallowed
@@ -2104,14 +2098,32 @@ func redactBasicHeader(s string) string {
 			// sits before the scheme word it looks for first, so the tail
 			// is judged before it stays (#226). The match is then
 			// consumed, because the tail has been written already.
+			//
+			// The value's own class folds an "=" join into one
+			// undecodable value the same way, so a credential behind the
+			// separator is never a piece either gate reaches (#246); its
+			// segments face the gate here, as the scheme core's do (#238).
+			joined, joinRedacted := redactJoinSegments(value)
 			if tail != "" {
 				if judged := judgeTail(tail); judged != tail {
 					out.WriteString(s[pos : pos+loc[8]])
-					out.WriteString(value)
+					out.WriteString(joined)
 					out.WriteString(judged)
 					pos += loc[1]
 					continue
 				}
+			}
+			if joinRedacted {
+				// Consume only through the value: the tail has been
+				// judged to carry nothing, but a later header can hide
+				// in it, and the scan must still read it. The unjudged
+				// segments are re-emitted verbatim, so scheme words and
+				// separators the later passes need keep their shape, and
+				// the fixed-point loop re-runs on the changed text.
+				out.WriteString(s[pos : pos+loc[8]])
+				out.WriteString(joined)
+				pos += loc[9]
+				continue
 			}
 			// A tail with nothing to redact changes nothing, so the value
 			// and the tail stay in play: a later header can hide in them.
@@ -2278,15 +2290,19 @@ func redactBasicScheme(s string) string {
 	return out.String()
 }
 
-// redactJoinSegments judges the "=" -separated segments of a core that
-// already failed to decode as a whole, and reports that core with every
-// segment decoding to a basic-auth credential replaced by "[REDACTED]". An
+// redactJoinSegments judges the "=" -separated segments of a core — or of a
+// declined header value, whose class admits "=" (#246) — that already failed
+// to decode as a whole, and reports it with every segment decoding to a
+// basic-auth credential replaced by "[REDACTED]". An
 // interior "=" is not valid base64, so a credential joined to a key
 // ("key=<credential>") or two credentials joined together
 // ("<credential>=<credential>") cannot decode as a whole and the whole-core
 // gate rejects them, keeping their plaintext (issue #238). Each segment
 // faces the gate on its own, so the credential goes while a non-credential
-// key or value stays readable. It reports false when the core carries no
+// key or value stays readable. A gate-passing segment that carries a scheme
+// word glued inside it re-emits that word (and its decodable remainder) the
+// way an accepted run does, so the credential behind the word stays
+// reachable to a later pass. It reports false when the core carries no
 // "=" or when no segment decodes, so a plain prose "key=value" is returned
 // unchanged and the caller leaves it in play.
 func redactJoinSegments(core string) (string, bool) {
@@ -2296,10 +2312,24 @@ func redactJoinSegments(core string) (string, bool) {
 	parts := strings.Split(core, "=")
 	redacted := false
 	for i, part := range parts {
-		if decodesToBasicCredential(part) {
-			parts[i] = "[REDACTED]"
-			redacted = true
+		if !decodesToBasicCredential(part) {
+			continue
 		}
+		// The segment goes whole, but a scheme word glued inside it is
+		// re-emitted with a real space, exactly as an accepted run does:
+		// the alphabets admit "_" and friends, so "cred_basic" passes the
+		// gate, and the word inside it is the context the NEXT
+		// credential sits behind. Swallowing it would leave that
+		// credential unreachable to every later pass (#246).
+		if word, rest, ok := cutGluedSchemeWord(part); ok {
+			parts[i] = "[REDACTED] " + word
+			if rest != "" {
+				parts[i] += " " + rest
+			}
+		} else {
+			parts[i] = "[REDACTED]"
+		}
+		redacted = true
 	}
 	if !redacted {
 		return core, false
