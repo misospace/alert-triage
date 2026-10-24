@@ -2001,11 +2001,12 @@ func stripBasicAuth(s string) string {
 	// Re-emitted material is context, not credential: a safeTail re-emits a
 	// redacted substring of its tail, splitGluedSchemeWord re-emits only the
 	// glue and the trailing scheme word it refused to redact (also for the
-	// join-segment cuts redactJoinSegments takes), the leading glue a join
-	// segment sheds stays where the line carried it, and the
-	// cutGluedSchemeWord arm re-emits only the split word plus a strict
-	// subset of the consumed run — a non-empty head that decoded is dropped
-	// and never restored — so the credential material outside the inert
+	// join-segment cuts redactJoinSegments takes), the cutGluedSchemeWord
+	// arm — and the join-segment cuts that share it — re-emit only the split
+	// word plus a strict subset of the consumed run, a non-empty head that
+	// decoded is dropped and never restored, and the leading glue a join
+	// segment sheds stays where the line carried it — so the credential
+	// material outside the inert
 	// "[REDACTED]" tokens strictly drops on every mutating pass and no pass
 	// can re-create work. Declined-match tails are also judged by
 	// judgeTail before any credential-bearing pieces can be re-emitted.
