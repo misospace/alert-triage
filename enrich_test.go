@@ -584,6 +584,30 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			t.Errorf("stripSecrets(%q) = %q; basic-auth payload survived", in, got)
 		}
 	}
+	// Four payload families still reached the digest in plaintext (issue
+	// #260): a credential behind a join the gate cannot read whole, a
+	// credential behind a leading glue run, a credential in the value slot
+	// of a "key=value" header, and a credential in front of a scheme word
+	// the prose continues. None of them may survive, in any of the arms
+	// that carry them.
+	for _, in := range []string{
+		"basic dXNlcjpwYXNz=-dXNlcjE6cA",
+		"basic -dXNlcjpwYXNz",
+		"authorization: key=dXVpZDpwYXNz-",
+		"authorization: key=dXVpZDpwYXNzbasically",
+		"authorization: dXVpZDpwYXNzbasicdXVpZDpwYXNz",
+		// The scheme context: the scheme word's word chain swallows the
+		// credential and the separator behind it as one token.
+		"basic dXVpZDpwYXNz- in request",
+		"basic dXVpZDpwYXNzbasically in request",
+		"authorization: dXVpZDpwYXNzbasically.example.com",
+	} {
+		for _, p := range []string{"dXNlcjpwYXNz", "dXNlcjE6cA", "dXVpZDpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 }
 
 // TestStripSecretsBasicAuthGluedByEqualsGone pins that the credential in
@@ -707,6 +731,57 @@ func TestStripSecretsBasicAuthJoinCutExposesMidWordGone(t *testing.T) {
 		}
 	}
 	// The sweep re-emits glue and scheme words as context, so a second pass
+	// must leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthResidualFamiliesGone pins the four payload
+// families that still reached the digest in plaintext (issue #260): a
+// credential behind a join the gate cannot read whole, a credential behind a
+// leading glue run, a credential in the value slot of a "key=value" header,
+// and a credential in front of a scheme word the prose continues. The
+// payload goes in every one of them, the join and the glue stay readable,
+// and the output is stable under a second pass.
+func TestStripSecretsBasicAuthResidualFamiliesGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// A credential in the slot behind a join, with a glue run the gate
+		// fails on: the payload goes, the join and the glue stay.
+		{"basic dXNlcjpwYXNz=-dXNlcjE6cA", "basic [REDACTED]=-[REDACTED]"},
+		// A credential behind a leading glue run: the glue stays where the
+		// line carried it, the payload goes.
+		{"basic -dXNlcjpwYXNz", "basic -[REDACTED]"},
+		// A credential in the value slot of a "key=value" header, with the
+		// glue behind it: the payload and the trailing glue go, the key and
+		// the join stay.
+		{"authorization: key=dXVpZDpwYXNz-", "authorization: key=[REDACTED]"},
+		// A credential in front of a scheme word the prose continues: the
+		// word is prose, not a scheme word, so the payload goes and the word
+		// stays readable.
+		{"authorization: key=dXVpZDpwYXNzbasically", "authorization: key=[REDACTED]basically"},
+		// A scheme word glued between two credentials is a scheme word: both
+		// payloads go and the word stays as the context they were read with.
+		{"authorization: dXVpZDpwYXNzbasicdXVpZDpwYXNz", "authorization: [REDACTED]basic[REDACTED]"},
+		// The same families in the scheme context: the scheme word's word
+		// chain swallows the credential and the separator behind it as one
+		// token, so the shared judge has to reach that arm too.
+		{"basic dXVpZDpwYXNz- in request", "basic [REDACTED] in request"},
+		{"basic dXVpZDpwYXNzbasically in request", "basic [REDACTED]basically in request"},
+		// The tail follows the prose the payload sits in front of, not the
+		// payload, so it stays visible: the operator still sees the host the
+		// line named.
+		{"authorization: dXVpZDpwYXNzbasically.example.com", "authorization: [REDACTED]basically.example.com"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The judgements re-emit glue and words as context, so a second pass
 	// must leave the output unchanged.
 	for _, tt := range tests {
 		once := stripSecrets(tt.in)
