@@ -1815,6 +1815,20 @@ var tailEndsInSchemeWord = regexp.MustCompile(`(?i)(?:(?:%[0-9A-Fa-f]{2})+[^A-Za
 // context the credential behind it needs, so it is cut out and re-emitted.
 var embeddedSchemeWord = regexp.MustCompile(`(?i)basic|authorization`)
 
+// credentialAlphabets are the two base64 alphabets a client may have used
+// to encode a credential. The char strings drive the clean-head scan in
+// credentialRunBoundary; the decoders are the raw (unpadded) forms, whose
+// byte stream a padded decode shares — padding only terminates the input,
+// it changes no byte. The boundary takes the longest prefix over both, so
+// their order here carries no weight.
+var credentialAlphabets = []struct {
+	chars  string
+	decode *base64.Encoding
+}{
+	{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", base64.RawStdEncoding},
+	{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", base64.RawURLEncoding},
+}
+
 // safeTail returns a captured tail that is safe to re-emit (issue #217). A
 // tail that stops on a scheme word is emitted rather than consumed, because
 // consuming it strips the next credential's context and the credential
@@ -2055,7 +2069,10 @@ func emitGluedWordSegment(out *strings.Builder, seg string) bool {
 // with the redaction (#242). A credential that sits in front of a word the
 // prose continues is the other way round — there the word is prose, not a
 // scheme word, and the credential in front of it is unreachable to every
-// later pass — so the head is redacted and the word stays readable.
+// later pass — so the head is redacted and the word stays readable. A
+// payload head in front of a residue that carries no scheme word at all is
+// the same shape without the word (#263): the longest prefix that decodes
+// is redacted and what decodes to nothing behind it stays readable.
 //
 // The segment that carries an "=" is refused: a join is the join judge's
 // business, and a segment that holds one is two segments of it.
@@ -2089,7 +2106,210 @@ func judgeSingleSegment(seg string) (string, bool) {
 	if out, ok := cutCredentialBeforeProse(seg); ok {
 		return lead + out, true
 	}
+	if out, ok := cutCredentialBeforeResidue(trimmed); ok {
+		return lead + out, true
+	}
 	return seg, false
+}
+
+// cutCredentialBeforeResidue redacts the credential a segment's payload
+// starts with when everything behind it decodes to nothing (#263). It is
+// cutCredentialBeforeProse's cut for a residue that carries no scheme word:
+// the payload head decodes, the residue behind it does not, so no earlier
+// arm in this judge fires — and no later pass can reach the payload either,
+// because every pass reads a credential only behind a scheme word or header
+// it looks for first — and the payload shipped whole.
+//
+// The cut is refused when the residue still carries a live mid-word shape —
+// a scheme word the prose continues with credential material decoding
+// behind it (#240). The mid-word judgement splits at the word and redacts
+// both sides; the greedy cut below would swallow the word and strand the
+// credential behind it inside the residue, where "[REDACTED]"'s brackets
+// block every later pass from reading it back. Callers that reach this
+// judge have already had that judgement decline on the same text, so the
+// refusal only bites where the judge runs without it — a join segment the
+// join judge faces on its own — and leaves the shape to the mid-word
+// judgement the join's caller or second sweep runs instead.
+//
+// The cut boundary is the longest prefix that decodes: a shorter one would
+// leave decodable alphabet behind the cut that no later pass can read. An
+// extension of the payload by further letters often decodes too — a
+// password byte may be anything above the control range, so the tail of
+// "dXNlcjpwYXNzprose" reads as two more password bytes — and the cut cannot
+// tell such an extension apart from a longer credential, so it takes the
+// longest: the word right behind the payload can lose its head letters, or
+// at the limit be swallowed through whole. That is the same
+// cannot-tell-apart trade-off #217 accepted at piece granularity, paid here
+// in the prose that sits directly behind a live payload; prose with no
+// decodable head in front of it is untouched.
+//
+// The residue behind the boundary is judged, not trusted to be prose: a
+// residue that is a credential of its own is swallowed whole — re-emitting
+// it would strand it behind "[REDACTED]"'s brackets, where no later pass
+// can read it back (#240's premise keeps such a remainder for the
+// whole-value arms, but here the whole run already declined, so nobody
+// else will come for it) — and a residue that carries separator-split
+// credential pieces loses the pieces that decode while its prose pieces
+// stay readable, the granularity judgeTail already answers for. The glue
+// beyond the trimmed candidate is already off it and goes with the
+// redaction, as it does for a wholesale one.
+//
+// The boundary costs one decode per client alphabet however long the run
+// is: a base64 prefix decodes to the matching prefix of the whole byte
+// stream, so one decode of each alphabet's clean head answers every prefix
+// length (credentialRunBoundary).
+func cutCredentialBeforeResidue(trimmed string) (string, bool) {
+	for _, m := range embeddedSchemeWord.FindAllStringIndex(trimmed, -1) {
+		if m[1] >= len(trimmed) {
+			continue
+		}
+		if c := trimmed[m[1]]; (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			if decodesToBasicCredential(strings.Trim(trimmed[m[1]:], schemeGlue)) ||
+				decodesToBasicCredential(strings.Trim(trimmed[m[1]:], "=_-")) {
+				return "", false
+			}
+		}
+	}
+	i, ok := credentialRunBoundary(trimmed)
+	if !ok {
+		return "", false
+	}
+	rest := trimmed[i:]
+	if rest == "" {
+		return "", false
+	}
+	if decodesToBasicCredential(rest) ||
+		decodesToBasicCredential(strings.Trim(rest, schemeGlue)) {
+		// The boundary's leftover bits are what kept the whole run from
+		// decoding, so the residue is a credential of its own and no
+		// later pass reads it back out of a re-emit.
+		return "[REDACTED]", true
+	}
+	if judged := judgeResiduePieces(rest); judged != rest {
+		return "[REDACTED]" + judged, true
+	}
+	return "[REDACTED]" + rest, true
+}
+
+// judgeResiduePieces judges the separator-split pieces of a residue at the
+// granularity judgeTail answers for (#217): a piece that decodes goes
+// whole, a piece that cannot be told apart from a file name that decodes
+// stays. A piece that carries the #263 shape one piece down — a decodable
+// credential head the gate cannot separate from the prose behind it —
+// loses the head and keeps the prose, the same cut the residue's segment
+// got at segment granularity. The pieces are split on the same separators
+// judgeTail splits on, and a percent-encoded separator is copied as the
+// three bytes its token names, for the reason judgeTail's comment records.
+func judgeResiduePieces(residue string) string {
+	var out strings.Builder
+	for i := 0; i < len(residue); {
+		if c := residue[i]; c == '.' || c == '%' || c == '=' {
+			if c == '%' && i+2 < len(residue) && isHexDigit(residue[i+1]) && isHexDigit(residue[i+2]) {
+				out.WriteString(residue[i : i+3])
+				i += 3
+				continue
+			}
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		end := i
+		for end < len(residue) {
+			if c := residue[end]; c == '.' || c == '%' || c == '=' {
+				break
+			}
+			end++
+		}
+		out.WriteString(judgeResiduePiece(residue[i:end]))
+		i = end
+	}
+	return out.String()
+}
+
+// judgeResiduePiece judges one separator-split piece of a residue. A piece
+// that decodes whole is payload; one that starts with a credential the
+// gate cannot separate from the prose behind it loses the credential; a
+// piece with no decodable head is prose or a file name and stays.
+func judgeResiduePiece(piece string) string {
+	if decodesToBasicCredential(piece) {
+		return "[REDACTED]"
+	}
+	if i, ok := credentialRunBoundary(piece); ok {
+		return "[REDACTED]" + piece[i:]
+	}
+	return piece
+}
+
+// credentialRunBoundary reports the longest prefix of run that decodes to a
+// basic-auth credential under any client alphabet. One decode per alphabet
+// answers every prefix length: a base64 prefix decodes to the matching
+// prefix of the whole byte stream, so the decode of an alphabet's clean
+// head — the run up to its first byte the alphabet does not carry, short of
+// a final character the length %4==1 wastes — is the byte stream every
+// prefix of that head decodes to. On those bytes the credential condition
+// is one interval of lengths: the first colon fixes the user part, and the
+// password part keeps its bytes valid up to the first one below 0x20 or at
+// 0x7f, so the longest boundary is the top of the interval mapped back to
+// characters (a byte length k needs the shortest character count whose
+// decoded bytes carry k bytes, which is never a length ≡1 mod 4).
+func credentialRunBoundary(run string) (int, bool) {
+	best := 0
+	for _, alph := range credentialAlphabets {
+		t := len(run)
+		for i := 0; i < len(run); i++ {
+			if strings.IndexByte(alph.chars, run[i]) < 0 {
+				t = i
+				break
+			}
+		}
+		if t%4 == 1 {
+			// The head's last character carries only leftover bits
+			// nothing behind it can use, and its length decodes under
+			// no alphabet: drop it, the boundary cannot sit on it.
+			t--
+		}
+		if t <= 0 {
+			continue
+		}
+		b, err := alph.decode.DecodeString(run[:t])
+		if err != nil {
+			continue
+		}
+		j := bytes.IndexByte(b, ':')
+		if j <= 0 {
+			continue
+		}
+		userOK := true
+		for _, c := range b[:j] {
+			if c < 0x20 || c > 0x7e {
+				userOK = false
+				break
+			}
+		}
+		if !userOK {
+			continue
+		}
+		k := len(b)
+		for p := j + 1; p < len(b); p++ {
+			if b[p] < 0x20 || b[p] == 0x7f {
+				k = p
+				break
+			}
+		}
+		var i int
+		switch k % 3 {
+		case 0:
+			i = k / 3 * 4
+		case 1:
+			i = (k*4 + 2) / 3
+		case 2:
+			i = (k*4 + 1) / 3
+		}
+		if i > best {
+			best = i
+		}
+	}
+	return best, best > 0
 }
 
 // cutCredentialBeforeProse redacts the credential that sits in front of a
@@ -2140,7 +2360,10 @@ func cutCredentialBeforeProse(seg string) (string, bool) {
 // "[REDACTED]". Inside a tail a piece that decodes to a credential cannot
 // be told apart from a file name that decodes to one, so the piece goes
 // whole — the trade-off #217 accepted for the re-emission path, at piece
-// granularity. The glue between pieces (dots, equals signs, percent
+// granularity. A piece that does not decode whole but starts with a
+// credential the gate cannot separate from the prose behind it loses that
+// head and keeps the prose (#263), the same cut the segment judge answers
+// for one level down. The glue between pieces (dots, equals signs, percent
 // tokens) and the pieces that decode to nothing survive: prose, file
 // names and the separator context later passes may still need stay readable, which is
 // why the pieces are judged instead of redacting the interior wholesale.
@@ -2179,6 +2402,13 @@ func judgeTail(tail string) string {
 		}
 		if decodesToBasicCredential(tail[i:end]) {
 			out.WriteString("[REDACTED]")
+		} else if n, ok := credentialRunBoundary(tail[i:end]); ok {
+			// A piece the gate refuses whole can still start with a
+			// credential the gate cannot separate from the prose behind
+			// it (#263) — the same shape one piece down. The head goes
+			// and the prose behind it stays, the same cut the segment
+			// judge answers for.
+			out.WriteString("[REDACTED]" + tail[i+n:end])
 		} else {
 			out.WriteString(tail[i:end])
 		}
