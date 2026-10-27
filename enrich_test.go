@@ -608,6 +608,30 @@ func TestStripSecretsBasicAuthPayloadGone(t *testing.T) {
 			}
 		}
 	}
+	// A credential the decode gate cannot separate from the prose behind
+	// it reached the digest whole (issue #263): the head decodes, the
+	// residue behind it does not, so no whole-run or word-based arm fired.
+	// The head must go in every arm that carries it — the bare-scheme
+	// run, the header value and the "=" join segment.
+	for _, in := range []string{
+		"basic dXNlcjE6cAfoo",
+		"basic dXNlcjE6cAxbasic",
+		"basic dXNlcjpwYXNz_+xbasic",
+		"authorization: key=dXNlcjE6cAxbasic",
+		"authorization: dXNlcjpwYXNz_+xbasic",
+		"authorization: key=dXNlcjpwYXNz_+xbasic",
+		"authorization: dXNlcjE6cAfoo",
+		"authorization: key=dXNlcjE6cAfoo",
+		"basic auth dXNlcjE6cAfoo",
+		"failed with basic dXNlcjE6cAfoo in request",
+		`{"authorization": "key=dXNlcjE6cAxbasic"}`,
+	} {
+		for _, p := range []string{"dXNlcjE6cA", "dXNlcjpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
 }
 
 // TestStripSecretsBasicAuthGluedByEqualsGone pins that the credential in
@@ -787,6 +811,99 @@ func TestStripSecretsBasicAuthResidualFamiliesGone(t *testing.T) {
 		once := stripSecrets(tt.in)
 		if twice := stripSecrets(once); twice != once {
 			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthCredentialBeforeResidueGone pins the shapes
+// issue #263 reproduces: a credential the decode gate cannot separate from
+// the prose behind it — the head decodes, the residue does not, so no
+// whole-run or word-based arm fired and the payload reached the digest
+// whole. The longest prefix that decodes is redacted and what decodes to
+// nothing behind it is re-emitted, in the bare-scheme run, the header value
+// and the "=" join segment alike. Prose the gate refuses stays
+// byte-identical: the gate, not the shape, decides. Where the payload's
+// letters extend into the word behind it and the extension still decodes,
+// the cut cannot tell them apart and takes the longest — the trade-off the
+// "dXNlcjpwYXNzprose" pin owns below.
+func TestStripSecretsBasicAuthCredentialBeforeResidueGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// The bare-scheme run: the residue is prose and stays readable.
+		{"basic dXNlcjE6cAfoo", "basic [REDACTED]foo"},
+		// The residue ends on a scheme word the payload's leftover bits
+		// glue a letter onto: the word is residue here, not a scheme word,
+		// and the payload goes with it readable.
+		{"basic dXNlcjE6cAxbasic", "basic [REDACTED]xbasic"},
+		// The payload whole with glue behind it the gate cannot read
+		// across ("_" and "+" mix the alphabets): the residue keeps the
+		// glue it carried.
+		{"basic dXNlcjpwYXNz_+xbasic", "basic [REDACTED]_+xbasic"},
+		// The header value and the "=" join segment: the shared judge
+		// reaches both, the key and the join stay readable.
+		{"authorization: key=dXNlcjE6cAxbasic", "authorization: key=[REDACTED]xbasic"},
+		{"authorization: dXNlcjpwYXNz_+xbasic", "authorization: [REDACTED]_+xbasic"},
+		{"authorization: key=dXNlcjpwYXNz_+xbasic", "authorization: key=[REDACTED]_+xbasic"},
+		{"authorization: dXNlcjE6cAfoo", "authorization: [REDACTED]foo"},
+		{"authorization: key=dXNlcjE6cAfoo", "authorization: key=[REDACTED]foo"},
+		// A word chain in front of the core, and a dotted tail behind it:
+		// the tail follows the residue's prose, not the payload.
+		{"basic auth dXNlcjE6cAfoo", "basic auth [REDACTED]foo"},
+		{"basic dXNlcjE6cAfoo.more", "basic [REDACTED]foo.more"},
+		// The residue a second credential decodes in goes with the first:
+		// re-emitting it would strand the payload behind "[REDACTED]"'s
+		// brackets, where no later pass can read it back.
+		{"basic dXNlcjE6cAdXNlcjE6cA", "basic [REDACTED]"},
+		{"authorization: key=dXNlcjE6cAdXNlcjE6cA", "authorization: key=[REDACTED]"},
+		// A residue split by a separator loses the pieces that decode and
+		// keeps the prose between them; a piece that only starts with a
+		// credential loses the credential the same way the segment does
+		// (#263 one piece down, judged in the tail the separator leaves).
+		{"basic dXNlcjE6cAfoo.dXNlcjpwYXNz", "basic [REDACTED]foo.[REDACTED]"},
+		{"basic dXNlcjE6cAfoo.dXNlcjE6cAbar.dXNlcjpwYXNz", "basic [REDACTED]foo.[REDACTED]bar.[REDACTED]"},
+		{"authorization: dXNlcjE6cAfoo.dXNlcjE6cAbar", "authorization: [REDACTED]foo.[REDACTED]bar"},
+		{"authorization: key=dXNlcjE6cAfoo.dXNlcjE6cAbar", "authorization: key=[REDACTED]foo.[REDACTED]bar"},
+		// An extension of the payload by the word behind it can decode too
+		// — a password byte may be anything above the control range — and
+		// the cut cannot tell that extension apart from a longer
+		// credential, so it takes the longest and the word loses its head
+		// letters. The trade-off is the one #217 accepted at piece
+		// granularity, paid in prose directly behind a live payload.
+		{"basic dXNlcjpwYXNzprose", "basic [REDACTED]e"},
+		// The JSON-quoted shape, which is how the header reaches a log in
+		// practice.
+		{`{"authorization": "key=dXNlcjE6cAxbasic"}`, `{"authorization": "key=[REDACTED]xbasic"}`},
+		// Prose stays byte-identical.
+		{"basic credentials expire", "basic credentials expire"},
+		{"authorization: key=authentication", "authorization: key=authentication"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The judge re-emits the residue it refused, so a second pass must
+	// leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	// Whatever the residue reads like, no credential payload may reach
+	// the digest.
+	for _, in := range []string{
+		"basic dXNlcjE6cAfoo",
+		"basic dXNlcjE6cAxbasic",
+		"basic dXNlcjpwYXNz_+xbasic",
+		"authorization: key=dXNlcjE6cAxbasic",
+		"authorization: dXNlcjpwYXNz_+xbasic",
+		"authorization: key=dXNlcjpwYXNz_+xbasic",
+		`{"authorization": "key=dXNlcjE6cAxbasic"}`,
+	} {
+		for _, p := range []string{"dXNlcjE6cA", "dXNlcjpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
 		}
 	}
 }
@@ -1058,6 +1175,18 @@ func TestStripSecretsBasicAuthIdempotent(t *testing.T) {
 		"authorization: Negotiate=dXNlcjpwYXNzd29yZA==",
 		"authorization: key=dXVpZDpwYXNz_basic dXVpZDpwYXNz",
 		"basic key12=dXVpZDpwYXNz_basic dXVpZDpwYXNz",
+		// A credential the gate cannot separate from the prose behind it
+		// (issue #263): the cut re-emits what decodes to nothing, so the
+		// second pass must not grow it.
+		"basic dXNlcjE6cAfoo",
+		"basic dXNlcjE6cAxbasic",
+		"basic dXNlcjpwYXNz_+xbasic",
+		"authorization: key=dXNlcjE6cAxbasic",
+		// A residue a second credential decodes in is swallowed whole, and
+		// a separator-split residue loses its decodable pieces: neither
+		// re-emit may grow on a second pass.
+		"basic dXNlcjE6cAdXNlcjE6cA",
+		"basic dXNlcjE6cAfoo.dXNlcjpwYXNz",
 	} {
 		once := stripSecrets(in)
 		if twice := stripSecrets(once); twice != once {
