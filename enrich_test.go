@@ -5262,3 +5262,277 @@ func TestKubeGetStillDecodesUnderCap(t *testing.T) {
 		t.Errorf("unexpected decode: %+v", out.Items)
 	}
 }
+
+// backupJobFixture is the end-to-end fixture for issue #137: a failed
+// controller-generated one-shot backup Job (a CronJob's mover) whose pod log
+// shows a permission error, while the serving workload mounting the same PVC
+// is healthy and unrelated namespace/Flux activity is in flight. It stands up
+// a fake Kubernetes apiserver and a fake GitHub API, runs a full Enrich
+// through them and renders the evidence, so both the structured Enrichment
+// and the rendered tier boundaries can be asserted without an LLM.
+//
+// Neutral public names only (AGENTS.md): nothing here names a real cluster,
+// host or private service.
+func backupJobFixture(t *testing.T) (Enrichment, string) {
+	t.Helper()
+
+	// Timestamps relative to now so a one-hour window keeps the Ready
+	// transition, the events and the termination inside it, with no sleeps.
+	now := time.Now().UTC()
+	startedAt := now.Add(-6 * time.Minute).Format(time.RFC3339)
+	finishedAt := now.Add(-5 * time.Minute).Format(time.RFC3339)
+	eventAt := now.Add(-3 * time.Minute).Format(time.RFC3339)
+	transition := now.Add(-2 * time.Minute).Format(time.RFC3339)
+	rev := "refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567"
+
+	// The one-shot Job's pod: Failed phase, one terminated container with
+	// exit 1, restartCount 0 — it never restarted, so its CURRENT log is the
+	// failure evidence and previous=true would 404. The declared identity
+	// (pod-level runAsUser 1000, no container override) and the PVC mount are
+	// what ground the permission hypothesis; the Flux annotations are what
+	// resolve the workload to its Kustomization.
+	pods := fmt.Sprintf(`{
+		"items":[
+			{"metadata":{"name":"backup-job-0","namespace":"sample-app",
+				"labels":{"job-name":"backup-job"},
+				"annotations":{"kustomize.toolkit.fluxcd.io/name":"sample-app","kustomize.toolkit.fluxcd.io/namespace":"sample-app"},
+				"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job","name":"backup-job","uid":"job-uid-1","controller":true}]},
+				"spec":{
+					"securityContext":{"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},
+					"containers":[{"name":"mover","volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+					"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"sample-app-data"}}]},
+				"status":{"phase":"Failed",
+					"containerStatuses":[{"name":"mover","ready":false,"restartCount":0,
+						"state":{"terminated":{"exitCode":1,"reason":"Error","startedAt":"%s","finishedAt":"%s",
+							"message":"mkdir: can't create directory '/data': Permission denied"}}}]}},
+			{"metadata":{"name":"sample-app-web-0","namespace":"sample-app",
+				"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"sample-app-web","uid":"rs-uid-1","controller":true}]},
+				"spec":{
+					"containers":[{"name":"web","securityContext":{"runAsUser":0},
+						"volumeMounts":[{"name":"web-data","mountPath":"/data"}]}],
+					"volumes":[{"name":"web-data","persistentVolumeClaim":{"claimName":"sample-app-data"}}]},
+				"status":{"phase":"Running",
+					"containerStatuses":[{"name":"web","ready":true,"restartCount":0,
+						"state":{"running":{"startedAt":"%s"}}}]}},
+			{"metadata":{"name":"other-0","namespace":"sample-app",
+				"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"other","uid":"rs-uid-2","controller":true}]},
+				"spec":{"containers":[{"name":"app"}]},
+				"status":{"phase":"Running",
+					"containerStatuses":[{"name":"app","ready":true,"restartCount":0,
+						"state":{"running":{"startedAt":"%s"}}}]}}
+		]}`, startedAt, finishedAt, startedAt, startedAt)
+
+	job := `{"metadata":{"name":"backup-job","namespace":"sample-app","uid":"job-uid-1",
+			"ownerReferences":[{"apiVersion":"batch/v1","kind":"CronJob","name":"backup-schedule","uid":"cron-uid-1","controller":true}]},
+			"spec":{"template":{"metadata":{"labels":{"job-name":"backup-job"}}}}}`
+
+	// One warning on the resolved subject (the Job itself) and two on objects
+	// outside the subject graph: only the first may reach Enrichment.Events.
+	events := fmt.Sprintf(`{"items":[
+			{"type":"Warning","reason":"BackoffLimitExceeded","lastTimestamp":"%s",
+				"involvedObject":{"kind":"Job","name":"backup-job","namespace":"sample-app"},
+				"message":"Job has reached the specified backoff limit"},
+			{"type":"Warning","reason":"VolumeResizeFailed","lastTimestamp":"%s",
+				"involvedObject":{"kind":"PersistentVolumeClaim","name":"helper-pvc","namespace":"sample-app"},
+				"message":"resize volume helper-pvc failed"},
+			{"type":"Warning","reason":"FailedMount","lastTimestamp":"%s",
+				"involvedObject":{"kind":"Pod","name":"helper-7","namespace":"sample-app"},
+				"message":"mount volume for pod helper-7 failed"}
+		]}`, eventAt, eventAt, eventAt)
+
+	// The mover's current log: the permission line plus routine lines, so the
+	// assertion can prove the failure line was fetched rather than invented.
+	logBody := "backup-mover starting one-shot run\nlisting /data\n" +
+		"mkdir: can't create directory '/data': Permission denied\n"
+
+	kustGet := fmt.Sprintf(`{"spec":{"path":"apps/sample-app",
+			"sourceRef":{"name":"flux-repo","kind":"GitRepository"}},
+			"status":{"lastAppliedRevision":%q}}`, rev)
+	kustList := fmt.Sprintf(`{"metadata":{"name":"sample-app","namespace":"sample-app"},
+			"status":{"lastAppliedRevision":%q,
+			"conditions":[{"type":"Ready","status":"True","reason":"Succeeded","lastTransitionTime":%q}]}}`, rev, transition)
+	gitRepo := `{"spec":{"url":"https://github.com/example/gitops-test.git"}}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(path, "/jobs/"):
+			_, _ = io.WriteString(w, job)
+		case strings.HasSuffix(path, "/pods"):
+			_, _ = io.WriteString(w, pods)
+		case strings.HasSuffix(path, "/log"):
+			// The one-shot container never restarted, so Enrich must ask for
+			// the current stream (no previous=true) for the named container.
+			if r.URL.Query().Get("previous") != "" || r.URL.Query().Get("container") != "mover" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, logBody)
+		case strings.Contains(path, "/events"):
+			_, _ = io.WriteString(w, events)
+		case strings.Contains(path, "/helmreleases"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(path, "/kustomizations"):
+			_, _ = io.WriteString(w, `{"items":[`+kustList+`]}`)
+		case strings.Contains(path, "/kustomizations/"):
+			_, _ = io.WriteString(w, kustGet)
+		case strings.Contains(path, "/gitrepositories/"):
+			_, _ = io.WriteString(w, gitRepo)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// The commit the Kustomization reconciled at touches only an unrelated
+	// path, so the correct classification is "does not touch": a healthy
+	// reconcile of someone else's change is not a workload change.
+	f := newFakeCommitServer(t)
+	f.payloads["0123456789abcdef0123456789abcdef01234567"] = commitPayload{
+		files:   []map[string]string{{"filename": "apps/other-game/deployment.yaml"}},
+		message: "bump other-game image to 1.4.2",
+	}
+	gh := &gitHubClient{token: "t", repo: "example/gitops-test", hc: f.srv.Client(), apiURL: f.srv.URL}
+
+	// A log backend holding unrelated namespace chatter. Because the alert
+	// resolves to a concrete subject, only the pod-scoped query may be issued;
+	// the unrelated lines are served only under the namespace-wide query
+	// shape, so their appearance anywhere in the rendered evidence would mean
+	// the scoping regressed (issue #129).
+	logsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		q := r.URL.Query().Get("query")
+		if strings.Contains(q, `pod:"backup-job-0"`) {
+			_, _ = io.WriteString(w, `{"_msg":"backup-mover exited 1 after listing /data"}`+"\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"_msg":"unrelated-job-9 routine namespace chatter"}`+"\n")
+	}))
+	t.Cleanup(logsSrv.Close)
+
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client(),
+		logs: &logsBackend{url: logsSrv.URL, base: logsSrv.URL, flavor: "victorialogs", limit: 100, hc: logsSrv.Client()}}
+	g := Group{
+		Key:        "single/KubeJobFailed",
+		Reason:     "single",
+		Namespaces: []string{"sample-app"},
+		Alerts: []Alert{{Labels: map[string]string{
+			"alertname": "KubeJobFailed", "severity": "warning",
+			"namespace": "sample-app", "job_name": "backup-job",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, gh)
+	return en, renderEvidence(Report{Group: g, Enrichment: en})
+}
+
+// TestEnrichBackupJobFixture is the issue #137 regression guard on the
+// structured evidence: the failed Job's own pod must be a direct subject whose
+// termination reading, current log, declared identity, same-claim sibling,
+// ownership chain and subject events are all captured, while unrelated
+// namespace warnings stay ambient and a healthy Flux reconcile stays neutrally
+// worded. It asserts structured facts only — the prose is the model's job.
+func TestEnrichBackupJobFixture(t *testing.T) {
+	en, _ := backupJobFixture(t)
+
+	// The Job was resolved and recorded as inspected, not merely swept up in
+	// a namespace listing.
+	if !podInList(t, en.InspectedJobs, "sample-app/backup-job") {
+		t.Fatalf("InspectedJobs = %v, want sample-app/backup-job", en.InspectedJobs)
+	}
+	if !strings.Contains(en.Scope, "jobs sample-app/backup-job were inspected") {
+		t.Errorf("scope %q does not record that the job was inspected", en.Scope)
+	}
+	// The failed Job-owned pod is a direct subject, observed in the listing.
+	if !podInList(t, en.SubjectPods, "sample-app/backup-job-0") || !podInList(t, en.UnhealthyPods, "sample-app/backup-job-0") {
+		t.Fatalf("failed job pod missing from SubjectPods/UnhealthyPods: %v / %v", en.SubjectPods, en.UnhealthyPods)
+	}
+	if !en.SubjectPodObserved {
+		t.Error("SubjectPodObserved = false, but the failed job pod was in the listing")
+	}
+
+	// The termination reading is this service's own: exit code and reason.
+	if !podInList(t, en.SubjectContainerDiagnostics, "sample-app/backup-job-0") ||
+		!podInList(t, en.SubjectContainerDiagnostics, "exit=1") ||
+		!podInList(t, en.SubjectContainerDiagnostics, "reason=Error") {
+		t.Errorf("SubjectContainerDiagnostics = %v, want the exit=1/reason=Error reading", en.SubjectContainerDiagnostics)
+	}
+	// The permission failure itself is workload text: the current log.
+	if log := en.SubjectPodLogs["sample-app/backup-job-0"]; !strings.Contains(log, "Permission denied") {
+		t.Errorf("SubjectPodLogs[mover pod] = %q, want the permission-denied line", log)
+	}
+	prov := en.SubjectPodLogProvenance["sample-app/backup-job-0"]
+	if prov.Stream != "current" || prov.Container != "mover" {
+		t.Errorf("provenance = %+v, want the current stream of container mover", prov)
+	}
+
+	// The declared identity and the PVC mount ground the hypothesis.
+	id := en.PodID["sample-app/backup-job-0"]
+	if !strings.Contains(id, "runAsUser=1000") || !strings.Contains(id, "runAsNonRoot=true") {
+		t.Errorf("PodID = %q, want the declared runAsUser/runAsNonRoot", id)
+	}
+	if !strings.Contains(id, "sample-app-data at /data") {
+		t.Errorf("PodID = %q, want the sample-app-data mount at /data", id)
+	}
+
+	// A healthy sibling on the same claim is comparison context: the mover
+	// failed, the storage and the serving workload did not.
+	if !podInList(t, en.PVCSiblings, "sample-app-web-0") || !podInList(t, en.PVCSiblings, "Running") {
+		t.Errorf("PVCSiblings = %v, want the healthy same-claim sibling", en.PVCSiblings)
+	}
+
+	// The ownership chain shows the maintenance role: the Job pod belongs to
+	// the Job, and the Job to its CronJob controller.
+	if !podInList(t, en.Ownership, "Pod/sample-app/backup-job-0") ||
+		!podInList(t, en.Ownership, "-> Job/sample-app/backup-job -> CronJob/backup-schedule") {
+		t.Errorf("Ownership = %v, want the pod->job->cronjob chain", en.Ownership)
+	}
+
+	// Only the subject's own warning reaches Events; the PVC and helper-7
+	// warnings stay ambient context.
+	if len(en.Events) != 1 || !strings.Contains(en.Events[0], "BackoffLimitExceeded Job/backup-job") {
+		t.Errorf("Events = %v, want only the BackoffLimitExceeded event on the job", en.Events)
+	}
+	if !podInList(t, en.Ambient, "helper-pvc") || !podInList(t, en.Ambient, "helper-7") {
+		t.Errorf("Ambient = %v, want the unrelated PVC and helper-7 warnings", en.Ambient)
+	}
+
+	// A healthy Flux reconcile in the namespace is neutral: it proves a sync,
+	// not a change to this workload.
+	if len(en.FluxActivity) != 1 || !strings.Contains(en.FluxActivity[0], "reconciled at revision") {
+		t.Errorf("FluxActivity = %v, want one neutral reconciled-at-revision entry", en.FluxActivity)
+	}
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(strings.ToLower(en.FluxActivity[0]), word) {
+			t.Errorf("FluxActivity %q must not claim a %q", en.FluxActivity[0], word)
+		}
+	}
+
+	// The reconciled commit touched only an unrelated path: exactly one
+	// classification, and it is not a workload change.
+	if len(en.CommitRelevance) != 1 {
+		t.Fatalf("CommitRelevance = %+v, want exactly one entry", en.CommitRelevance)
+	}
+	rel := en.CommitRelevance[0]
+	if rel.State != commitRelevanceDoesNotTouch {
+		t.Errorf("CommitRelevance.State = %q, want %q", rel.State, commitRelevanceDoesNotTouch)
+	}
+	if rel.WorkloadPath != "apps/sample-app" {
+		t.Errorf("CommitRelevance.WorkloadPath = %q, want apps/sample-app", rel.WorkloadPath)
+	}
+
+	// Backend logs were subject-scoped: the primary lines are the mover's,
+	// and the unrelated namespace chatter the backend holds was never asked
+	// for, so it appears nowhere in the enrichment.
+	if !en.BackendScoped || en.BackendState != "ok" {
+		t.Errorf("BackendScoped/BackendState = %v/%q, want scoped/ok", en.BackendScoped, en.BackendState)
+	}
+	if len(en.BackendLogs) != 1 || !strings.Contains(en.BackendLogs[0], "backup-mover exited 1") {
+		t.Errorf("BackendLogs = %v, want the subject-scoped mover line", en.BackendLogs)
+	}
+	if podInList(t, en.Ambient, "unrelated-job-9") {
+		t.Errorf("unrelated namespace log lines must not become ambient context: %v", en.Ambient)
+	}
+}
