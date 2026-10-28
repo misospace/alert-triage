@@ -39,11 +39,7 @@ func (a Alert) identity() string {
 	if a.Fingerprint != "" {
 		return a.Fingerprint
 	}
-	keys := make([]string, 0, len(a.Labels))
-	for k := range a.Labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := sortedKeys(a.Labels)
 	var b strings.Builder
 	for _, k := range keys {
 		b.WriteString(k)

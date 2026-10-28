@@ -688,22 +688,14 @@ func identityFields(id containerID) string {
 // claims to know it.
 func podIdentities(targetPods map[string]*podItem) map[string]string {
 	out := map[string]string{}
-	keys := make([]string, 0, len(targetPods))
-	for k := range targetPods {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := sortedKeys(targetPods)
 	for _, key := range keys {
 		p := targetPods[key]
 		if p == nil {
 			continue // the alert named a pod the namespace list never returned
 		}
 		failing := p.failing()
-		names := make([]string, 0, len(failing))
-		for n := range failing {
-			names = append(names, n)
-		}
-		sort.Strings(names)
+		names := sortedKeys(failing)
 		if len(names) == 0 {
 			continue
 		}
@@ -716,11 +708,7 @@ func podIdentities(targetPods map[string]*podItem) map[string]string {
 			id := p.containerSpec(n).effective(p.Spec.Security)
 			fmt.Fprintf(&b, "container %s (declared: %s)", n, identityFields(id))
 			claims := p.containerMounts(n)
-			claimNames := make([]string, 0, len(claims))
-			for c := range claims {
-				claimNames = append(claimNames, c)
-			}
-			sort.Strings(claimNames)
+			claimNames := sortedKeys(claims)
 			var mounts []string
 			for _, c := range claimNames {
 				m := claims[c]
@@ -1098,11 +1086,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			if targetPods[p.Metadata.Namespace+"/"+p.Metadata.Name] {
 				continue
 			}
-			claims := make([]string, 0, len(p.claims()))
-			for claim := range p.claims() {
-				claims = append(claims, claim)
-			}
-			sort.Strings(claims)
+			claims := sortedKeys(p.claims())
 			for _, claim := range claims {
 				if !targetClaims[claim] {
 					continue
@@ -1216,11 +1200,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// alerts named and the pods the listing returned. Nothing is derived from
 	// names, so a job that merely shares its name with the application it
 	// serves is not reported as owned by it.
-	jobKeys := make([]string, 0, len(jobTargets))
-	for key := range jobTargets {
-		jobKeys = append(jobKeys, key)
-	}
-	sort.Strings(jobKeys)
+	jobKeys := sortedKeys(jobTargets)
 	for _, key := range jobKeys {
 		j := jobTargets[key]
 		jkey := j.Namespace + "/" + j.Name

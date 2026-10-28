@@ -712,11 +712,7 @@ func podIDLines(m map[string]string) []string {
 	if len(m) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := sortedKeys(m)
 	out := make([]string, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, m[k])

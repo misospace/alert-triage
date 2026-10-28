@@ -270,11 +270,7 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	// Query the expression for each alert name we found in rules. The
 	// expression is replayed as written, so its result may span more than the
 	// resolved subject; it stays context rather than being promoted to DIRECT.
-	sortedNames := make([]string, 0, len(alertNames))
-	for name := range alertNames {
-		sortedNames = append(sortedNames, name)
-	}
-	sort.Strings(sortedNames)
+	sortedNames := sortedKeys(alertNames)
 
 	for _, name := range sortedNames {
 		expr, ok := rules[name]

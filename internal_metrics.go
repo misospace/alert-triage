@@ -168,9 +168,9 @@ func metricsHandler() http.HandlerFunc {
 	}
 }
 
-// sortedKeys is a small helper for any future labelled metric; it keeps the
-// output deterministic when label sets grow.
-func sortedKeys(m map[string]int64) []string {
+// sortedKeys returns a map's keys in sorted order, so evidence assembled from
+// a map stays deterministic across runs.
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
