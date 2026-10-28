@@ -1562,3 +1562,149 @@ func TestRenderEvidencePodIDNegatives(t *testing.T) {
 		}
 	}
 }
+
+// insideUntrustedFence reports whether byte position idx in s sits inside an
+// open untrusted fence: one more BEGIN than END marker precedes it. Used to
+// pin which side of the data boundary a rendered finding landed on, without
+// depending on prose.
+func insideUntrustedFence(s string, idx int) bool {
+	if idx < 0 || idx > len(s) {
+		return false
+	}
+	return strings.Count(s[:idx], untrustedBegin) > strings.Count(s[:idx], untrustedEnd)
+}
+
+// TestRenderBackupJobFixture pins the tier boundaries of the issue #137
+// fixture's rendered evidence: the failed Job pod's identity, the service's
+// own termination reading and the ownership chain sit in DIRECT SUBJECT
+// EVIDENCE (the reading outside the untrusted fence, the log and the chain
+// inside it), the healthy same-claim sibling and the unrelated namespace
+// warnings stay in CONTEXT / BACKGROUND, the healthy Flux reconcile is never
+// described as a deploy or change, and the "does not touch workload" commit
+// classification is rendered. Placement is asserted, not prose.
+func TestRenderBackupJobFixture(t *testing.T) {
+	_, out := backupJobFixture(t)
+
+	direct := strings.Index(out, "DIRECT SUBJECT EVIDENCE")
+	context := strings.Index(out, "CONTEXT / BACKGROUND")
+	background := strings.Index(out, "BACKGROUND - everything else")
+	if direct < 0 || context < 0 || background < 0 || !(direct < context && context < background) {
+		t.Fatalf("missing or misordered tier headings:\n%s", out)
+	}
+
+	// Subject and Job identity reach the direct tier via the inspected-jobs
+	// and unhealthy-pods sections. The search starts at the heading because
+	// the EVIDENCE scope line (which precedes it) also names the job, and the
+	// match is bounded above by CONTEXT so a leak into a lower tier fails too.
+	if i := strings.Index(out[direct:], "sample-app/backup-job"); i < 0 || direct+i >= context {
+		t.Errorf("resolved job identity missing from DIRECT:\n%s", out)
+	}
+	if i := strings.Index(out[direct:], "sample-app/backup-job-0"); i < 0 || direct+i >= context {
+		t.Errorf("failed pod identity missing from DIRECT:\n%s", out)
+	}
+
+	// The exit=1/reason=Error reading is this service's own, so it must be in
+	// the direct tier AND outside the untrusted fence.
+	i := strings.Index(out, "terminated exit=1")
+	if i < direct || i >= context {
+		t.Errorf("termination reading at %d must sit in DIRECT [%d, %d):\n%s", i, direct, context, out)
+	}
+	if insideUntrustedFence(out, i) {
+		t.Errorf("the service's own termination reading must be outside the untrusted fence:\n%s", out)
+	}
+	if !strings.Contains(out, "reason=Error") {
+		t.Errorf("termination reason Error must be rendered:\n%s", out)
+	}
+
+	// The permission-denied line is the container's own log text: it must
+	// appear under the Pod failure logs heading, inside the fence, in the
+	// direct tier. The same line also travels as the termination message, so
+	// the LAST occurrence is the log block's.
+	logs := strings.Index(out, "Pod failure logs")
+	denied := strings.LastIndex(out, "Permission denied")
+	if logs < direct || logs >= context {
+		t.Errorf("Pod failure logs heading at %d must sit in DIRECT [%d, %d):\n%s", logs, direct, context, out)
+	}
+	if denied < logs {
+		t.Fatalf("permission-denied log line not rendered under Pod failure logs:\n%s", out)
+	}
+	if !insideUntrustedFence(out, denied) {
+		t.Errorf("the permission-denied log line must be inside the untrusted fence:\n%s", out)
+	}
+	if !strings.Contains(out, "container mover, current stream") {
+		t.Errorf("log provenance must name the container and the current stream:\n%s", out)
+	}
+
+	// The declared identity line is direct evidence.
+	if i := strings.Index(out, "runAsUser=1000"); i < direct || i >= context {
+		t.Errorf("declared identity at %d must sit in DIRECT [%d, %d):\n%s", i, direct, context, out)
+	}
+	if !strings.Contains(out, "sample-app-data at /data") {
+		t.Errorf("the PVC mount relationship must be rendered:\n%s", out)
+	}
+
+	// The ownership chain is object metadata, so it renders fenced, in the
+	// direct tier.
+	chain := strings.Index(out, "-> Job/sample-app/backup-job -> CronJob/backup-schedule")
+	if chain < direct || chain >= context {
+		t.Errorf("ownership chain at %d must sit in DIRECT [%d, %d):\n%s", chain, direct, context, out)
+	}
+	if !insideUntrustedFence(out, chain) {
+		t.Errorf("the ownership chain must render inside the untrusted fence:\n%s", out)
+	}
+
+	// The healthy same-claim sibling is comparison context.
+	if i := strings.Index(out, "sample-app-web-0"); i < context {
+		t.Errorf("healthy sibling at %d must not appear before CONTEXT (starts %d):\n%s", i, context, out)
+	}
+	if !strings.Contains(out, "same-claim sample-app-data") {
+		t.Errorf("the same-claim relationship must be rendered:\n%s", out)
+	}
+
+	// The unrelated namespace warnings are ambient: they may exist only under
+	// BACKGROUND, never in the direct tier.
+	for _, noise := range []string{"helper-pvc", "helper-7"} {
+		if i := strings.Index(out, noise); i < background {
+			t.Errorf("unrelated warning %q at %d must sit under BACKGROUND (starts %d):\n%s", noise, i, background, out)
+		}
+	}
+
+	// The healthy Flux reconcile must surface neutrally: no deploy/change/
+	// trigger wording anywhere in the evidence outside the alert's own fence.
+	evIdx := strings.Index(out, "EVIDENCE")
+	if evIdx < 0 {
+		t.Fatalf("EVIDENCE heading missing:\n%s", out)
+	}
+	after := out[evIdx:]
+	if !strings.Contains(after, "reconciled at revision") {
+		t.Errorf("the healthy reconcile must still surface, neutrally worded:\n%s", out)
+	}
+	for _, word := range []string{"deploy", "change", "trigger"} {
+		if strings.Contains(strings.ToLower(after), word) {
+			t.Errorf("evidence outside the alert fence must not call the reconcile a %q:\n%s", word, after)
+		}
+	}
+
+	// The commit the reconcile sat at touched only an unrelated path, and the
+	// rendered evidence says so.
+	if !strings.Contains(out, "does NOT touch workload") || !strings.Contains(out, "apps/sample-app") {
+		t.Errorf("the does-not-touch classification must be rendered with the workload path:\n%s", out)
+	}
+
+	// Unrelated namespace log lines must not render anywhere: with a resolved
+	// subject the backend query is pod-scoped and the namespace chatter is
+	// never fetched (issue #129).
+	if strings.Contains(out, "unrelated-job-9") {
+		t.Errorf("unrelated namespace log lines leaked into the evidence:\n%s", out)
+	}
+	// The subject-scoped backend line, by contrast, is direct evidence.
+	if i := strings.Index(out, "backup-mover exited 1"); i < direct || i >= context {
+		t.Errorf("subject-scoped backend log at %d must sit in DIRECT [%d, %d):\n%s", i, direct, context, out)
+	}
+
+	// A resolved and observed subject pod must not let the renderer emit the
+	// empty-subject negative: that phrasing is for the no-subject case.
+	if strings.Contains(out, "No subject pod was observed") {
+		t.Errorf("empty-subject negative rendered while the failed job pod was inspected:\n%s", out)
+	}
+}
