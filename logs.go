@@ -388,11 +388,7 @@ func streamLabels(s map[string]string) []string {
 	if len(s) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(s))
-	for k := range s {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := sortedKeys(s)
 	out := make([]string, 0, len(keys))
 	for _, key := range keys {
 		out = append(out, key+"="+s[key])
