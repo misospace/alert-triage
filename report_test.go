@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestSeverityColor(t *testing.T) {
@@ -1706,5 +1707,178 @@ func TestRenderBackupJobFixture(t *testing.T) {
 	// empty-subject negative: that phrasing is for the no-subject case.
 	if strings.Contains(out, "No subject pod was observed") {
 		t.Errorf("empty-subject negative rendered while the failed job pod was inspected:\n%s", out)
+	}
+}
+
+// captureDiscordEmbed runs Deliver against a stub webhook and returns the
+// embed exactly as it went over the wire, after JSON decoding — which is
+// the string Discord applies its limits to.
+func captureDiscordEmbed(t *testing.T, cfg *Config, rpt Report) discordEmbed {
+	t.Helper()
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+	}))
+	defer srv.Close()
+	cfg.DiscordURL = srv.URL
+	if err := Deliver(context.Background(), cfg, rpt); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	var wire struct {
+		Embeds []discordEmbed `json:"embeds"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("decode delivered body %q: %v", body, err)
+	}
+	if len(wire.Embeds) != 1 {
+		t.Fatalf("want exactly 1 embed delivered, got %d", len(wire.Embeds))
+	}
+	return wire.Embeds[0]
+}
+
+// assertDiscordEmbedBudgets checks every documented Discord embed limit
+// against a delivered embed, counted the way Discord counts: characters of
+// the decoded strings, with the aggregate summed over all embed text.
+func assertDiscordEmbedBudgets(t *testing.T, e discordEmbed) {
+	t.Helper()
+	total := runeLen(e.Title) + runeLen(e.Description) + runeLen(e.Footer.Text)
+	if n := runeLen(e.Title); n > discordTitleMax {
+		t.Errorf("title is %d characters, limit %d", n, discordTitleMax)
+	}
+	if n := runeLen(e.Description); n > discordDescriptionMax {
+		t.Errorf("description is %d characters, limit %d", n, discordDescriptionMax)
+	}
+	if n := runeLen(e.Footer.Text); n > discordFooterMax {
+		t.Errorf("footer is %d characters, limit %d", n, discordFooterMax)
+	}
+	if len(e.Fields) > discordFieldsMax {
+		t.Errorf("%d fields, limit %d", len(e.Fields), discordFieldsMax)
+	}
+	for i, f := range e.Fields {
+		if n := runeLen(f.Name); n > discordFieldNameMax {
+			t.Errorf("field %d name is %d characters, limit %d", i, n, discordFieldNameMax)
+		}
+		if n := runeLen(f.Value); n > discordFieldValueMax {
+			t.Errorf("field %d value is %d characters, limit %d", i, n, discordFieldValueMax)
+		}
+		if !utf8.ValidString(f.Name) || !utf8.ValidString(f.Value) {
+			t.Errorf("field %d is not valid UTF-8 after truncation", i)
+		}
+		total += runeLen(f.Name) + runeLen(f.Value)
+	}
+	if total > discordEmbedTotalMax {
+		t.Errorf("embed aggregate is %d characters, limit %d", total, discordEmbedTotalMax)
+	}
+	for label, s := range map[string]string{"title": e.Title, "description": e.Description, "footer": e.Footer.Text} {
+		if !utf8.ValidString(s) {
+			t.Errorf("%s is not valid UTF-8 after truncation", label)
+		}
+	}
+}
+
+func TestFitKeepsBudgetAndMarkerInside(t *testing.T) {
+	if got := fit("short", 10); got != "short" {
+		t.Errorf("fit of a fitting string = %q, want unchanged", got)
+	}
+	got := fit(strings.Repeat("x", 5000), 4096)
+	if runeLen(got) != 4096 || !strings.HasSuffix(got, "...") {
+		t.Errorf("fit(long, 4096): %d runes, suffix %q; want 4096 runes ending in marker", runeLen(got), got[runeLen(got)-3:])
+	}
+	long := strings.Repeat("målsikt🚨", 1000)
+	if got := fit(long, 101); !utf8.ValidString(got) || runeLen(got) > 101 {
+		t.Errorf("fit cut a rune in half or overran: %q", got)
+	}
+	if got := fit("x", 0); got != "" {
+		t.Errorf("fit(x, 0) = %q, want empty", got)
+	}
+	if got := fit("abcdef", 2); runeLen(got) > 2 {
+		t.Errorf("fit(abcdef, 2) = %q, want at most 2 runes", got)
+	}
+}
+
+// A long alert name, a long GitOps path, and a group resolving more source
+// paths than an embed may carry must each still deliver, with every Discord
+// limit satisfied on the outbound JSON (issue #270).
+func TestDeliverEnforcesDiscordEmbedLimits(t *testing.T) {
+	longName := strings.Repeat("ExtremelyLongAlertName", 300)
+	longPath := "deploy/" + strings.Repeat("nested/", 700) + "app.yaml"
+	manyLongPaths := make([]string, 40)
+	for i := range manyLongPaths {
+		manyLongPaths[i] = fmt.Sprintf("clusters/prod/app-%d/%s.yaml", i, strings.Repeat("depth/", 200))
+	}
+	named := func(name string) Report {
+		return Report{Group: Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": name}}}}}
+	}
+	cases := []struct {
+		name  string
+		rpt   Report
+		check func(*testing.T, discordEmbed)
+	}{
+		{"long alert name", named(longName), func(t *testing.T, e discordEmbed) {
+			if !strings.HasSuffix(e.Title, "...") {
+				t.Errorf("truncated title lacks the marker: %q", e.Title[max(0, len(e.Title)-16):])
+			}
+		}},
+		{"long source path", Report{
+			Group:      Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": "GitOpsDrift"}}}},
+			Enrichment: Enrichment{RepoPaths: []string{longPath}},
+		}, func(t *testing.T, e discordEmbed) {
+			if len(e.Fields) != 1 {
+				t.Fatalf("want 1 Source field, got %d", len(e.Fields))
+			}
+			if !strings.HasSuffix(e.Fields[0].Value, "...") {
+				t.Errorf("truncated path lacks the marker")
+			}
+		}},
+		{"more than 25 source paths", Report{
+			Group:      Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": "GitOpsDrift"}}}},
+			Enrichment: Enrichment{RepoPaths: manyLongPaths},
+		}, func(t *testing.T, e discordEmbed) {
+			if len(e.Fields) != discordFieldsMax {
+				t.Fatalf("want exactly %d fields, got %d", discordFieldsMax, len(e.Fields))
+			}
+			last := e.Fields[len(e.Fields)-1].Value
+			if !strings.Contains(last, "...and 16 more") {
+				t.Errorf("overflow fields should be counted into a summary, last field is %q", last)
+			}
+		}},
+		{"everything oversized at once", Report{
+			Group:      Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": longName}}}},
+			Enrichment: Enrichment{RepoPaths: manyLongPaths},
+			Narrative:  strings.Repeat("n", 5000),
+		}, nil},
+		{"multi-byte truncation stays valid UTF-8", named(strings.Repeat("målsikt🚨", 900)), nil},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			e := captureDiscordEmbed(t, &Config{}, tt.rpt)
+			assertDiscordEmbedBudgets(t, e)
+			if tt.check != nil {
+				tt.check(t, e)
+			}
+		})
+	}
+}
+
+// The tracked-issue link is the pointer to the durable record; a narrative
+// big enough to force truncation may shorten the digest but must not drop
+// the link or breach the description budget (issue #168, issue #270).
+func TestDeliverKeepsTrackedLinkWhenTruncated(t *testing.T) {
+	ghStub := newStubGitHub(t)
+	orig := newGitHubClient
+	t.Cleanup(func() { newGitHubClient = orig })
+	newGitHubClient = func(*Config) *gitHubClient {
+		return &gitHubClient{token: "tok", repo: "owner/repo", hc: &http.Client{}, apiURL: ghStub.server.URL}
+	}
+
+	rpt := Report{
+		Group:     Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")},
+		Triage:    Triage{FixLocation: "git"},
+		Narrative: strings.Repeat("y", 5000),
+	}
+	e := captureDiscordEmbed(t, &Config{GitHubRepo: "owner/repo", GitHubToken: "tok"}, rpt)
+	assertDiscordEmbedBudgets(t, e)
+	if !strings.Contains(e.Description, "Tracked: <https://example.com/42>") {
+		t.Errorf("tracked link lost to truncation; description tail: %q", e.Description[max(0, len(e.Description)-120):])
 	}
 }
