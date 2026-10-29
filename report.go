@@ -764,19 +764,46 @@ func firstAnnotation(a Alert) string {
 	return ""
 }
 
+type discordField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
 type discordEmbed struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Color       int    `json:"color"`
-	Fields      []struct {
-		Name   string `json:"name"`
-		Value  string `json:"value"`
-		Inline bool   `json:"inline"`
-	} `json:"fields,omitempty"`
-	Footer struct {
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	Color       int            `json:"color"`
+	Fields      []discordField `json:"fields,omitempty"`
+	Footer      struct {
 		Text string `json:"text"`
 	} `json:"footer"`
 }
+
+// Discord embed limits, enforced on the assembled embed before the POST
+// (https://discord.com/developers/docs/resources/message#embed-object-embed-limits).
+// Exceeding any one of them makes Discord reject the entire digest with
+// HTTP 400, and alert-controlled text reaches all of them: an alert name
+// lands in the title without a bound of its own, GitOps paths land in field
+// values, and a large group can resolve more Source fields than an embed may
+// carry.
+const (
+	discordTitleMax       = 256
+	discordDescriptionMax = 4096
+	discordFooterMax      = 2048
+	discordFieldsMax      = 25
+	discordFieldNameMax   = 256
+	discordFieldValueMax  = 1024
+	discordEmbedTotalMax  = 6000
+
+	// The narrative and its tracked-issue link are the digest; Source
+	// fields are evidence. Against the aggregate, fields share at most this
+	// much, and the description floor guarantees the narrative a share even
+	// with a maxed-out title and footer: 6000 - 256 - 2048 - 2000 stays
+	// well positive, so no section can crowd another out of the embed.
+	discordFieldsTotalMax   = 2000
+	discordDescriptionFloor = 512
+)
 
 func severityColor(s string) int {
 	switch s {
@@ -916,6 +943,120 @@ func discordDescription(cfg *Config, r Report) string {
 // production always uses newGitHub.
 var newGitHubClient = newGitHub //nolint:gochecknoglobals
 
+// fit shortens s to at most n characters as Discord meters them (see
+// textLen), keeping the truncation marker inside the budget instead of
+// appending it past n the way clamp does, and cutting on rune boundaries so
+// a truncated multi-byte name still decodes.
+func fit(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	const marker = "..."
+	if textLen(s) <= n {
+		return s
+	}
+	if n <= len(marker) {
+		// No room for content plus a marker. Only a caller with a limit of
+		// three characters or less can reach this.
+		if n == len(marker) {
+			return marker
+		}
+		return ""
+	}
+	budget := n - len(marker)
+	r := []rune(s)
+	keep, units := 0, 0
+	for _, c := range r {
+		w := 1
+		if c > 0xFFFF {
+			w = 2
+		}
+		if units+w > budget {
+			break
+		}
+		units += w
+		keep++
+	}
+	return string(r[:keep]) + marker
+}
+
+// budgetEmbed returns embed with every Discord limit enforced on the final
+// values, and the tracked-issue link folded into the description with room
+// reserved for it. Discord's 6000-character aggregate covers all text in
+// the embed, so the sections are allocated in order of what the operator
+// needs: title and footer take their (small, capped) share, Source fields
+// split what the aggregate leaves them but never more than
+// discordFieldsTotalMax, and the description gets the rest. Excess fields
+// are counted into one summary line rather than dropped — evidence
+// collapses, it is not deleted to fit.
+func budgetEmbed(embed discordEmbed, trackedURL string) discordEmbed {
+	embed.Title = fit(embed.Title, discordTitleMax)
+	embed.Footer.Text = fit(embed.Footer.Text, discordFooterMax)
+
+	// Past 25 fields Discord rejects the embed outright, and no per-field
+	// trim can fix the count, so keep 24 and count the rest.
+	if len(embed.Fields) > discordFieldsMax {
+		omitted := len(embed.Fields) - (discordFieldsMax - 1)
+		embed.Fields = append(embed.Fields[:discordFieldsMax-1:discordFieldsMax-1],
+			discordField{Name: embed.Fields[discordFieldsMax-1].Name, Value: fmt.Sprintf("...and %d more", omitted)})
+	}
+
+	// Integer division makes the sum of the shares at most the room, never
+	// more, so the field slice can never overrun the aggregate.
+	if len(embed.Fields) > 0 {
+		room := max(min(discordFieldsTotalMax,
+			discordEmbedTotalMax-textLen(embed.Title)-textLen(embed.Footer.Text)-discordDescriptionFloor), 0)
+		share := min(discordFieldValueMax, room/len(embed.Fields))
+		for i, f := range embed.Fields {
+			f.Name = fit(f.Name, min(discordFieldNameMax, share))
+			f.Value = fit(f.Value, min(discordFieldValueMax, share-textLen(f.Name)))
+			embed.Fields[i] = f
+		}
+	}
+
+	used := textLen(embed.Title) + textLen(embed.Footer.Text)
+	for _, f := range embed.Fields {
+		used += textLen(f.Name) + textLen(f.Value)
+	}
+
+	// A GitHub issue may mirror this incident, and the link to that durable
+	// record has to survive inside the embed — the embed is the only thing
+	// marshaled into the wire body (issue #168). The link's room is cut
+	// from the description budget before the body is fitted, so a long body
+	// truncates but the link never disappears.
+	budget := min(discordDescriptionMax, discordEmbedTotalMax-used)
+	link := ""
+	if trackedURL != "" {
+		link = fmt.Sprintf("\n\nTracked: <%s>", trackedURL)
+	}
+	switch {
+	case link == "":
+		embed.Description = fit(embed.Description, budget)
+	case textLen(link) >= budget:
+		// An implausibly long URL: keep the budget and as much of the link
+		// as fits; the narrative would only push the link out entirely.
+		embed.Description = fit(link, budget)
+	default:
+		embed.Description = fit(embed.Description, budget-textLen(link)) + link
+	}
+	return embed
+}
+
+// textLen counts s the way Discord meters embed text: UTF-16 code units, so an
+// astral-plane character such as an emoji costs 2. Counting code points
+// instead would under-count emoji-heavy alert text and still let a digest
+// Discord rejects go out.
+func textLen(s string) int {
+	units := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			units++
+		}
+		units++
+	}
+	return units
+}
+
 // Deliver posts one incident to the digest webhook. When GitHub is configured
 // and the triage is actionable it is also mirrored to a GitHub issue keyed on
 // the group signature; see issue #14. Unset env keeps the original chat-only
@@ -940,21 +1081,9 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 
 	desc := discordDescription(cfg, r)
 
-	// A GitHub issue now mirrors this incident; link the chat digest to that
-	// durable record so the operator can click through. The link has to be
-	// inside the embed — it is the only thing marshaled into the wire body —
-	// so it is folded into the description before the embed is built. The
-	// base body is clamped to 3900 to keep headroom under Discord's 4096
-	// description cap for the appended link, then the combined string is
-	// clamped again so a long URL can never overflow it (issue #168).
-	description := clamp(desc, 3900)
-	if ghAction.URL != "" {
-		description = clamp(description+fmt.Sprintf("\n\nTracked: <%s>", ghAction.URL), 4096)
-	}
-
 	embed := discordEmbed{
 		Title:       r.Group.Title(),
-		Description: description,
+		Description: desc,
 		Color:       severityColor(r.Group.Severity()),
 	}
 	seen := "first time seen"
@@ -966,12 +1095,13 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 		embed.Footer.Text = cluster + " · " + embed.Footer.Text
 	}
 	for _, p := range r.Enrichment.RepoPaths {
-		embed.Fields = append(embed.Fields, struct {
-			Name   string `json:"name"`
-			Value  string `json:"value"`
-			Inline bool   `json:"inline"`
-		}{Name: "Source", Value: untrusted(p), Inline: false})
+		embed.Fields = append(embed.Fields, discordField{Name: "Source", Value: untrusted(p)})
 	}
+	// Every Discord limit applies to the assembled embed as it goes out the
+	// door, not to the pieces as they were built: alert-controlled text
+	// (group title, Source field values, field count) and the 6000-character
+	// aggregate all have to hold at once.
+	embed = budgetEmbed(embed, ghAction.URL)
 
 	body, err := json.Marshal(map[string]any{"embeds": []discordEmbed{embed}})
 	if err != nil {
