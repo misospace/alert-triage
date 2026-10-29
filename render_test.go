@@ -49,6 +49,44 @@ func TestEvidenceOmitsBoilerplateLabels(t *testing.T) {
 	}
 }
 
+// TestEvidenceRedactsCredentialsInAlertText (#269): the Alerts lines copy raw
+// annotation and label text into the prompt, the GitHub issue body and the
+// PR body. Pod logs were already stripped at the fetch; alert metadata had no
+// such gate, so a credential in a description reached the durable record even
+// though the payload section was sanitized.
+func TestEvidenceRedactsCredentialsInAlertText(t *testing.T) {
+	a := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "BackupFailed",
+			// credential-shaped value under a fixed key: the alert line
+			// renders severity and name straight, without the map walk.
+			"severity": "critical token=synthetic-evidence-sev",
+			"password": "synthetic-label-secret",
+		},
+		Annotations: map[string]string{
+			"description": `backup failed: {"token": "synthetic-json-token"}`,
+		},
+	}
+	out := renderEvidence(Report{
+		Group:      Group{Key: "BackupFailed", Alerts: []Alert{a}},
+		Enrichment: Enrichment{Scope: "cluster-wide"},
+	})
+	for _, secret := range []string{"synthetic-label-secret", "synthetic-json-token", "synthetic-evidence-sev"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("secret %q leaked into evidence:\n%s", secret, out)
+		}
+	}
+	// The key stays visible and the alert name survives, so the redaction is
+	// auditable and the digest still says which alert fired.
+	if !strings.Contains(out, "password=[REDACTED]") {
+		t.Errorf("credential key should remain with a redaction marker:\n%s", out)
+	}
+	if !strings.Contains(out, "BackupFailed") {
+		t.Errorf("alert name must survive redaction:\n%s", out)
+	}
+}
+
 func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})

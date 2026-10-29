@@ -2992,6 +2992,47 @@ func stripSecrets(s string) string {
 	return s
 }
 
+// safeMetadataValue renders one alert label or annotation value for a
+// model-visible or durable surface: pod logs are already stripped at the
+// fetch, but alert metadata reaches the digest, the prompt, the GitHub issue
+// and the PR body verbatim unless a renderer redacts it (issue #269).
+//
+// A credential whose KEY names it ("password": "hunter2") matches no value
+// pattern, so values under a credential-shaped key are replaced whole. The
+// key itself stays so the operator can see what was stripped.
+func safeMetadataValue(k, v string) string {
+	if isCredentialKey(k) {
+		return "[REDACTED]"
+	}
+	return stripSecrets(v)
+}
+
+// credentialKeyFragments are key-name fragments that declare a value to be a
+// credential: a label or annotation literally named password/token/secret
+// carries a secret even when the value alone matches none of stripSecrets'
+// patterns. Matching is on the lowercased name with separators removed so
+// api_key, api-key and apiKey read alike. Like the JSON-key pattern in
+// secretPatterns this over-redacts innocent names ("note_password"); fail-safe
+// beats leak on a durable record. "key" alone is not a fragment — it appears
+// in unrelated names — while the compound forms (apikey, accesskey,
+// privatekey) are unambiguous.
+var credentialKeyFragments = []string{
+	"password", "passwd", "pwd", "token", "bearer", "secret",
+	"credential", "apikey", "accesskey", "privatekey", "authorization",
+}
+
+var credentialKeySeparator = strings.NewReplacer("_", "", "-", "", ".", "", " ", "")
+
+func isCredentialKey(k string) bool {
+	n := credentialKeySeparator.Replace(strings.ToLower(k))
+	for _, frag := range credentialKeyFragments {
+		if strings.Contains(n, frag) {
+			return true
+		}
+	}
+	return false
+}
+
 // podLogMode picks the log stream that holds the failure evidence for one
 // container, or "" when no log stream is worth fetching:
 //
