@@ -443,7 +443,10 @@ func renderEvidence(r Report) string {
 	b.WriteString("\nAlerts:\n")
 	b.WriteString(untrustedBegin + "\n")
 	for _, a := range r.Group.Alerts {
-		fmt.Fprintf(&b, "- [%s] %s", untrusted(a.severity()), untrusted(a.name()))
+		// severity and name are fixed-key label values; untrusted() flattens
+		// their shape but redacts nothing, so the keyword engine runs first
+		// (#269 review).
+		fmt.Fprintf(&b, "- [%s] %s", untrusted(stripSecrets(a.severity())), untrusted(stripSecrets(a.name())))
 		if s := firstAnnotation(a); s != "" {
 			fmt.Fprintf(&b, ": %s", untrusted(s))
 		}
@@ -738,7 +741,10 @@ var boilerplateLabels = map[string]bool{
 
 // contextLabels renders the labels that help interpret an alert. Without these
 // the model sees only the alert name, and alert names use the vocabulary of
-// whatever emitted them rather than Kubernetes'.
+// whatever emitted them rather than Kubernetes'. Values pass through
+// safeMetadataValue: this text is quoted into the prompt, the GitHub issue and
+// the PR body, and pod logs taught the same rule at fetch time — the model and
+// a durable record have no need of a credential (issue #269).
 func contextLabels(a Alert) string {
 	keys := make([]string, 0, len(a.Labels))
 	for k, v := range a.Labels {
@@ -750,15 +756,18 @@ func contextLabels(a Alert) string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, k+"="+a.Labels[k])
+		parts = append(parts, k+"="+safeMetadataValue(k, a.Labels[k]))
 	}
 	return strings.Join(parts, " ")
 }
 
+// firstAnnotation picks the annotation most likely to describe the failure.
+// Redaction runs before truncation: truncate alone would keep the first 200
+// characters of a long credential and ship them anyway.
 func firstAnnotation(a Alert) string {
 	for _, k := range []string{"summary", "message", "description"} {
 		if v := strings.TrimSpace(a.Annotations[k]); v != "" {
-			return truncate(v, 200)
+			return truncate(safeMetadataValue(k, v), 200)
 		}
 	}
 	return ""

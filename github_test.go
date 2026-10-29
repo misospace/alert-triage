@@ -305,6 +305,119 @@ func TestRenderIssueBodyPayloadDetails(t *testing.T) {
 	}
 }
 
+// TestRenderIssueBodyRedactsPayloadCredentials is the #269 regression: the raw
+// payload is the one place alert metadata reaches the durable issue verbatim,
+// so every credential shape the log redactor knows must not survive into it.
+func TestRenderIssueBodyRedactsPayloadCredentials(t *testing.T) {
+	r := Report{
+		Cfg: &Config{},
+		Group: Group{Key: "AuditExample", Alerts: []Alert{{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "AuditExample",
+				"severity":  "critical",
+				"password":  "synthetic-label-password",
+				"namespace": "backup-db password=synthetic-ns-secret",
+			},
+			Annotations: map[string]string{
+				"description":  "connection failed with password=synthetic-description-secret",
+				"headers":      "Authorization: Bearer 0f1e2d3c4b5a6978",
+				"backend_json": `{"token": "synthetic-quoted-token"}`,
+			},
+		}}},
+	}
+	body := renderIssueBody(r, r.Group.Signature())
+	for _, secret := range []string{
+		"synthetic-label-password",
+		"synthetic-ns-secret",
+		"synthetic-description-secret",
+		"0f1e2d3c4b5a6978",
+		"synthetic-quoted-token",
+	} {
+		if strings.Contains(body, secret) {
+			t.Errorf("secret %q leaked into issue body:\n%s", secret, body)
+		}
+	}
+
+	// The payload section must stay valid JSON and keep the non-sensitive
+	// metadata operators triage from.
+	fence := "```json\n"
+	i := strings.Index(body, fence)
+	if i < 0 {
+		t.Fatalf("body missing payload fence:\n%s", body)
+	}
+	rest := body[i+len(fence):]
+	j := strings.Index(rest, "\n```")
+	if j < 0 {
+		t.Fatalf("payload fence unterminated:\n%s", body)
+	}
+	var pv struct {
+		Group  string  `json:"group"`
+		Alerts []Alert `json:"alerts"`
+	}
+	if err := json.Unmarshal([]byte(rest[:j]), &pv); err != nil {
+		t.Fatalf("payload section is not valid JSON: %v\n%s", err, rest[:j])
+	}
+	if len(pv.Alerts) != 1 {
+		t.Fatalf("payload lost alerts: %+v", pv.Alerts)
+	}
+	got := pv.Alerts[0]
+	if got.Labels["alertname"] != "AuditExample" || got.Labels["severity"] != "critical" {
+		t.Errorf("non-sensitive labels not preserved: %v", got.Labels)
+	}
+	if !strings.Contains(got.Annotations["description"], "[REDACTED]") {
+		t.Errorf("description should carry the redaction marker, got %q", got.Annotations["description"])
+	}
+}
+
+// TestSanitizedAlertsDoesNotMutateOriginals guards the copy contract: the
+// same maps feed correlation, history, the prompt and the chat digest, and a
+// redaction leaking back into them would delete evidence from paths that
+// never had the GitHub leak risk.
+func TestSanitizedAlertsDoesNotMutateOriginals(t *testing.T) {
+	in := []Alert{
+		{
+			Labels:      map[string]string{"alertname": "M", "password": "synthetic-label-secret"},
+			Annotations: map[string]string{"description": "password=synthetic-desc-secret"},
+		},
+		{Labels: map[string]string{"alertname": "NilAnnos"}},
+	}
+	out := sanitizedAlerts(in)
+
+	if in[0].Labels["password"] != "synthetic-label-secret" {
+		t.Errorf("original labels mutated: %v", in[0].Labels)
+	}
+	if in[0].Annotations["description"] != "password=synthetic-desc-secret" {
+		t.Errorf("original annotations mutated: %v", in[0].Annotations)
+	}
+	if out[0].Labels["password"] != "[REDACTED]" {
+		t.Errorf("credential-keyed label not redacted: %v", out[0].Labels)
+	}
+	if out[0].Annotations["description"] != "[REDACTED]" {
+		t.Errorf("credential-shaped annotation value not redacted: %q", out[0].Annotations["description"])
+	}
+	if out[1].Annotations != nil {
+		t.Errorf("nil annotation map should stay nil, got %v", out[1].Annotations)
+	}
+}
+
+func TestIsCredentialKey(t *testing.T) {
+	secret := []string{"password", "Password", "db_password", "api-key", "API_KEY", "apiKey", "access_token", "secret", "client_secret", "credential", "authorization", "bearer", "private_key", "AWS_SECRET_ACCESS_KEY"}
+	for _, k := range secret {
+		if !isCredentialKey(k) {
+			t.Errorf("isCredentialKey(%q) = false, want true", k)
+		}
+	}
+	// Ordinary Alertmanager label names must survive: redacting these would
+	// gut the payload's triage value.
+	normal := []string{"alertname", "severity", "namespace", "pod", "instance", "job", "cluster", "node", "monitor_key_hash", "owner"}
+	for _, k := range normal {
+		if isCredentialKey(k) {
+			t.Errorf("isCredentialKey(%q) = true, want false", k)
+		}
+	}
+}
+
 func TestRenderCommentBody(t *testing.T) {
 	r := Report{Group: Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")}, PriorSeen: 3}
 	body := renderCommentBody(r)

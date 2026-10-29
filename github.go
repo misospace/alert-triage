@@ -261,7 +261,10 @@ func renderIssueBody(r Report, sig string) string {
 	b.WriteString("| Severity | Alert | Namespace | Since |\n")
 	b.WriteString("| --- | --- | --- | --- |\n")
 	for _, a := range r.Group.Alerts {
-		ns := a.namespace()
+		// The three cells read fixed label values, which bypass the payload's
+		// sanitized copies; the same keyword engine keeps a credential-shaped
+		// value in one of them out of the durable body (#269 review).
+		ns := stripSecrets(a.namespace())
 		if ns == "" {
 			ns = "—"
 		}
@@ -269,7 +272,7 @@ func renderIssueBody(r Report, sig string) string {
 		if !a.StartsAt.IsZero() {
 			since = a.StartsAt.UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(&b, "| %s | `%s` | %s | %s |\n", a.severity(), a.name(), ns, since)
+		fmt.Fprintf(&b, "| %s | `%s` | %s | %s |\n", stripSecrets(a.severity()), stripSecrets(a.name()), ns, since)
 	}
 	b.WriteString("\n")
 
@@ -312,13 +315,57 @@ func renderPayload(r Report) string {
 	pv := payloadView{
 		Group:  r.Group.Key,
 		Status: "firing",
-		Alerts: r.Group.Alerts,
+		Alerts: sanitizedAlerts(r.Group.Alerts),
 	}
 	b, err := json.MarshalIndent(pv, "", "  ")
 	if err != nil {
 		return ""
 	}
 	return string(b)
+}
+
+// sanitizedAlerts copies alerts with credential-bearing label and annotation
+// values redacted (issue #269). The issue is a durable record, so unlike the
+// chat digest it keeps everything the payload carries; without this pass a
+// description containing password=..., a Bearer header, or a JSON-quoted
+// token is copied into the issue verbatim even though pod and backend logs
+// are redacted.
+//
+// The originals must survive untouched: correlation, history, the model
+// prompt and the Discord digest all read the same maps, and redacting them
+// in place would delete evidence from paths where the leak was never the
+// risk. So every map is rebuilt rather than modified.
+func sanitizedAlerts(alerts []Alert) []Alert {
+	if alerts == nil {
+		// Preserve the serialized shape: a nil slice marshals as null, and an
+		// empty-but-non-nil one as []. Rebuilding only what exists keeps the
+		// payload byte-identical apart from redaction.
+		return nil
+	}
+	out := make([]Alert, len(alerts))
+	copy(out, alerts)
+	for i := range out {
+		if out[i].Labels != nil {
+			out[i].Labels = sanitizedMetadata(out[i].Labels)
+		}
+		if out[i].Annotations != nil {
+			out[i].Annotations = sanitizedMetadata(out[i].Annotations)
+		}
+	}
+	return out
+}
+
+// sanitizedMetadata copies m with every value passed through safeMetadataValue,
+// the same redaction the evidence renderers apply. Sanitizing per value rather
+// than the marshalled JSON keeps the payload valid: the keyword patterns end
+// in \S+, which on serialized JSON would swallow the closing quote of a
+// string and corrupt the document.
+func sanitizedMetadata(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = safeMetadataValue(k, v)
+	}
+	return out
 }
 
 // findOpenIssue lists open issues labelled alert-triage and returns the one
