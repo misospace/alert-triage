@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // Report is one correlated incident, ready to deliver.
@@ -944,25 +943,41 @@ func discordDescription(cfg *Config, r Report) string {
 // production always uses newGitHub.
 var newGitHubClient = newGitHub //nolint:gochecknoglobals
 
-// fit shortens s to at most n characters as Discord counts them (runes),
-// keeping the truncation marker inside the budget instead of appending it
-// past n the way clamp does, and cutting on rune boundaries so a truncated
-// multi-byte name still decodes.
+// fit shortens s to at most n characters as Discord meters them (see
+// textLen), keeping the truncation marker inside the budget instead of
+// appending it past n the way clamp does, and cutting on rune boundaries so
+// a truncated multi-byte name still decodes.
 func fit(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= n {
+	const marker = "..."
+	if textLen(s) <= n {
 		return s
 	}
-	const marker = "..."
 	if n <= len(marker) {
-		// No room for content and a marker; the budget wins. Only a
-		// caller with a limit of three characters or less can reach this.
-		return string(r[:n])
+		// No room for content plus a marker. Only a caller with a limit of
+		// three characters or less can reach this.
+		if n == len(marker) {
+			return marker
+		}
+		return ""
 	}
-	return string(r[:n-len(marker)]) + marker
+	budget := n - len(marker)
+	r := []rune(s)
+	keep, units := 0, 0
+	for _, c := range r {
+		w := 1
+		if c > 0xFFFF {
+			w = 2
+		}
+		if units+w > budget {
+			break
+		}
+		units += w
+		keep++
+	}
+	return string(r[:keep]) + marker
 }
 
 // budgetEmbed returns embed with every Discord limit enforced on the final
@@ -990,18 +1005,18 @@ func budgetEmbed(embed discordEmbed, trackedURL string) discordEmbed {
 	// more, so the field slice can never overrun the aggregate.
 	if len(embed.Fields) > 0 {
 		room := max(min(discordFieldsTotalMax,
-			discordEmbedTotalMax-runeLen(embed.Title)-runeLen(embed.Footer.Text)-discordDescriptionFloor), 0)
+			discordEmbedTotalMax-textLen(embed.Title)-textLen(embed.Footer.Text)-discordDescriptionFloor), 0)
 		share := min(discordFieldValueMax, room/len(embed.Fields))
 		for i, f := range embed.Fields {
 			f.Name = fit(f.Name, min(discordFieldNameMax, share))
-			f.Value = fit(f.Value, min(discordFieldValueMax, share-runeLen(f.Name)))
+			f.Value = fit(f.Value, min(discordFieldValueMax, share-textLen(f.Name)))
 			embed.Fields[i] = f
 		}
 	}
 
-	used := runeLen(embed.Title) + runeLen(embed.Footer.Text)
+	used := textLen(embed.Title) + textLen(embed.Footer.Text)
 	for _, f := range embed.Fields {
-		used += runeLen(f.Name) + runeLen(f.Value)
+		used += textLen(f.Name) + textLen(f.Value)
 	}
 
 	// A GitHub issue may mirror this incident, and the link to that durable
@@ -1017,17 +1032,30 @@ func budgetEmbed(embed discordEmbed, trackedURL string) discordEmbed {
 	switch {
 	case link == "":
 		embed.Description = fit(embed.Description, budget)
-	case runeLen(link) >= budget:
+	case textLen(link) >= budget:
 		// An implausibly long URL: keep the budget and as much of the link
 		// as fits; the narrative would only push the link out entirely.
 		embed.Description = fit(link, budget)
 	default:
-		embed.Description = fit(embed.Description, budget-runeLen(link)) + link
+		embed.Description = fit(embed.Description, budget-textLen(link)) + link
 	}
 	return embed
 }
 
-func runeLen(s string) int { return utf8.RuneCountInString(s) }
+// textLen counts s the way Discord meters embed text: UTF-16 code units, so an
+// astral-plane character such as an emoji costs 2. Counting code points
+// instead would under-count emoji-heavy alert text and still let a digest
+// Discord rejects go out.
+func textLen(s string) int {
+	units := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			units++
+		}
+		units++
+	}
+	return units
+}
 
 // Deliver posts one incident to the digest webhook. When GitHub is configured
 // and the triage is actionable it is also mirrored to a GitHub issue keyed on

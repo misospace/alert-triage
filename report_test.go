@@ -75,7 +75,8 @@ func TestDeliverClamp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify description is clamped to 3900 chars + "...".
+	// Verify the oversized narrative is truncated with the marker inside
+	// the budget, not appended past it (issue #270).
 	if !strings.Contains(receivedBody, "...") {
 		t.Error("expected '...' suffix in clamped description")
 	}
@@ -1741,30 +1742,30 @@ func captureDiscordEmbed(t *testing.T, cfg *Config, rpt Report) discordEmbed {
 // the decoded strings, with the aggregate summed over all embed text.
 func assertDiscordEmbedBudgets(t *testing.T, e discordEmbed) {
 	t.Helper()
-	total := runeLen(e.Title) + runeLen(e.Description) + runeLen(e.Footer.Text)
-	if n := runeLen(e.Title); n > discordTitleMax {
+	total := textLen(e.Title) + textLen(e.Description) + textLen(e.Footer.Text)
+	if n := textLen(e.Title); n > discordTitleMax {
 		t.Errorf("title is %d characters, limit %d", n, discordTitleMax)
 	}
-	if n := runeLen(e.Description); n > discordDescriptionMax {
+	if n := textLen(e.Description); n > discordDescriptionMax {
 		t.Errorf("description is %d characters, limit %d", n, discordDescriptionMax)
 	}
-	if n := runeLen(e.Footer.Text); n > discordFooterMax {
+	if n := textLen(e.Footer.Text); n > discordFooterMax {
 		t.Errorf("footer is %d characters, limit %d", n, discordFooterMax)
 	}
 	if len(e.Fields) > discordFieldsMax {
 		t.Errorf("%d fields, limit %d", len(e.Fields), discordFieldsMax)
 	}
 	for i, f := range e.Fields {
-		if n := runeLen(f.Name); n > discordFieldNameMax {
+		if n := textLen(f.Name); n > discordFieldNameMax {
 			t.Errorf("field %d name is %d characters, limit %d", i, n, discordFieldNameMax)
 		}
-		if n := runeLen(f.Value); n > discordFieldValueMax {
+		if n := textLen(f.Value); n > discordFieldValueMax {
 			t.Errorf("field %d value is %d characters, limit %d", i, n, discordFieldValueMax)
 		}
 		if !utf8.ValidString(f.Name) || !utf8.ValidString(f.Value) {
 			t.Errorf("field %d is not valid UTF-8 after truncation", i)
 		}
-		total += runeLen(f.Name) + runeLen(f.Value)
+		total += textLen(f.Name) + textLen(f.Value)
 	}
 	if total > discordEmbedTotalMax {
 		t.Errorf("embed aggregate is %d characters, limit %d", total, discordEmbedTotalMax)
@@ -1781,18 +1782,37 @@ func TestFitKeepsBudgetAndMarkerInside(t *testing.T) {
 		t.Errorf("fit of a fitting string = %q, want unchanged", got)
 	}
 	got := fit(strings.Repeat("x", 5000), 4096)
-	if runeLen(got) != 4096 || !strings.HasSuffix(got, "...") {
-		t.Errorf("fit(long, 4096): %d runes, suffix %q; want 4096 runes ending in marker", runeLen(got), got[runeLen(got)-3:])
+	if textLen(got) != 4096 || !strings.HasSuffix(got, "...") {
+		t.Errorf("fit(long, 4096): %d runes, suffix %q; want 4096 runes ending in marker", textLen(got), got[textLen(got)-3:])
 	}
 	long := strings.Repeat("målsikt🚨", 1000)
-	if got := fit(long, 101); !utf8.ValidString(got) || runeLen(got) > 101 {
+	if got := fit(long, 101); !utf8.ValidString(got) || textLen(got) > 101 {
 		t.Errorf("fit cut a rune in half or overran: %q", got)
 	}
 	if got := fit("x", 0); got != "" {
 		t.Errorf("fit(x, 0) = %q, want empty", got)
 	}
-	if got := fit("abcdef", 2); runeLen(got) > 2 {
-		t.Errorf("fit(abcdef, 2) = %q, want at most 2 runes", got)
+	if got := fit("abcdef", 2); textLen(got) > 2 {
+		t.Errorf("fit(abcdef, 2) = %q, want at most 2 units", got)
+	}
+	if got := fit(strings.Repeat("x", 10), 3); got != "..." {
+		t.Errorf("fit(long, 3) = %q, want the marker alone", got)
+	}
+	// Astral-plane characters cost two UTF-16 units, the way Discord
+	// meters them; packing must stop at the unit budget, not the rune count.
+	if got := fit(strings.Repeat("🚨", 100), 5); textLen(got) > 5 || !utf8.ValidString(got) {
+		t.Errorf("fit(astral, 5) = %q (%d units), want valid UTF-8 within 5", got, textLen(got))
+	}
+}
+
+// A URL long enough to fill the description on its own must still leave the
+// delivered embed within every budget, keeping as much of the link as fits.
+func TestBudgetEmbedKeepsBudgetWithImplausibleURL(t *testing.T) {
+	embed := discordEmbed{Title: "t", Description: strings.Repeat("d", 4000)}
+	got := budgetEmbed(embed, "https://example.com/"+strings.Repeat("u", 7000))
+	assertDiscordEmbedBudgets(t, got)
+	if !strings.Contains(got.Description, "Tracked: <https://example.com/u") {
+		t.Errorf("description should carry the link head, got %q", got.Description[:min(60, len(got.Description))])
 	}
 }
 
@@ -1842,6 +1862,25 @@ func TestDeliverEnforcesDiscordEmbedLimits(t *testing.T) {
 				t.Errorf("overflow fields should be counted into a summary, last field is %q", last)
 			}
 		}},
+		{"exactly 26 source paths", Report{
+			Group:      Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": "GitOpsDrift"}}}},
+			Enrichment: Enrichment{RepoPaths: manyLongPaths[:26]},
+		}, func(t *testing.T, e discordEmbed) {
+			if len(e.Fields) != discordFieldsMax {
+				t.Fatalf("want exactly %d fields, got %d", discordFieldsMax, len(e.Fields))
+			}
+			if last := e.Fields[len(e.Fields)-1].Value; !strings.Contains(last, "...and 2 more") {
+				t.Errorf("26 paths should summarise two omitted, last field is %q", last)
+			}
+		}},
+		{"oversized cluster label in footer", Report{
+			Group: Group{Key: "sig-1", Cluster: strings.Repeat("c", 3000), Alerts: []Alert{{Labels: map[string]string{"alertname": "HighCPU"}}}},
+		}, func(t *testing.T, e discordEmbed) {
+			if !strings.HasSuffix(e.Footer.Text, "...") {
+				t.Errorf("truncated footer lacks the marker")
+			}
+		}},
+		{"astral-heavy alert name fits Discord's metering", named(strings.Repeat("🚨", 600)), nil},
 		{"everything oversized at once", Report{
 			Group:      Group{Key: "sig-1", Alerts: []Alert{{Labels: map[string]string{"alertname": longName}}}},
 			Enrichment: Enrichment{RepoPaths: manyLongPaths},
