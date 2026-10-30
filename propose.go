@@ -19,8 +19,16 @@ package main
 //     fix site is a file).
 //  4. A relative file path must be attached. Without it there is nothing to
 //     anchor the change.
-//  5. The file must parse as a YAML document and round-trip with only the
-//     intended scalar changed.
+//  5. The file must parse as a YAML document, and the new value must be
+//     replaceable at exactly the position the parser recorded for the scalar,
+//     so every other byte of the file — indentation, quoting, comments,
+//     further documents — is preserved as-is. Re-encoding the parsed document
+//     instead normalises unrelated formatting (a four-space manifest comes
+//     back two-space indented), and a diff carrying only the first changed
+//     region then drops the memory change while still applying cleanly,
+//     which is how #274 reached a purported memory fix with no memory
+//     increase. If the emitted patch would not reproduce the intended
+//     content under the write arm's own applier, no proposal is shown.
 //  6. The value must parse as a Kubernetes quantity and the new value must
 //     stay within a bounded multiplier of the old one.
 //
@@ -33,6 +41,7 @@ import (
 	"log"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -190,26 +199,153 @@ func buildMemoryPatch(relPath, original, container string) (string, bool) {
 		return "", false
 	}
 
-	target.child.Value = encoded
-
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(&doc); err != nil {
-		log.Printf("propose: dropped, rewrite failed for %s: %v", cleanPath, err)
+	patched, ok := replaceScalarValue(original, target.child.Line, target.child.Column, target.child.Value, encoded)
+	if !ok {
+		// The scalar did not reappear in the source text exactly as it
+		// parsed (a tag, a block scalar, an escape, a byte at the recorded
+		// column that is not the value): refuse rather than fall back to a
+		// re-encode, whose scattered formatting differences the single-hunk
+		// diff cannot represent (#274).
+		log.Printf("propose: dropped, memory scalar at %d:%d is not replaceable in place for %s",
+			target.child.Line, target.child.Column, cleanPath)
 		return "", false
 	}
-	if err := enc.Close(); err != nil {
-		log.Printf("propose: dropped, encoder close failed for %s: %v", cleanPath, err)
+	if !patchCarriesMemoryChange(patched, encoded, target.container) {
+		log.Printf("propose: dropped, patched content does not carry the intended change for %s", cleanPath)
 		return "", false
 	}
 
-	diff, err := unifiedDiff(cleanPath, original, buf.String())
+	diff, err := unifiedDiff(cleanPath, original, patched)
 	if err != nil {
 		log.Printf("propose: dropped, diff failed for %s: %v", cleanPath, err)
 		return "", false
 	}
+	// The write arm commits applyDiff(content, diff), not the content verified
+	// above. Prove the emitted patch reproduces exactly that content under
+	// the same applier before anyone is allowed to ship it. This also refuses
+	// files whose trailing newlines applyDiff would normalise (more than one
+	// final break): the committed content would differ from the original in
+	// bytes the proposal never mentions, so no patch is shipped instead.
+	if applied, ok := applyDiff(original, diff); !ok || applied != patched {
+		log.Printf("propose: dropped, emitted patch does not reproduce patched content for %s", cleanPath)
+		return "", false
+	}
 	return diff, true
+}
+
+// replaceScalarValue rewrites one scalar token in the source text at the
+// line:column the parser recorded for it, returning the new content. This is
+// why the patch can promise "everything except the memory value is untouched"
+// even for files whose formatting yaml.v3 would not reproduce: no re-encode
+// happens, so nothing outside the token can move. Anything that cannot be
+// confined to the token itself — a tag between column and value, a block
+// scalar, an escaped quote, trailing text that is not a comment or flow
+// terminator — fails closed, because a diff we cannot prove is exactly the
+// intended change is worse than no diff.
+func replaceScalarValue(original string, line, column int, oldValue, newValue string) (string, bool) {
+	if oldValue == "" || newValue == "" {
+		return "", false
+	}
+	lines := strings.Split(original, "\n")
+	if line < 1 || line > len(lines) {
+		return "", false
+	}
+	text := lines[line-1]
+	// yaml.v3 counts columns in runes; text is indexed in bytes. Landing on
+	// the wrong byte would silently reject a valid line carrying multi-byte
+	// characters before the token (reachable in flow style).
+	if column < 1 {
+		return "", false
+	}
+	start := 0
+	for r := 1; r < column && start < len(text); r++ {
+		_, width := utf8.DecodeRuneInString(text[start:])
+		start += width
+	}
+	if start >= len(text) {
+		return "", false
+	}
+	rest0 := text[start:]
+
+	var token, rest string
+	switch {
+	case strings.HasPrefix(rest0, oldValue):
+		token, rest = newValue, rest0[len(oldValue):]
+	case strings.HasPrefix(rest0, `"`), strings.HasPrefix(rest0, "'"):
+		quote := rest0[0]
+		end := closingQuote(rest0, quote)
+		if end < 0 {
+			return "", false
+		}
+		inner := rest0[1 : end-1]
+		if quote == '"' && strings.Contains(inner, `\`) {
+			// An escaped double quote decodes to text we cannot re-derive
+			// token-safe from the raw bytes.
+			return "", false
+		}
+		if quote == '\'' {
+			inner = strings.ReplaceAll(inner, "''", "'")
+		}
+		if inner != oldValue {
+			return "", false
+		}
+		token, rest = string(quote)+newValue+string(quote), rest0[end:]
+	default:
+		return "", false
+	}
+	if !scalarTokenEndIsBoundary(rest) {
+		return "", false
+	}
+
+	lines[line-1] = text[:start] + token + rest
+	return strings.Join(lines, "\n"), true
+}
+
+// closingQuote returns the index just past the matching close quote of a
+// quoted scalar starting at rest[0], or -1 when no closing quote exists on
+// that line.
+func closingQuote(rest string, quote byte) int {
+	for i := 1; i < len(rest); i++ {
+		switch {
+		case quote == '"' && rest[i] == '\\':
+			i++ // an escaped character cannot close the quote
+		case rest[i] == quote:
+			if quote == '\'' && i+1 < len(rest) && rest[i+1] == '\'' {
+				i++ // a doubled '' is an escaped quote, not the close
+				continue
+			}
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// scalarTokenEndIsBoundary reports whether only whitespace, a comment, a flow
+// collection terminator, or the carriage return of a CRLF line follows the
+// value token on its line — never more scalar text, which would mean the
+// recorded column did not line up with the value as parsed.
+func scalarTokenEndIsBoundary(rest string) bool {
+	trimmed := strings.TrimLeft(rest, " \t")
+	if trimmed == "" {
+		return true
+	}
+	switch trimmed[0] {
+	case '#', ',', ']', '}', '\r':
+		return true
+	}
+	return false
+}
+
+// patchCarriesMemoryChange re-parses the patched content and requires the
+// memory target chosen for the same container to hold the new value, so the
+// change provably landed where it was intended and the document still parses.
+func patchCarriesMemoryChange(patched, encoded, container string) bool {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(patched), &doc); err != nil {
+		return false
+	}
+	target := locateMemoryTarget(&doc, container)
+	return target != nil && target.child.Value == encoded && target.container == container
 }
 
 // rootNode strips the DocumentNode wrapper that yaml.Unmarshal produces.
