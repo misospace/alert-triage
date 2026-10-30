@@ -4,6 +4,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 const multiContainerManifest = `apiVersion: apps/v1
@@ -369,6 +371,231 @@ func TestProposeRefusesMemoryThatOverflowsOnDecode(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
 	if diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest); diff != "" {
 		t.Fatalf("expected no proposal when the value overflows to infinity, got %q", diff)
+	}
+}
+
+// fourSpaceManifest is a valid manifest whose indentation differs from the
+// two-space form yaml.v3 re-encodes to. Every indented line — before and
+// after the memory scalar — is a difference against the re-encoded text, so
+// a generator that emits only the first changed region produces a
+// formatting-only patch that applies cleanly with no memory increase (#274).
+const fourSpaceManifest = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: web
+spec:
+    replicas: 3
+    template:
+        spec:
+            containers:
+                - name: api
+                  image: ghcr.io/example/api:1.2.3
+                  resources:
+                      limits:
+                          cpu: 250m
+                          memory: 64Mi
+                      requests:
+                          cpu: 100m
+                          memory: 64Mi
+                - name: sidecar
+                  image: ghcr.io/example/sidecar:9.9.9
+                  resources:
+                      limits:
+                          cpu: 100m
+                          memory: 32Mi
+`
+
+// applyProposed applies a proposal's own diff the way the PR write arm does.
+func applyProposed(t *testing.T, manifest, diff string) string {
+	t.Helper()
+	patched, ok := applyDiff(manifest, diff)
+	if !ok {
+		t.Fatalf("applyDiff rejected the emitted diff:\n%s", diff)
+	}
+	return patched
+}
+
+// assertOneChangedLine requires patched to differ from original on exactly
+// one line — every other byte, including indentation, quoting, comments and
+// any further document, must survive untouched — and returns that line.
+func assertOneChangedLine(t *testing.T, original, patched string) (int, []string) {
+	t.Helper()
+	o := strings.Split(original, "\n")
+	p := strings.Split(patched, "\n")
+	if len(o) != len(p) {
+		t.Fatalf("patched has %d lines, original has %d", len(p), len(o))
+	}
+	changed := -1
+	for i := range o {
+		if o[i] != p[i] {
+			if changed >= 0 {
+				t.Fatalf("more than one line changed:\nline %d: %q -> %q\nline %d: %q -> %q",
+					changed, o[changed], p[changed], i, o[i], p[i])
+			}
+			changed = i
+		}
+	}
+	if changed < 0 {
+		t.Fatal("patched content is identical to the original")
+	}
+	return changed, p
+}
+
+// containerMemory reads spec.template.spec.containers[<name>].resources.<block>.memory.
+func containerMemory(t *testing.T, manifest, container, block string) string {
+	t.Helper()
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(manifest), &root); err != nil {
+		t.Fatalf("manifest does not parse: %v", err)
+	}
+	podSpec, _ := root["spec"].(map[string]any)
+	tpl, _ := podSpec["template"].(map[string]any)
+	tplSpec, _ := tpl["spec"].(map[string]any)
+	list, _ := tplSpec["containers"].([]any)
+	for _, c := range list {
+		cm, _ := c.(map[string]any)
+		if cm["name"] != container {
+			continue
+		}
+		res, _ := cm["resources"].(map[string]any)
+		blk, _ := res[block].(map[string]any)
+		m, _ := blk["memory"].(string)
+		return m
+	}
+	return ""
+}
+
+// The #274 regression: a four-space manifest used to yield a nonempty
+// formatting-only diff (the first difference is metadata.name, far above the
+// memory field) that applyDiff accepted, so the write arm could open a
+// "memory fix" PR that changed no memory. Applying the proposal must now
+// raise the api limit while leaving every other line byte-identical.
+func TestProposeRaisesMemoryWhenReencodingWouldReshuffleFormatting(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "apps/web.yaml", fourSpaceManifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal for a four-space manifest")
+	}
+	patched := applyProposed(t, fourSpaceManifest, diff)
+	changed, lines := assertOneChangedLine(t, fourSpaceManifest, patched)
+	if !strings.Contains(lines[changed], "memory: 128Mi") {
+		t.Fatalf("the single changed line is not the memory increase: %q", lines[changed])
+	}
+	if got := containerMemory(t, patched, "api", "limits"); got != "128Mi" {
+		t.Errorf("api limits.memory = %q, want 128Mi", got)
+	}
+	if got := containerMemory(t, patched, "api", "requests"); got != "64Mi" {
+		t.Errorf("api requests.memory = %q, want 64Mi untouched", got)
+	}
+	if got := containerMemory(t, patched, "sidecar", "limits"); got != "32Mi" {
+		t.Errorf("sidecar limits.memory = %q, want 32Mi untouched", got)
+	}
+}
+
+// Separated differences before and after the target scalar, this time with
+// the target itself quoted and carrying a trailing comment: the rewrite must
+// keep the quoting style and the comment and raise only the value.
+func TestProposeRaisesQuotedMemoryWithForeignFormatting(t *testing.T) {
+	manifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: web
+spec:
+    template:
+        spec:
+            containers:
+                - name: api
+                  resources:
+                      limits:
+                          memory: "64Mi" # lowered during the drill
+                      requests:
+                          memory: '64Mi'
+`
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "apps/web.yaml", manifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal")
+	}
+	patched := applyProposed(t, manifest, diff)
+	changed, lines := assertOneChangedLine(t, manifest, patched)
+	if want := `                          memory: "128Mi" # lowered during the drill`; lines[changed] != want {
+		t.Fatalf("changed line = %q, want %q", lines[changed], want)
+	}
+	if got := containerMemory(t, patched, "api", "requests"); got != "64Mi" {
+		t.Errorf("api requests.memory = %q, want 64Mi untouched", got)
+	}
+}
+
+// A Kubernetes manifest may carry several YAML documents; the proposal may
+// only rewrite the memory scalar in the first and must leave every later
+// document byte-identical rather than dropping them the way a re-encode of
+// the first parsed document would.
+func TestProposePreservesAdditionalDocuments(t *testing.T) {
+	manifest := multiContainerManifest + "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n    app: web\n"
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal")
+	}
+	patched := applyProposed(t, manifest, diff)
+	changed, lines := assertOneChangedLine(t, manifest, patched)
+	if !strings.Contains(lines[changed], "memory: 128Mi") {
+		t.Fatalf("the single changed line is not the memory increase: %q", lines[changed])
+	}
+	if !strings.Contains(patched, "kind: Service") {
+		t.Fatalf("the second document was not preserved:\n%s", patched)
+	}
+}
+
+// CRLF line endings must survive in place: the rewrite is line-local, so a
+// CRLF manifest keeps its carriage returns and still gets the bump.
+func TestProposeRaisesMemoryInCRLFManifest(t *testing.T) {
+	manifest := strings.ReplaceAll(multiContainerManifest, "\n", "\r\n")
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal for a CRLF manifest")
+	}
+	patched := applyProposed(t, manifest, diff)
+	changed, lines := assertOneChangedLine(t, manifest, patched)
+	if !strings.Contains(lines[changed], "memory: 128Mi") {
+		t.Fatalf("the single changed line is not the memory increase: %q", lines[changed])
+	}
+	if !strings.Contains(patched, "\r\n") {
+		t.Fatalf("CRLF endings were not preserved:\n%q", patched)
+	}
+}
+
+// Scalars whose source text cannot be proven equal to the parsed value at
+// the recorded position — a tag, a block scalar, an alias — are refused
+// outright instead of being rewritten or re-encoded (#274's fail-closed
+// branch: no diff rather than a wrong one).
+func TestProposeRefusesScalarItCannotRewriteInPlace(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	cases := map[string]string{
+		"tagged scalar": strings.Replace(multiContainerManifest,
+			"memory: 64Mi", "memory: !!str 64Mi", 1),
+		"block scalar": strings.Replace(multiContainerManifest,
+			"memory: 64Mi", "memory: |-\n                64Mi", 1),
+		"alias value": `defaults: &defaultmem 64Mi
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            limits:
+              memory: *defaultmem
+`,
+	}
+	for name, manifest := range cases {
+		if got := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest); got != "" {
+			t.Errorf("%s: expected no proposal, got %q", name, got)
+		}
 	}
 }
 
