@@ -4,6 +4,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 const multiContainerManifest = `apiVersion: apps/v1
@@ -36,27 +38,183 @@ spec:
 `
 
 // oomAlerts is a minimal group of alerts that passes the memory-pressure
-// gate: one OOMKilled alert.
+// gate: one OOMKilled alert naming the api container.
 func oomAlerts() []Alert {
-	return []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}}
+	return oomAlertsFor("api")
+}
+
+func oomAlertsFor(container string) []Alert {
+	return []Alert{{Labels: map[string]string{
+		"alertname": "OOMKilled", "severity": "warning", "container": container,
+	}}}
+}
+
+// reversedContainerManifest is multiContainerManifest with the containers
+// swapped, so "first container with resources" and "the sidecar" disagree.
+const reversedContainerManifest = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: sidecar
+          image: ghcr.io/example/sidecar:9.9.9
+          resources:
+            limits:
+              cpu: 100m
+              memory: 32Mi
+            requests:
+              cpu: 50m
+              memory: 32Mi
+        - name: api
+          image: ghcr.io/example/api:1.2.3
+          resources:
+            limits:
+              cpu: 250m
+              memory: 64Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+`
+
+// patchedLimitsMemory applies a Propose diff and returns each container's
+// limits.memory from the result, so a test can prove which container — and
+// only that container — was raised.
+func patchedLimitsMemory(t *testing.T, original, diff string) map[string]string {
+	t.Helper()
+	patched, ok := applyDiff(original, diff)
+	if !ok {
+		t.Fatalf("applyDiff failed on a Propose diff:\n%s", diff)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(patched), &doc); err != nil {
+		t.Fatalf("patched manifest does not parse: %v", err)
+	}
+	out := map[string]string{}
+	for _, c := range findContainers(rootNode(&doc)) {
+		mem := childByKey(childByKey(childByKey(c, "resources"), "limits"), "memory")
+		if mem == nil || mem.Kind != yaml.ScalarNode {
+			t.Fatalf("container %q has no limits.memory after patching:\n%s", scalarOf(c, "name"), patched)
+		}
+		out[scalarOf(c, "name")] = mem.Value
+	}
+	return out
 }
 
 func TestProposeRaisesOnlyTheOomKilledContainer(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	diff := Propose(oomAlerts(), triage, "k8s/web.yaml", multiContainerManifest)
+	diff := Propose(oomAlertsFor("api"), triage, "k8s/web.yaml", multiContainerManifest)
 	if diff == "" {
 		t.Fatalf("expected a non-empty diff")
 	}
-	if !contains(diff, "api") {
-		t.Fatalf("diff did not mention the api container; got %q", diff)
+	got := patchedLimitsMemory(t, multiContainerManifest, diff)
+	if got["api"] != "128Mi" {
+		t.Errorf("api memory = %q; want 128Mi", got["api"])
 	}
-	if contains(diff, "sidecar: 64Mi") {
-		// The proposal must not bump the sidecar's identical 32Mi block.
-		t.Fatalf("diff touched the sidecar block; got %q", diff)
+	if got["sidecar"] != "32Mi" {
+		t.Errorf("sidecar memory = %q; want the untouched 32Mi", got["sidecar"])
 	}
-	// The proposed value must exceed the original 64Mi for the api container.
-	if !contains(diff, "128Mi") {
-		t.Fatalf("diff did not raise api memory; got %q", diff)
+}
+
+// An OOM naming the sidecar must raise the sidecar, not the first container
+// with resources (#273). The reversed manifest makes the two orders disagree.
+func TestProposeRaisesSidecarNamedByAlert(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	for _, manifest := range []string{multiContainerManifest, reversedContainerManifest} {
+		diff := Propose(oomAlertsFor("sidecar"), triage, "k8s/web.yaml", manifest)
+		if diff == "" {
+			t.Fatalf("expected a non-empty diff for the sidecar OOM")
+		}
+		got := patchedLimitsMemory(t, manifest, diff)
+		if got["sidecar"] != "64Mi" {
+			t.Errorf("sidecar memory = %q; want the raised 64Mi", got["sidecar"])
+		}
+		if got["api"] != "64Mi" {
+			t.Errorf("api memory = %q; want the untouched 64Mi", got["api"])
+		}
+	}
+}
+
+func TestProposeRaisesApiNamedByAlertInReversedManifest(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlertsFor("api"), triage, "k8s/web.yaml", reversedContainerManifest)
+	if diff == "" {
+		t.Fatalf("expected a non-empty diff for the api OOM")
+	}
+	got := patchedLimitsMemory(t, reversedContainerManifest, diff)
+	if got["api"] != "128Mi" {
+		t.Errorf("api memory = %q; want 128Mi", got["api"])
+	}
+	if got["sidecar"] != "32Mi" {
+		t.Errorf("sidecar memory = %q; want the untouched 32Mi", got["sidecar"])
+	}
+}
+
+// Without a container identity a multi-container manifest has no defensible
+// target; picking the first scalar is the wrong-container bug, so decline.
+func TestProposeRefusesMissingContainerIdentity(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	alerts := []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}}
+	if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal without a container identity, got %q", got)
+	}
+}
+
+// Two OOM alerts naming different containers do not identify one field to
+// raise; guessing between them would grow an allocation the OOM may not
+// justify.
+func TestProposeRefusesConflictingTargets(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	alerts := []Alert{
+		{Labels: map[string]string{"alertname": "OOMKilled", "container": "api"}},
+		{Labels: map[string]string{"alertname": "ContainerOOMKilled", "container": "sidecar"}},
+	}
+	if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal for conflicting container targets, got %q", got)
+	}
+}
+
+// An alert naming a container the manifest does not define is describing
+// something else; do not raise a stand-in.
+func TestProposeRefusesUnmatchedContainer(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	if got := Propose(oomAlertsFor("db"), triage, "k8s/web.yaml", multiContainerManifest); got != "" {
+		t.Fatalf("expected no proposal for an unmatched container, got %q", got)
+	}
+}
+
+// Duplicate container names make identity ambiguous even when one matches;
+// the manifest is too broken to guess about.
+func TestProposeRefusesDuplicateContainerNames(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	manifest := strings.Replace(multiContainerManifest,
+		"- name: sidecar", "- name: api", 1)
+	if got := Propose(oomAlertsFor("api"), triage, "k8s/web.yaml", manifest); got != "" {
+		t.Fatalf("expected no proposal when the target name matches twice, got %q", got)
+	}
+}
+
+// The single-container case: with only one container, manifest order cannot
+// lie, so a missing identity stays eligible, a matching one targets it, and
+// a mismatched one still declines.
+func TestProposeSingleContainerCases(t *testing.T) {
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	noIdentity := []Alert{{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}}}
+	diff := Propose(noIdentity, triage, "deploy/web.yaml", patchableManifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal for a single-container manifest without identity")
+	}
+	if got := patchedLimitsMemory(t, patchableManifest, diff); got["api"] != "128Mi" {
+		t.Errorf("api memory = %q; want 128Mi", got["api"])
+	}
+	if diff := Propose(oomAlertsFor("api"), triage, "deploy/web.yaml", patchableManifest); diff == "" {
+		t.Fatalf("expected a proposal for a matching single-container identity")
+	}
+	if got := Propose(oomAlertsFor("sidecar"), triage, "deploy/web.yaml", patchableManifest); got != "" {
+		t.Fatalf("expected no proposal for a mismatched single-container identity, got %q", got)
 	}
 }
 
@@ -106,7 +264,7 @@ func TestProposeAcceptsGroupContainingOOMKilled(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
 	alerts := []Alert{
 		{Labels: map[string]string{"alertname": "KubePodNotReady", "severity": "warning"}},
-		{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning"}},
+		{Labels: map[string]string{"alertname": "OOMKilled", "severity": "warning", "container": "api"}},
 	}
 	diff := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest)
 	if diff == "" {
@@ -117,7 +275,7 @@ func TestProposeAcceptsGroupContainingOOMKilled(t *testing.T) {
 // ContainerOOMKilled is the kube-state-metrics spelling of the same fault.
 func TestProposeAcceptsContainerOOMKilled(t *testing.T) {
 	triage := Triage{FixLocation: "git", Confidence: "high"}
-	alerts := []Alert{{Labels: map[string]string{"alertname": "ContainerOOMKilled", "severity": "warning"}}}
+	alerts := []Alert{{Labels: map[string]string{"alertname": "ContainerOOMKilled", "severity": "warning", "container": "api"}}}
 	diff := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest)
 	if diff == "" {
 		t.Fatalf("expected a proposal for ContainerOOMKilled")
@@ -132,7 +290,7 @@ func TestProposeAcceptsTerminatedReasonLabel(t *testing.T) {
 		"kube_pod_container_status_terminated_reason",
 		"kube_pod_container_status_last_terminated_reason",
 	} {
-		alerts := []Alert{{Labels: map[string]string{"alertname": "PodTerminated", k: "OOMKilled"}}}
+		alerts := []Alert{{Labels: map[string]string{"alertname": "PodTerminated", k: "OOMKilled", "container": "api"}}}
 		if got := Propose(alerts, triage, "k8s/web.yaml", multiContainerManifest); got == "" {
 			t.Fatalf("expected a proposal for %s=OOMKilled", k)
 		}
@@ -370,15 +528,4 @@ func TestProposeRefusesMemoryThatOverflowsOnDecode(t *testing.T) {
 	if diff := Propose(oomAlerts(), triage, "k8s/web.yaml", manifest); diff != "" {
 		t.Fatalf("expected no proposal when the value overflows to infinity, got %q", diff)
 	}
-}
-
-func contains(s, sub string) bool { return indexOf(s, sub) >= 0 }
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

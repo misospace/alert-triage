@@ -10,13 +10,18 @@ package main
 //     ContainerOOMKilled alert, or a terminated-reason label of OOMKilled).
 //     A memory bump is defensible only because a container was killed for
 //     memory; on any other alert the same triage is guesswork dressed as a fix.
-//  2. The triage must be high-confidence and point at git (or partial where the
+//  2. The memory field is chosen by the container the OOM alerts name, never
+//     by manifest order. In a multi-container manifest a missing, conflicting
+//     or unmatched container identity declines the proposal: raising the first
+//     container that happens to carry resources leaves the OOM cause untouched
+//     and grows an unrelated container's allocation (#273).
+//  3. The triage must be high-confidence and point at git (or partial where the
 //     fix site is a file).
-//  3. A relative file path must be attached. Without it there is nothing to
+//  4. A relative file path must be attached. Without it there is nothing to
 //     anchor the change.
-//  4. The file must parse as a YAML document and round-trip with only the
+//  5. The file must parse as a YAML document and round-trip with only the
 //     intended scalar changed.
-//  5. The value must parse as a Kubernetes quantity and the new value must
+//  6. The value must parse as a Kubernetes quantity and the new value must
 //     stay within a bounded multiplier of the old one.
 //
 // An empty return means no proposal is warranted; the report layer renders the
@@ -38,10 +43,16 @@ const maxMultiplier = 8.0
 // Propose returns a unified diff or "" when no proposal should be shown.
 // alerts are the group's alerts: the alert-type gate (guardrail 1) runs
 // before any file content is touched, so a non-memory-pressure alert is
-// refused without a YAML walk.
+// refused without a YAML walk. The memory-pressure alerts' container labels
+// then pick which container's memory field is raised (guardrail 2).
 func Propose(alerts []Alert, t Triage, relativePath, original string) string {
 	if !memoryPressureAlerts(alerts) {
 		log.Printf("propose: dropped, no memory-pressure alert in group")
+		return ""
+	}
+	container, conflict := oomContainer(alerts)
+	if conflict {
+		log.Printf("propose: dropped, memory-pressure alerts name conflicting containers")
 		return ""
 	}
 	if !proposalEligible(t) {
@@ -57,7 +68,7 @@ func Propose(alerts []Alert, t Triage, relativePath, original string) string {
 		return ""
 	}
 
-	patch, ok := buildMemoryPatch(relativePath, original)
+	patch, ok := buildMemoryPatch(relativePath, original, container)
 	if !ok {
 		return ""
 	}
@@ -79,24 +90,52 @@ func proposalEligible(t Triage) bool {
 // A group that fired for anything else — node health, image pulls, probes,
 // networking — is refused before any YAML walk.
 func memoryPressureAlerts(alerts []Alert) bool {
-	terminatedReason := func(v string) bool {
-		return strings.EqualFold(strings.TrimSpace(v), "OOMKilled")
-	}
 	for _, a := range alerts {
-		name := a.name()
-		if name == "OOMKilled" || name == "ContainerOOMKilled" {
+		if memoryPressureAlert(a) {
 			return true
-		}
-		for _, k := range []string{
-			"kube_pod_container_status_terminated_reason",
-			"kube_pod_container_status_last_terminated_reason",
-		} {
-			if terminatedReason(a.Labels[k]) {
-				return true
-			}
 		}
 	}
 	return false
+}
+
+func memoryPressureAlert(a Alert) bool {
+	name := a.name()
+	if name == "OOMKilled" || name == "ContainerOOMKilled" {
+		return true
+	}
+	for _, k := range []string{
+		"kube_pod_container_status_terminated_reason",
+		"kube_pod_container_status_last_terminated_reason",
+	} {
+		if strings.EqualFold(strings.TrimSpace(a.Labels[k]), "OOMKilled") {
+			return true
+		}
+	}
+	return false
+}
+
+// oomContainer returns the single container name the group's memory-pressure
+// alerts agree on, or "" when none of them carries a container label. The
+// second result reports a conflict: alerts naming two different containers do
+// not identify one field to raise, and guessing between them would grow an
+// allocation the OOM does not justify. Non-memory-pressure alerts are ignored
+// here even when they carry a container label — their subject is not the
+// fault this proposal fixes.
+func oomContainer(alerts []Alert) (name string, conflict bool) {
+	for _, a := range alerts {
+		if !memoryPressureAlert(a) {
+			continue
+		}
+		container := strings.TrimSpace(a.Labels["container"])
+		if container == "" || container == name {
+			continue
+		}
+		if name != "" {
+			return "", true
+		}
+		name = container
+	}
+	return name, false
 }
 
 // memoryTarget pins the parent block that owns the memory scalar.
@@ -106,9 +145,10 @@ type memoryTarget struct {
 	container string
 }
 
-// buildMemoryPatch parses the file once, lifts the right container's memory
-// field, raises it within bounds, and emits a unified diff.
-func buildMemoryPatch(relPath, original string) (string, bool) {
+// buildMemoryPatch parses the file once, lifts the OOM'd container's memory
+// field, raises it within bounds, and emits a unified diff. container is the
+// name the memory-pressure alerts agree on, possibly "".
+func buildMemoryPatch(relPath, original, container string) (string, bool) {
 	cleanPath := path.Clean(relPath)
 	if cleanPath == "." || cleanPath == "/" || strings.HasPrefix(cleanPath, "..") {
 		log.Printf("propose: dropped, unsafe path %q", relPath)
@@ -121,9 +161,13 @@ func buildMemoryPatch(relPath, original string) (string, bool) {
 		return "", false
 	}
 
-	target := locateMemoryTarget(&doc)
+	target := locateMemoryTarget(&doc, container)
 	if target == nil {
-		log.Printf("propose: dropped, no memory field in %s", cleanPath)
+		if container != "" {
+			log.Printf("propose: dropped, no usable memory field for container %q in %s", container, cleanPath)
+		} else {
+			log.Printf("propose: dropped, no unambiguous memory field in %s", cleanPath)
+		}
 		return "", false
 	}
 
@@ -179,29 +223,51 @@ func rootNode(doc *yaml.Node) *yaml.Node {
 	return doc
 }
 
-func locateMemoryTarget(doc *yaml.Node) *memoryTarget {
+// locateMemoryTarget picks the memory scalar of one specific container.
+// With a name it must match exactly one container in the manifest — no match
+// means the alerts describe something this file does not define, and a
+// duplicate name is too broken to guess about. Without a name the manifest
+// must have exactly one container, the single-container case where manifest
+// order cannot lie. Choosing "the first container with resources" instead is
+// what raised a sidecar-less api while the sidecar starved (#273).
+func locateMemoryTarget(doc *yaml.Node, container string) *memoryTarget {
 	root := rootNode(doc)
 	if root == nil || root.Kind != yaml.MappingNode {
 		return nil
 	}
 	containers := findContainers(root)
-	for _, c := range containers {
-		name := scalarOf(c, "name")
-		res := childByKey(c, "resources")
-		if res == nil || res.Kind != yaml.MappingNode {
+	if len(containers) == 0 {
+		return nil
+	}
+	if container != "" {
+		var matches []*yaml.Node
+		for _, c := range containers {
+			if scalarOf(c, "name") == container {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) != 1 {
+			return nil
+		}
+		containers = matches
+	} else if len(containers) != 1 {
+		return nil
+	}
+	c := containers[0]
+	res := childByKey(c, "resources")
+	if res == nil || res.Kind != yaml.MappingNode {
+		return nil
+	}
+	for _, sub := range []string{"limits", "requests"} {
+		block := childByKey(res, sub)
+		if block == nil || block.Kind != yaml.MappingNode {
 			continue
 		}
-		for _, sub := range []string{"limits", "requests"} {
-			block := childByKey(res, sub)
-			if block == nil || block.Kind != yaml.MappingNode {
-				continue
-			}
-			mem := childByKey(block, "memory")
-			if mem == nil || mem.Kind != yaml.ScalarNode {
-				continue
-			}
-			return &memoryTarget{parent: block, child: mem, container: name}
+		mem := childByKey(block, "memory")
+		if mem == nil || mem.Kind != yaml.ScalarNode {
+			continue
 		}
+		return &memoryTarget{parent: block, child: mem, container: scalarOf(c, "name")}
 	}
 	return nil
 }
