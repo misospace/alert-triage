@@ -1960,25 +1960,30 @@ func redactGluedWordSegments(run string) (string, bool) {
 	prev := 0
 	for _, l := range locs {
 		// A word followed by a letter is not a scheme word
-		// ("authorizations", "basically"), unless the residue after the
-		// word decodes on its own ("…basic<cred>"): an undecodable
-		// residue would orphan the credential inside it — the never-
-		// decodable-again shape #217 guards the tail against — so the
-		// occurrence is skipped then and no segment around it is judged;
-		// the run keeps whatever its caller does with undecodable runs.
-		// A decodable residue earns the split and the residue's
-		// redaction.
+		// ("authorizations", "basically"), unless the material behind it
+		// is credential material: an undecodable residue would orphan
+		// the credential inside it — the never-decodable-again shape
+		// #217 guards the tail against — so the occurrence is skipped
+		// when the residue behind it holds no credential, and no segment
+		// around it is judged; the run keeps whatever its caller does
+		// with undecodable runs.
+		//
+		// The skip must not hide a credential that sits behind the word
+		// (issue #262): a residue that carries a credential plus one
+		// trailing character whose bits are left over ("…<cred>x") does
+		// not decode as a whole, so the whole-decode test alone skipped
+		// the occurrence and left that credential in play; the prefix
+		// test of segmentHoldsCredential is what sees it.
 		if l[1] < len(run) {
 			c := run[l[1]]
 			if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
-				if !decodesToBasicCredential(strings.Trim(run[l[1]:], schemeGlue)) &&
-					!decodesToBasicCredential(strings.Trim(run[l[1]:], "=_-")) {
+				if !segmentHoldsCredential(run[l[1]:]) {
 					continue
 				}
 			}
 		}
 		if l[0] > prev {
-			if emitGluedWordSegment(&out, run[prev:l[0]]) {
+			if _, found := emitGluedWordSegment(&out, run[prev:l[0]]); found {
 				changed = true
 			}
 		}
@@ -1986,7 +1991,7 @@ func redactGluedWordSegments(run string) (string, bool) {
 		prev = l[1]
 	}
 	if prev < len(run) {
-		if emitGluedWordSegment(&out, run[prev:]) {
+		if _, found := emitGluedWordSegment(&out, run[prev:]); found {
 			changed = true
 		}
 	}
@@ -2003,9 +2008,20 @@ func redactGluedWordSegments(run string) (string, bool) {
 // (issue #240, join review): "key=<credential>_<word>" reaches this arm
 // undecoded whole, so every join face of the trimmed segment is judged
 // like redactJoinSegments judges a core, with the segment's own glue
-// written outside the judged part. Reports whether the segment was
-// redacted.
-func emitGluedWordSegment(out *strings.Builder, seg string) bool {
+// written outside the judged part. A segment that is no credential as a
+// whole but starts with one loses that credential (issue #262): a payload
+// with one trailing character whose bits are left over ("…<cred>x") does
+// not decode as a whole, and the payload behind the leftover character
+// would otherwise ship in plaintext.
+//
+// It reports two things. "redacted" says whether the segment changed at
+// all. "found" says whether the segment held a credential of its own: the
+// mid-word judgement counts that as its own finding and acts on it, while a
+// segment the shared judge answers on its own (a credential in front of a
+// scheme word the prose continues) is left to that judge, which keeps the
+// prose behind it readable and the tail that follows it visible
+// (issue #262).
+func emitGluedWordSegment(out *strings.Builder, seg string) (redacted, found bool) {
 	lead := seg[:len(seg)-len(strings.TrimLeft(seg, schemeGlue))]
 	trimmed := strings.Trim(seg, schemeGlue)
 	if trimmed == "" {
@@ -2013,7 +2029,7 @@ func emitGluedWordSegment(out *strings.Builder, seg string) bool {
 		// all-glue segment must not mint a redaction — "[REDACTED]"
 		// emitted beyond the word would grow every pass).
 		out.WriteString(seg)
-		return false
+		return false, false
 	}
 	if !decodesToBasicCredential(trimmed) {
 		// The same trim-width worry splitGluedSchemeWord's gate answers:
@@ -2022,18 +2038,66 @@ func emitGluedWordSegment(out *strings.Builder, seg string) bool {
 		alt := strings.Trim(seg, "=_-")
 		if alt != "" && decodesToBasicCredential(alt) {
 			out.WriteString(lead + "[REDACTED]")
-			return true
+			return true, true
 		}
 		if joined, ok := redactJoinSegments(trimmed); ok {
 			trail := seg[len(strings.TrimRight(seg, schemeGlue)):]
 			out.WriteString(lead + joined + trail)
-			return true
+			return true, true
+		}
+		if cut, ok := cutCredentialBeforeProse(seg); ok {
+			// A credential in front of a scheme word the prose continues:
+			// the word is prose, not a scheme word, so the credential goes
+			// and the word and the prose behind it stay readable. The
+			// shared judge answers the same shape one level down, and this
+			// arm must not be weaker than it (issue #262: the mid-word
+			// judgement fires on more segments now, so a segment it judges
+			// has to lose every credential the shared judge would lose).
+			out.WriteString(lead + cut)
+			return true, false
+		}
+		if cut, ok := cutCredentialBeforeResidue(trimmed); ok {
+			// The segment is no credential as a whole, but it starts
+			// with one: the longest prefix that decodes to a
+			// user:password pair is the credential, and the residue
+			// behind it is judged rather than trusted — a residue
+			// that is a credential of its own goes whole, so no
+			// credential is stranded behind the redaction's brackets.
+			// The segment's trailing glue stays: it is the separator
+			// the neighbouring scheme word hung on, and dropping it
+			// would leave that word unreadable as a scheme word and
+			// the credential behind it unreadable to every later pass
+			// (#217, issue #262).
+			trail := seg[len(strings.TrimRight(seg, schemeGlue)):]
+			out.WriteString(lead + cut + trail)
+			return true, true
 		}
 		out.WriteString(seg)
-		return false
+		return false, false
 	}
 	out.WriteString(lead + "[REDACTED]")
-	return true
+	return true, true
+}
+
+// segmentHoldsCredential reports whether seg carries credential material the
+// gate can point at: the segment decodes to a user:password pair as a whole,
+// with the glue on its edges trimmed off, or its longest decodable prefix is
+// such a pair.
+//
+// The prefix test is the one that sees a payload with one trailing character
+// whose bits are left over ("…<cred>x"): such a segment does not decode as a
+// whole, so the whole-decode test alone called it prose, and the credential
+// behind the leftover character was neither redacted nor counted as a
+// credential (issue #262). The gate — not the shape of the segment — still
+// decides: the prefix decodes to a user:password pair, exactly as a whole
+// segment has to.
+func segmentHoldsCredential(seg string) bool {
+	if decodesToBasicCredential(strings.Trim(seg, schemeGlue)) ||
+		decodesToBasicCredential(strings.Trim(seg, "=_-")) {
+		return true
+	}
+	_, ok := credentialRunBoundary(strings.Trim(seg, schemeGlue))
+	return ok
 }
 
 // judgeSingleSegment judges one segment of a run that the decode gate
@@ -2139,20 +2203,36 @@ func judgeSingleSegment(seg string) (string, bool) {
 // stream, so one decode of each alphabet's clean head answers every prefix
 // length (credentialRunBoundary).
 func cutCredentialBeforeResidue(trimmed string) (string, bool) {
+	i, ok := credentialRunBoundary(trimmed)
+	if !ok {
+		return "", false
+	}
 	for _, m := range embeddedSchemeWord.FindAllStringIndex(trimmed, -1) {
 		if m[1] >= len(trimmed) {
 			continue
 		}
-		if c := trimmed[m[1]]; (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+		c := trimmed[m[1]]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			// A word the prose continues: the residue behind it is
+			// decoded as a whole, so the cut would swallow the word and
+			// strand the credential inside it (#240).
 			if decodesToBasicCredential(strings.Trim(trimmed[m[1]:], schemeGlue)) ||
 				decodesToBasicCredential(strings.Trim(trimmed[m[1]:], "=_-")) {
 				return "", false
 			}
 		}
-	}
-	i, ok := credentialRunBoundary(trimmed)
-	if !ok {
-		return "", false
+		// A word the cut would swallow while a credential behind it
+		// survives whole inside the residue, where "[REDACTED]"'s
+		// brackets block every later pass from reading it back (#240).
+		// The cut covers what comes before the boundary, so a credential
+		// behind the word is stranded only when the boundary stops at or
+		// before the word's end; a cut that reaches past it already took
+		// the credential with it, and refusing then would hand the shape
+		// to a judgement that reads the run in pieces and can no longer
+		// decode what the whole-run cut could (issue #262).
+		if i <= m[1] && segmentHoldsCredential(trimmed[m[1]:]) {
+			return "", false
+		}
 	}
 	rest := trimmed[i:]
 	if rest == "" {
