@@ -58,6 +58,17 @@ type ghIssue struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Comments  int       `json:"comments"`
+	// PullRequest is GitHub's discriminator on the repository /issues
+	// endpoint: it sets the object on pull-request rows and omits the key on
+	// genuine issues. listIssues drops rows where it is non-nil.
+	PullRequest *ghPullRef `json:"pull_request"`
+}
+
+// ghPullRef reads just enough of a pull-request row's pull_request object;
+// the pointer's presence is the whole judgement, so the fields exist only to
+// give it a decodable shape.
+type ghPullRef struct {
+	URL string `json:"url"`
 }
 
 type ghLabel struct {
@@ -447,11 +458,18 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, 0, err
 	}
-	// The /issues endpoint also returns PRs; drop anything that doesn't look
-	// like an issue we created. The signature marker search below will also
-	// reject PRs since their bodies never carry the marker.
+	// The /issues endpoint also returns pull requests; drop them on the
+	// pull_request discriminator, never on body content. The marker search
+	// cannot reject PRs: pull.go aliases prMarker to signatureMarker so a
+	// generated PR body carries the same marker an incident issue would, and
+	// a PR that gains the alert-triage label would otherwise be mistaken for
+	// the open incident, suppressing the real issue and sending re-fire
+	// comments to the PR (issue #272).
 	issues := make([]ghIssue, 0, len(raw))
 	for _, i := range raw {
+		if i.PullRequest != nil {
+			continue
+		}
 		issues = append(issues, i)
 	}
 	next := 0

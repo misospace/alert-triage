@@ -805,6 +805,139 @@ func TestFindOpenIssueStub(t *testing.T) {
 	}
 }
 
+// ghMarkerRow renders one /issues row carrying the incident signature marker.
+// When isPR is set the row also carries GitHub's pull_request discriminator,
+// exactly as a generated PR appears on the repository issues endpoint.
+func ghMarkerRow(number int, marker string, isPR bool) map[string]any {
+	row := map[string]any{
+		"number":   number,
+		"title":    "row",
+		"state":    "open",
+		"html_url": fmt.Sprintf("http://example.invalid/%d", number),
+		"body":     marker + "\n\nbody",
+		"labels":   []map[string]string{{"name": "alert-triage"}},
+	}
+	if isPR {
+		row["pull_request"] = map[string]string{"url": fmt.Sprintf("http://example.invalid/api/pulls/%d", number)}
+	}
+	return row
+}
+
+// TestFindOpenIssueSkipsPullRequestRows is the issue #272 regression: the
+// repository /issues endpoint returns pull requests alongside issues, and a
+// generated PR body carries the same signature marker an incident issue
+// would (pull.go aliases prMarker to signatureMarker). A labelled PR must
+// never be returned as the open incident; the lookup must skip it and still
+// find the genuine issue behind it, including across a page boundary.
+func TestFindOpenIssueSkipsPullRequestRows(t *testing.T) {
+	sig := "KubeJobFailed|abc"
+	marker := fmt.Sprintf(signatureMarker, sig)
+
+	t.Run("PR precedes the real issue on one page", func(t *testing.T) {
+		rows, _ := json.Marshal([]map[string]any{
+			ghMarkerRow(123, marker, true),
+			ghMarkerRow(124, marker, false),
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(rows)
+		}))
+		defer srv.Close()
+
+		g := &gitHubClient{token: "t", repo: "owner/repo", hc: http.DefaultClient, apiURL: srv.URL}
+		got, err := g.findOpenIssue(context.Background(), sig)
+		if err != nil {
+			t.Fatalf("findOpenIssue: %v", err)
+		}
+		if got == nil || got.Number != 124 {
+			t.Fatalf("got %+v, want the genuine issue 124, not the PR", got)
+		}
+	})
+
+	t.Run("PR-only page one, real issue after pagination", func(t *testing.T) {
+		prPage, _ := json.Marshal([]map[string]any{ghMarkerRow(123, marker, true)})
+		issuePage, _ := json.Marshal([]map[string]any{ghMarkerRow(124, marker, false)})
+		var page2Seen atomic.Bool
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Query().Get("page") {
+			case "2":
+				page2Seen.Store(true)
+				_, _ = w.Write(issuePage)
+			default:
+				rel := fmt.Sprintf(`<%s%s?page=2>; rel="next"`, srv.URL, r.URL.Path)
+				w.Header().Set("Link", rel)
+				_, _ = w.Write(prPage)
+			}
+		}))
+		defer srv.Close()
+
+		g := &gitHubClient{token: "t", repo: "owner/repo", hc: http.DefaultClient, apiURL: srv.URL}
+		got, err := g.findOpenIssue(context.Background(), sig)
+		if err != nil {
+			t.Fatalf("findOpenIssue: %v", err)
+		}
+		if got == nil || got.Number != 124 {
+			t.Fatalf("got %+v, want issue 124 from page 2", got)
+		}
+		if !page2Seen.Load() {
+			t.Fatal("lookup stopped before paging past the PR-only page")
+		}
+	})
+}
+
+// TestDeliverGitHubPullRequestOnlyRaisesNewIssue is the other half of the
+// issue #272 acceptance: when the only marker-carrying, alert-triage-labelled
+// object is a PR, no existing incident may be reported, so the normal
+// creation path runs and the tracked-issue link points at the new issue.
+func TestDeliverGitHubPullRequestOnlyRaisesNewIssue(t *testing.T) {
+	r := Report{
+		Group:  Group{Key: "KubeJobFailed", Alerts: sampleAlerts("warning")},
+		Triage: Triage{FixLocation: "git"},
+	}
+	marker := fmt.Sprintf(signatureMarker, r.Group.Signature())
+	prPage, _ := json.Marshal([]map[string]any{ghMarkerRow(123, marker, true)})
+
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(prPage)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues":
+			posts.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number":55,"title":"new","body":"new","html_url":"http://example.invalid/55"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &Config{GitHubRepo: "owner/repo", GitHubToken: "tok"}
+	g := newGitHub(cfg)
+	g.apiURL = srv.URL
+
+	if existing, err := g.findOpenIssue(context.Background(), r.Group.Signature()); err != nil || existing != nil {
+		t.Fatalf("findOpenIssue = %+v, %v; want no match for a PR-only list", existing, err)
+	}
+	action, err := deliverGitHub(context.Background(), g, cfg, r)
+	if err != nil {
+		t.Fatalf("deliverGitHub: %v", err)
+	}
+	if action.Outcome != "created" {
+		t.Fatalf("outcome = %q, want created (a PR must not suppress issue creation)", action.Outcome)
+	}
+	if action.URL != "http://example.invalid/55" {
+		t.Fatalf("tracked-issue URL = %q, want the newly created issue", action.URL)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("POST /issues calls = %d, want 1", posts.Load())
+	}
+}
+
 func TestCreateIssueBodyShape(t *testing.T) {
 	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
