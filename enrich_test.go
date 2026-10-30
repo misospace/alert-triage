@@ -349,7 +349,8 @@ func TestStripSecretsBasicAuth(t *testing.T) {
 		{"basic Zm9vOmJhcg=authorization-dXNlcjpwYXNz", "basic [REDACTED]=authorization-[REDACTED]"},
 		// A "+"/"/"-glued run the "=" join cannot cut on still sees its
 		// word split, with the glue left of the word going with the
-		// credential.
+		// credential. The tail goes with the credential the word split
+		// redacted, the rule the mid-word branch follows since #240.
 		{"basic Zm9vOmJhcg+basic-dXNlcjpwYXNz.more", "basic [REDACTED]basic-[REDACTED]"},
 		// The "/" glue, whose shape is the same "+"-family one: the base64
 		// alphabet char nothing later can read goes with the redacted
@@ -760,6 +761,102 @@ func TestStripSecretsBasicAuthJoinCutExposesMidWordGone(t *testing.T) {
 		once := stripSecrets(tt.in)
 		if twice := stripSecrets(once); twice != once {
 			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthMidWordUndecodableResidueGone pins the residue of
+// a mid-run scheme word whose material behind it never decodes (issue #262):
+// the occurrence was skipped then, so no segment around the word was judged
+// and the credentials beside it stayed in plaintext. A residue that carries a
+// credential plus one trailing character whose bits are left over
+// ("…<credential>x") does not decode as a whole, but the longest decodable
+// prefix of it is a credential all the same, so the payload goes. The scheme
+// word stays readable as the context it is, the prose around it survives, and
+// the output is stable under a second pass.
+func TestStripSecretsBasicAuthMidWordUndecodableResidueGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// A mid-run scheme word with a credential behind it that carries a
+		// trailing character whose bits are left over: the payload behind
+		// the word goes, the word stays as the context it is.
+		{"basic dXNlcjpwYXNz-basicdXNlcjpwYXNzx", "basic [REDACTED]basic[REDACTED]x"},
+		// The same shape in a header value, behind a join: the join's key
+		// slot stays readable and the word splits the value.
+		{"authorization: key=dXVpZDpwYXNz/basic-dXNlcjpwYXNzx", "authorization: key=[REDACTED]/basic-[REDACTED]x"},
+		// The leftover character is any one the alphabet carries: the
+		// credential behind the word goes whatever it is.
+		{"basic dXNlcjpwYXNz-basicdXNlcjpwYXNza", "basic [REDACTED]basic[REDACTED]a"},
+		// A residue that decodes as a whole is judged the way it always
+		// was: both payloads go and the word stays.
+		{"basic dXNlcjpwYXNz-basicdXNlcjpwYXNz", "basic [REDACTED]basic[REDACTED]"},
+		// A word the prose continues is prose: nothing behind it holds a
+		// credential, so no segment is judged and the text stays readable.
+		{"basic dXNlcjpwYXNzbasically", "basic [REDACTED]basically"},
+		{"authorization: dXVpZDpwYXNzbasically.example.com", "authorization: [REDACTED]basically.example.com"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The judgements re-emit glue and words as context, so a second pass
+	// must leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	// Whatever the residue carries, no credential payload may reach the
+	// digest, in either context.
+	for _, in := range []string{
+		"basic dXNlcjpwYXNz-basicdXNlcjpwYXNzx",
+		"basic dXNlcjpwYXNz-basicdXNlcjpwYXNza",
+		"basic dXNlcjpwYXNz-basicdXNlcjpwYXNzx in request",
+		"authorization: key=dXVpZDpwYXNz/basic-dXNlcjpwYXNzx",
+		"authorization: dXVpZDpwYXNzbasicdXNlcjpwYXNzx",
+		"basic Zm9vOmJhcg+basic-dXNlcjpwYXNzx",
+		"basic dXNlcjpwYXNz/basic-dXNlcjpwYXNzx",
+		// A scheme word in the middle of a run with a credential behind it
+		// and another scheme word behind that: the credentials on either
+		// side of the first word go, and the second word's context stays
+		// readable.
+		"basic cjpubbasicdXNlcjpwYXNz--authorizationx",
+		"authorization: key=dXNlcjpwYXNz_basic_dXNlcjpwYXNz_Basicx",
+		// A credential behind a scheme word whose residue carries a
+		// credential of its own: the residue goes whole.
+		"basic-cjpbasic.-Zm9vOmJhcg",
+	} {
+		got := stripSecrets(in)
+		for _, p := range []string{"dXNlcjpwYXNz", "dXVpZDpwYXNz", "Zm9vOmJhcg"} {
+			if strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+	// The words that are prose stay prose: a word the prose continues, and
+	// the words that merely carry it, are not credentials.
+	for _, in := range []string{
+		"subbasic",
+		"offbasic",
+		"basically",
+		"basic subbasic",
+		"basic offbasic",
+		"basic subbasic in request",
+		"basic offbasic in request",
+	} {
+		if got := stripSecrets(in); got != in {
+			t.Errorf("stripSecrets(%q) = %q; prose changed", in, got)
+		}
+	}
+	// A credential behind prose the word chain carries is still a
+	// credential: the prose stays readable, the payload does not.
+	for _, tt := range []struct{ in, want string }{
+		{"basic subbasic dXNlcjpwYXNz", "basic subbasic [REDACTED]"},
+		{"basic offbasic dXNlcjpwYXNz", "basic offbasic [REDACTED]"},
+	} {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
 		}
 	}
 }
