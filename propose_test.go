@@ -197,6 +197,35 @@ func TestProposeRefusesDuplicateContainerNames(t *testing.T) {
 	}
 }
 
+// An OOM on a container the manifest defines but gives no resources block
+// declines: adding limits is a different change class, and falling through to
+// the next container with a memory scalar is the #273 bug.
+func TestProposeRefusesTargetContainerWithoutMemory(t *testing.T) {
+	const manifest = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/example/api:1.2.3
+          resources:
+            limits:
+              memory: 64Mi
+        - name: sidecar
+          image: ghcr.io/example/sidecar:9.9.9
+`
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	if got := Propose(oomAlertsFor("sidecar"), triage, "k8s/web.yaml", manifest); got != "" {
+		t.Fatalf("expected no proposal when the OOM'd container has no memory field, got %q", got)
+	}
+	if diff := Propose(oomAlertsFor("api"), triage, "k8s/web.yaml", manifest); diff == "" {
+		t.Fatalf("expected a proposal when the OOM'd container itself has the memory field")
+	}
+}
+
 // The single-container case: with only one container, manifest order cannot
 // lie, so a missing identity stays eligible, a matching one targets it, and
 // a mismatched one still declines.
