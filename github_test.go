@@ -885,6 +885,28 @@ func TestFindOpenIssueSkipsPullRequestRows(t *testing.T) {
 			t.Fatal("lookup stopped before paging past the PR-only page")
 		}
 	})
+	t.Run("explicit null discriminator still reads as an issue", func(t *testing.T) {
+		// api.github.com omits the key rather than sending null; this pins the
+		// chosen degradation if a proxy or GHES shim ever emits null: the row
+		// stays a candidate instead of silently vanishing and duplicating the
+		// incident.
+		row, _ := json.Marshal([]map[string]any{ghMarkerRow(130, marker, false)})
+		rows := append(row[:len(row)-2], []byte(`,"pull_request":null}]`)...)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(rows)
+		}))
+		defer srv.Close()
+
+		g := &gitHubClient{token: "t", repo: "owner/repo", hc: http.DefaultClient, apiURL: srv.URL}
+		got, err := g.findOpenIssue(context.Background(), sig)
+		if err != nil {
+			t.Fatalf("findOpenIssue: %v", err)
+		}
+		if got == nil || got.Number != 130 {
+			t.Fatalf("got %+v, want issue 130 kept as a candidate", got)
+		}
+	})
 }
 
 // TestDeliverGitHubPullRequestOnlyRaisesNewIssue is the other half of the
@@ -900,7 +922,13 @@ func TestDeliverGitHubPullRequestOnlyRaisesNewIssue(t *testing.T) {
 	prPage, _ := json.Marshal([]map[string]any{ghMarkerRow(123, marker, true)})
 
 	var posts atomic.Int32
+	var touchesPR atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Comments and label syncs address objects by number under
+		// /issues/{n}/; nothing may ever be written to the PR row.
+		if strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/123/") {
+			touchesPR.Add(1)
+		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues":
 			w.Header().Set("Content-Type", "application/json")
@@ -935,6 +963,9 @@ func TestDeliverGitHubPullRequestOnlyRaisesNewIssue(t *testing.T) {
 	}
 	if posts.Load() != 1 {
 		t.Fatalf("POST /issues calls = %d, want 1", posts.Load())
+	}
+	if touchesPR.Load() != 0 {
+		t.Fatal("wrote to the PR object; re-fire comments and label syncs must never target it")
 	}
 }
 

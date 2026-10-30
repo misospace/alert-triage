@@ -60,7 +60,11 @@ type ghIssue struct {
 	Comments  int       `json:"comments"`
 	// PullRequest is GitHub's discriminator on the repository /issues
 	// endpoint: it sets the object on pull-request rows and omits the key on
-	// genuine issues. listIssues drops rows where it is non-nil.
+	// genuine issues. listIssues drops rows where it is non-nil. A literal
+	// "pull_request": null (unobserved on api.github.com) decodes to nil and
+	// reads as a genuine issue; degrading that way toward a visible marker
+	// match beats silently dropping a real issue and duplicating the
+	// incident.
 	PullRequest *ghPullRef `json:"pull_request"`
 }
 
