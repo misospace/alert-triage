@@ -566,6 +566,38 @@ func TestProposeRaisesMemoryInCRLFManifest(t *testing.T) {
 	}
 }
 
+// yaml.v3 counts columns in runes while text is indexed in bytes: a flow
+// line with multi-byte characters before the memory token used to offset
+// the recorded column by one byte per rune and silently refuse a valid
+// manifest. The rewrite must land on the token and touch nothing else.
+func TestProposeRaisesMemoryOnLineWithMultiByteCharacters(t *testing.T) {
+	manifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers: [{name: café-api, resources: {limits: {memory: 64Mi}, requests: {memory: 64Mi}}}]
+`
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	diff := Propose(oomAlerts(), triage, "apps/web.yaml", manifest)
+	if diff == "" {
+		t.Fatalf("expected a proposal despite multi-byte characters before the token")
+	}
+	patched := applyProposed(t, manifest, diff)
+	changed, lines := assertOneChangedLine(t, manifest, patched)
+	if !strings.Contains(lines[changed], "memory: 128Mi") {
+		t.Fatalf("the single changed line is not the memory increase: %q", lines[changed])
+	}
+	if got := containerMemory(t, patched, "café-api", "limits"); got != "128Mi" {
+		t.Errorf("limits.memory = %q, want 128Mi", got)
+	}
+	if got := containerMemory(t, patched, "café-api", "requests"); got != "64Mi" {
+		t.Errorf("requests.memory = %q, want 64Mi untouched", got)
+	}
+}
+
 // Scalars whose source text cannot be proven equal to the parsed value at
 // the recorded position — a tag, a block scalar, an alias — are refused
 // outright instead of being rewritten or re-encoded (#274's fail-closed

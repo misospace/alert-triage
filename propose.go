@@ -36,6 +36,7 @@ import (
 	"log"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -177,7 +178,10 @@ func buildMemoryPatch(relPath, original string) (string, bool) {
 	}
 	// The write arm commits applyDiff(content, diff), not the content verified
 	// above. Prove the emitted patch reproduces exactly that content under
-	// the same applier before anyone is allowed to ship it.
+	// the same applier before anyone is allowed to ship it. This also refuses
+	// files whose trailing newlines applyDiff would normalise (more than one
+	// final break): the committed content would differ from the original in
+	// bytes the proposal never mentions, so no patch is shipped instead.
 	if applied, ok := applyDiff(original, diff); !ok || applied != patched {
 		log.Printf("propose: dropped, emitted patch does not reproduce patched content for %s", cleanPath)
 		return "", false
@@ -203,8 +207,18 @@ func replaceScalarValue(original string, line, column int, oldValue, newValue st
 		return "", false
 	}
 	text := lines[line-1]
-	start := column - 1
-	if start < 0 || start >= len(text) {
+	// yaml.v3 counts columns in runes; text is indexed in bytes. Landing on
+	// the wrong byte would silently reject a valid line carrying multi-byte
+	// characters before the token (reachable in flow style).
+	if column < 1 {
+		return "", false
+	}
+	start := 0
+	for r := 1; r < column && start < len(text); r++ {
+		_, width := utf8.DecodeRuneInString(text[start:])
+		start += width
+	}
+	if start >= len(text) {
 		return "", false
 	}
 	rest0 := text[start:]
