@@ -1816,6 +1816,89 @@ func TestBudgetEmbedKeepsBudgetWithImplausibleURL(t *testing.T) {
 	}
 }
 
+// Truncating a description whose last rendered section is a fenced PodLogs
+// block can cut inside the open fence; the tail after the cut — the
+// tracked-issue link — must then still render outside code, not as literal
+// text inside the dangling fence (issue #275).
+func TestBudgetEmbedClosesFenceCutByTruncation(t *testing.T) {
+	// Head outside any fence, then an open fence whose content runs past
+	// every plausible cut point.
+	desc := "Pod crashed.\n```\n" + strings.Repeat("log line\n", 500)
+	embed := discordEmbed{Title: "t", Description: desc}
+	url := "https://example.com/issues/1"
+	got := budgetEmbed(embed, url)
+	assertDiscordEmbedBudgets(t, got)
+
+	d := got.Description
+	if !strings.HasSuffix(d, url+">") {
+		t.Fatalf("description should end with the tracked link, got tail %q", d[max(0, len(d)-60):])
+	}
+	link := "\n\nTracked: <" + url + ">"
+	head := strings.TrimSuffix(d, link)
+	if head == d {
+		t.Fatalf("link not found verbatim at the tail: %q", d[max(0, len(d)-60):])
+	}
+	if strings.Count(head, "```")%2 != 0 {
+		t.Errorf("dangling fence before the link (%d markers in %q): link renders as code", strings.Count(head, "```"), head)
+	}
+	if !strings.Contains(head, "```") {
+		t.Errorf("closing fence missing before the link: %q", head)
+	}
+	// The closing fence must sit after the truncation marker, i.e. the fix
+	// closes the cut fence rather than truncating the fence away.
+	if !strings.Contains(head, "...```") {
+		t.Errorf("expected a closing fence appended after the marker, got tail %q", head[max(0, len(head)-30):])
+	}
+}
+
+// The same defect without a tracked link: a mid-fence cut still leaves the
+// digest tail rendering as code, so the delivered description must end with
+// balanced fences either way.
+func TestBudgetEmbedClosesFenceWithoutLink(t *testing.T) {
+	desc := "Pod crashed.\n```\n" + strings.Repeat("log line\n", 500)
+	embed := discordEmbed{Title: "t", Description: desc}
+	got := budgetEmbed(embed, "")
+	assertDiscordEmbedBudgets(t, got)
+	if n := strings.Count(got.Description, "```"); n%2 != 0 {
+		t.Errorf("description ends inside an open fence (%d markers): %q", n, got.Description[max(0, len(got.Description)-40):])
+	}
+}
+
+// A description that fits its budget is none of truncation's business, even
+// when the model left a fence unterminated.
+func TestBudgetEmbedLeavesFittingDescriptionAlone(t *testing.T) {
+	open := discordEmbed{Title: "t", Description: "short\n```\nunclosed"}
+	if got := budgetEmbed(open, ""); got.Description != open.Description {
+		t.Errorf("fitting description with an open fence was rewritten: %q", got.Description)
+	}
+}
+
+// fitCloseFence mechanics beyond what budgetEmbed's realistic budgets reach:
+// a re-fit that lands before the dangling opener must not gain a spurious
+// opening fence from the closer, and one that lands inside the fence again
+// must come back closed and inside budget.
+func TestFitCloseFenceRefitPlacement(t *testing.T) {
+	inside := "aaa\n```" + strings.Repeat("b", 20)
+	got := fitCloseFence(inside, 15)
+	if textLen(got) > 15 {
+		t.Errorf("fitCloseFence overran budget: %q (%d units)", got, textLen(got))
+	}
+	if !strings.HasSuffix(got, "```") || strings.Count(got, "```")%2 != 0 {
+		t.Errorf("cut inside the fence must come back closed: %q", got)
+	}
+	// Room 8: the first cut keeps the opener; the closer's refit lands before
+	// it, and appending would open a fence instead of closing one.
+	before := "x\n```" + strings.Repeat("y", 100)
+	if got := fitCloseFence(before, 8); strings.HasSuffix(got, "```") {
+		t.Errorf("clean re-fit must not gain a dangling opener: %q", got)
+	}
+	// A cut that never enters a fence passes through untouched.
+	closed := "```code``` " + strings.Repeat("t", 40)
+	if got, want := fitCloseFence(closed, 20), fit(closed, 20); got != want {
+		t.Errorf("fitCloseFence(closed fence, 20) = %q, want plain fit %q", got, want)
+	}
+}
+
 // A long alert name, a long GitOps path, and a group resolving more source
 // paths than an embed may carry must each still deliver, with every Discord
 // limit satisfied on the outbound JSON (issue #270).
