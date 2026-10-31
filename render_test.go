@@ -87,6 +87,41 @@ func TestEvidenceRedactsCredentialsInAlertText(t *testing.T) {
 	}
 }
 
+// TestDiscordDescriptionRedactsFixedLabelValues (#278): the chat's Alerts
+// list renders severity, name and namespace directly, bypassing the
+// sanitized payload copies. #269 gated the prompt line and the issue-body
+// table with stripSecrets but left this sink raw; the same synthetic
+// credentials must not reach the chat either.
+func TestDiscordDescriptionRedactsFixedLabelValues(t *testing.T) {
+	g := Group{
+		Key: "chat-redaction",
+		Alerts: []Alert{{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "JobStuck authorization Bearer abcdef0123456789",
+				"severity":  "critical password=synthetic-chat-password",
+				"namespace": "payments token=synthetic-chat-token",
+			},
+		}},
+	}
+	got := discordDescription(&Config{}, Report{Group: g})
+	for _, secret := range []string{"abcdef0123456789", "synthetic-chat-password", "synthetic-chat-token"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("secret %q leaked into chat digest:\n%s", secret, got)
+		}
+	}
+	// Fail-safe redaction must not eat the text operators triage from: the
+	// severity, the alert name and the namespace all keep their benign parts.
+	for _, benign := range []string{"critical", "JobStuck", "payments"} {
+		if !strings.Contains(got, benign) {
+			t.Errorf("non-sensitive text %q must survive redaction:\n%s", benign, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("digest should carry the redaction marker:\n%s", got)
+	}
+}
+
 func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})

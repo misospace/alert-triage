@@ -401,6 +401,24 @@ func TestSanitizedAlertsDoesNotMutateOriginals(t *testing.T) {
 	}
 }
 
+// TestIssueTitleRedactsCredentialAlertName (#278): the issue title is built
+// from Group.Title(), outside the body path #269 sanitized, so a credential
+// carried in an alertname label rode into the title of a durable, public
+// record. The severity suffix and the benign name must survive.
+func TestIssueTitleRedactsCredentialAlertName(t *testing.T) {
+	r := Report{Group: Group{Alerts: []Alert{{
+		Status: "firing",
+		Labels: map[string]string{"alertname": "AuditExample password=synthetic-title-secret", "severity": "warning"},
+	}}}}
+	got := issueTitle(r)
+	if strings.Contains(got, "synthetic-title-secret") {
+		t.Errorf("credential leaked into issue title: %q", got)
+	}
+	if want := "[default] AuditExample [REDACTED] (warning)"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
 func TestIsCredentialKey(t *testing.T) {
 	secret := []string{"password", "Password", "db_password", "api-key", "API_KEY", "apiKey", "access_token", "secret", "client_secret", "credential", "authorization", "bearer", "private_key", "AWS_SECRET_ACCESS_KEY"}
 	for _, k := range secret {

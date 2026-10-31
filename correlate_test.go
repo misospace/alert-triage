@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,6 +175,24 @@ func TestTitleSummarisesMultiple(t *testing.T) {
 	g := Group{Alerts: []Alert{alert("A", "x", "warning", 0), alert("B", "x", "warning", 0)}}
 	if got := g.Title(); got != "[default] A + 1 more" {
 		t.Errorf("want '[default] A + 1 more', got %q", got)
+	}
+}
+
+// #278: every consumer of the title — the GitHub issue title, the PR title,
+// the Discord embed title, the history JSONL — renders this one method, so
+// a credential placed in an alertname label is stripped here rather than at
+// each sink. The benign name and the dedup key must survive.
+func TestTitleRedactsCredentialAlertName(t *testing.T) {
+	g := Group{Alerts: []Alert{alert("BackupFailed password=synthetic-title-secret", "x", "warning", 0)}}
+	got := g.Title()
+	if strings.Contains(got, "synthetic-title-secret") {
+		t.Errorf("credential leaked into title: %q", got)
+	}
+	if want := "[default] BackupFailed [REDACTED]"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+	if g.Signature() == "" {
+		t.Error("redacting the title must not disturb the signature used for dedup")
 	}
 }
 

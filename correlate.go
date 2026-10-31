@@ -429,6 +429,14 @@ func (g Group) Severity() string {
 }
 
 // Title summarises the group for a message header.
+//
+// Alert names carry stripSecrets: every consumer of a title is a
+// human-visible or durable surface — the GitHub issue title, the PR title,
+// the Discord embed title, the history JSONL and the journal — and an
+// alertname label is alert-supplied text, so a credential placed in it must
+// not ride all of them (issue #278). Dedup and "seen N times" key on
+// Key()/Signature(), which hash the raw names, so redacting here cannot
+// change grouping or issue matching.
 func (g Group) Title() string {
 	cluster := g.Cluster
 	if cluster == "" {
@@ -436,7 +444,7 @@ func (g Group) Title() string {
 	}
 	names := make([]string, 0, len(g.Alerts))
 	for _, a := range g.Alerts {
-		names = append(names, a.name())
+		names = append(names, stripSecrets(a.name()))
 	}
 	names = dedupe(names)
 	sort.Strings(names)

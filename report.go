@@ -834,10 +834,14 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n\n")
 	}
 	desc.WriteString("**Alerts**\n")
+	// Severity, name and namespace are fixed label values read directly,
+	// bypassing the sanitized payload copies; the same keyword engine that
+	// gates the issue-body table keeps a credential-shaped value out of the
+	// chat digest (#278).
 	for _, a := range r.Group.Alerts {
-		fmt.Fprintf(&desc, "• `%s` %s", a.severity(), a.name())
+		fmt.Fprintf(&desc, "• `%s` %s", stripSecrets(a.severity()), stripSecrets(a.name()))
 		if ns := a.namespace(); ns != "" {
-			fmt.Fprintf(&desc, " — %s", ns)
+			fmt.Fprintf(&desc, " — %s", stripSecrets(ns))
 		}
 		desc.WriteString("\n")
 	}
@@ -1155,11 +1159,17 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 // on, best-effort from annotations. Empty if the alert payload didn't carry
 // one - in which case the metrics link is silently omitted rather than
 // emitting a broken Explore URL.
+//
+// The value is redacted before it is embedded: the annotation is alert-
+// supplied text, and scrape-target URLs with hard-coded credentials do occur
+// in rule expressions, so the durable URL-quoted Explore link must not carry
+// one (#278). URL escaping happens after this in grafanaExplore, so
+// [REDACTED] stays link-safe.
 func firstExpression(alerts []Alert) string {
 	for _, a := range alerts {
 		for _, key := range []string{"expr", "expression", "query"} {
 			if v := strings.TrimSpace(a.Annotations[key]); v != "" {
-				return v
+				return safeMetadataValue(key, v)
 			}
 		}
 	}
@@ -1167,11 +1177,13 @@ func firstExpression(alerts []Alert) string {
 }
 
 // firstNamespace returns the first non-empty namespace across the group's
-// alerts, mirroring the grouping logic in correlate.go.
+// alerts, mirroring the grouping logic in correlate.go. Redacted like
+// firstExpression: the value becomes the LogQL selector of the Explore logs
+// link, which is as durable as the metrics one (#278).
 func firstNamespace(alerts []Alert) string {
 	for _, a := range alerts {
 		if ns := a.namespace(); ns != "" {
-			return ns
+			return safeMetadataValue("namespace", ns)
 		}
 	}
 	return ""
