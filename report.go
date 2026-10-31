@@ -989,6 +989,35 @@ func fit(s string, n int) string {
 	return string(r[:keep]) + marker
 }
 
+// fenceOpen reports whether s ends inside an open ``` fence: the markers pair
+// up in order of appearance, so an odd count leaves the last one dangling.
+func fenceOpen(s string) bool {
+	return strings.Count(s, "```")%2 == 1
+}
+
+// fitCloseFence fits s to at most n units and, when the cut lands inside an
+// open ``` fence (PodLogs and backend evidence render fenced blocks, and a
+// dangling opener turns everything after it — the tracked-issue link — into
+// literal code text), refits a little shorter and appends a closing fence
+// before any trailing content. A description that already fits is returned
+// unchanged even if the model left a fence open; balancing an unterminated
+// model fence is beyond truncation's remit (#275).
+func fitCloseFence(s string, n int) string {
+	body := fit(s, n)
+	if textLen(s) <= n || !fenceOpen(body) {
+		return body
+	}
+	const fence = "```"
+	// The shorter cut can land before the opener (nothing left to close) or
+	// inside the fence again (close it); either way the result stays in
+	// budget, and appending to a clean cut would open a fence, not close one.
+	shorter := fit(s, n-len(fence))
+	if fenceOpen(shorter) {
+		return shorter + fence
+	}
+	return shorter
+}
+
 // budgetEmbed returns embed with every Discord limit enforced on the final
 // values, and the tracked-issue link folded into the description with room
 // reserved for it. Discord's 6000-character aggregate covers all text in
@@ -1040,13 +1069,13 @@ func budgetEmbed(embed discordEmbed, trackedURL string) discordEmbed {
 	}
 	switch {
 	case link == "":
-		embed.Description = fit(embed.Description, budget)
+		embed.Description = fitCloseFence(embed.Description, budget)
 	case textLen(link) >= budget:
 		// An implausibly long URL: keep the budget and as much of the link
 		// as fits; the narrative would only push the link out entirely.
 		embed.Description = fit(link, budget)
 	default:
-		embed.Description = fit(embed.Description, budget-textLen(link)) + link
+		embed.Description = fitCloseFence(embed.Description, budget-textLen(link)) + link
 	}
 	return embed
 }
