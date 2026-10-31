@@ -872,7 +872,11 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n**Backend logs (untrusted workload text)**\n")
 		for _, line := range r.Enrichment.BackendLogs {
 			desc.WriteString("• ")
-			desc.WriteString(line)
+			// Same sanitization as the PodLogs block above: a
+			// workload-authored ``` would otherwise open or close a real
+			// code fence here, and flip the fence parity the truncation
+			// fit relies on.
+			desc.WriteString(sanitizeFenceContent(line))
 			desc.WriteByte('\n')
 		}
 	}
