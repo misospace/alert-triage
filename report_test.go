@@ -60,6 +60,41 @@ func TestDeliverDiscord(t *testing.T) {
 	}
 }
 
+// TestDeliverDiscordRedactsCredentialGroupIdentity (#278 review): the embed
+// footer carries the group Key and the cluster prefix on every chat
+// delivery, and the embed title carries both labels again. Key redaction
+// happens at group construction, so this drives real Correlate output
+// end-to-end into the delivered embed JSON.
+func TestDeliverDiscordRedactsCredentialGroupIdentity(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		receivedBody = string(data)
+	}))
+	defer srv.Close()
+
+	gs := Correlate([]Alert{alert("ZetaAlpha password=synthetic-footer-secret", "payments", "warning", 0)}, nil, DefaultSignatures(), time.Minute)
+	if len(gs) != 1 {
+		t.Fatalf("expected one group, got %d", len(gs))
+	}
+	g := gs[0]
+	g.Cluster = "prod token=synthetic-footer-token"
+	cfg := Config{DiscordURL: srv.URL}
+	if err := Deliver(context.Background(), &cfg, Report{Group: g}); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"synthetic-footer-secret", "synthetic-footer-token"} {
+		if strings.Contains(receivedBody, secret) {
+			t.Errorf("secret %q leaked into delivered embed:\n%s", secret, receivedBody)
+		}
+	}
+	for _, benign := range []string{"ZetaAlpha [REDACTED]", "prod [REDACTED]", "payments"} {
+		if !strings.Contains(receivedBody, benign) {
+			t.Errorf("non-sensitive text %q must survive in the embed:\n%s", benign, receivedBody)
+		}
+	}
+}
+
 func TestDeliverClamp(t *testing.T) {
 	var receivedBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

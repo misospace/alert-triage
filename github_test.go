@@ -401,6 +401,45 @@ func TestSanitizedAlertsDoesNotMutateOriginals(t *testing.T) {
 	}
 }
 
+// TestIssueTitleRedactsCredentialAlertName (#278): the issue title is built
+// from Group.Title(), outside the body path #269 sanitized, so a credential
+// carried in an alertname label rode into the title of a durable, public
+// record. The severity suffix and the benign name must survive.
+func TestIssueTitleRedactsCredentialAlertName(t *testing.T) {
+	r := Report{Group: Group{Alerts: []Alert{{
+		Status: "firing",
+		Labels: map[string]string{"alertname": "AuditExample password=synthetic-title-secret", "severity": "warning"},
+	}}}}
+	got := issueTitle(r)
+	if strings.Contains(got, "synthetic-title-secret") {
+		t.Errorf("credential leaked into issue title: %q", got)
+	}
+	if want := "[default] AuditExample [REDACTED] (warning)"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+// TestIssueBodyRedactsGroupIdentity (#278 review): the durable payload block
+// embeds Group.Key while every alert field goes through sanitizedAlerts.
+// Driven through the real Correlate constructor so the payload block, the
+// evidence header and the Alerts table are all checked in one body.
+func TestIssueBodyRedactsGroupIdentity(t *testing.T) {
+	gs := Correlate([]Alert{
+		alert("ZetaAlpha", "payments bearer=synthetic-body-bearer", "warning", 0),
+		alert("ZetaBeta", "payments bearer=synthetic-body-bearer", "warning", 0),
+	}, nil, DefaultSignatures(), time.Minute)
+	if len(gs) != 1 {
+		t.Fatalf("expected one namespace group, got %d", len(gs))
+	}
+	body := renderIssueBody(Report{Group: gs[0]}, "sig-x")
+	if strings.Contains(body, "synthetic-body-bearer") {
+		t.Errorf("credential leaked into issue body:\n%s", body)
+	}
+	if !strings.Contains(body, "payments [REDACTED]") {
+		t.Errorf("body should carry the redaction marker:\n%s", body)
+	}
+}
+
 func TestIsCredentialKey(t *testing.T) {
 	secret := []string{"password", "Password", "db_password", "api-key", "API_KEY", "apiKey", "access_token", "secret", "client_secret", "credential", "authorization", "bearer", "private_key", "AWS_SECRET_ACCESS_KEY"}
 	for _, k := range secret {
