@@ -364,17 +364,22 @@ func Narrate(ctx context.Context, cfg *Config, r Report) (Triage, bool) {
 
 func renderEvidence(r Report) string {
 	var b strings.Builder
+	// The header block echoes fixed identity fields, all of which originate in
+	// alert labels (cluster, node, namespace). Key and Reason are already
+	// redacted at group construction; these three render raw fields that
+	// enrichment needs unredacted for its lookups, so the renderer strips
+	// instead (#278 review).
 	cluster := r.Group.Cluster
 	if cluster == "" {
 		cluster = "default"
 	}
-	fmt.Fprintf(&b, "Cluster: %s\n", cluster)
+	fmt.Fprintf(&b, "Cluster: %s\n", stripSecrets(cluster))
 	fmt.Fprintf(&b, "Grouping: %s (%s)\n", r.Group.Key, r.Group.Reason)
 	if r.Group.Node != "" {
-		fmt.Fprintf(&b, "Node: %s\n", r.Group.Node)
+		fmt.Fprintf(&b, "Node: %s\n", stripSecrets(r.Group.Node))
 	}
 	if len(r.Group.Namespaces) > 0 {
-		fmt.Fprintf(&b, "Namespaces: %s\n", strings.Join(r.Group.Namespaces, ", "))
+		fmt.Fprintf(&b, "Namespaces: %s\n", stripSecrets(strings.Join(r.Group.Namespaces, ", ")))
 	}
 	if len(r.Enrichment.RepoPaths) > 0 {
 		fmt.Fprintf(&b, "RepoPaths:\n")
@@ -457,7 +462,10 @@ func renderEvidence(r Report) string {
 	}
 	b.WriteString(untrustedEnd + "\n")
 
-	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", orUnknown(r.Enrichment.Scope))
+	// The Scope string embeds the inspected namespace list and, on a cluster
+	// mismatch, the group's cluster label — alert-supplied values on a
+	// model-visible and issue-quoted line, so the renderer strips (#278 review).
+	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", stripSecrets(orUnknown(r.Enrichment.Scope)))
 	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
 	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
 	b.WriteString("above); the context tier rules causes out and fills gaps - it does not\n")
@@ -834,10 +842,14 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n\n")
 	}
 	desc.WriteString("**Alerts**\n")
+	// Severity, name and namespace are fixed label values read directly,
+	// bypassing the sanitized payload copies; the same keyword engine that
+	// gates the issue-body table keeps a credential-shaped value out of the
+	// chat digest (#278).
 	for _, a := range r.Group.Alerts {
-		fmt.Fprintf(&desc, "• `%s` %s", a.severity(), a.name())
+		fmt.Fprintf(&desc, "• `%s` %s", stripSecrets(a.severity()), stripSecrets(a.name()))
 		if ns := a.namespace(); ns != "" {
-			fmt.Fprintf(&desc, " — %s", ns)
+			fmt.Fprintf(&desc, " — %s", stripSecrets(ns))
 		}
 		desc.WriteString("\n")
 	}
@@ -1101,7 +1113,9 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 	}
 	embed.Footer.Text = fmt.Sprintf("%s · %s · %s", r.Group.Key, r.Group.Severity(), seen)
 	if cluster := r.Group.Cluster; cluster != "" && cluster != "default" {
-		embed.Footer.Text = cluster + " · " + embed.Footer.Text
+		// The footer's Key is already redacted at group construction; the
+		// cluster prefix is a raw label, so the renderer strips it (#278 review).
+		embed.Footer.Text = stripSecrets(cluster) + " · " + embed.Footer.Text
 	}
 	for _, p := range r.Enrichment.RepoPaths {
 		embed.Fields = append(embed.Fields, discordField{Name: "Source", Value: untrusted(p)})
@@ -1155,11 +1169,17 @@ func Deliver(ctx context.Context, cfg *Config, r Report) error {
 // on, best-effort from annotations. Empty if the alert payload didn't carry
 // one - in which case the metrics link is silently omitted rather than
 // emitting a broken Explore URL.
+//
+// The value is redacted before it is embedded: the annotation is alert-
+// supplied text, and scrape-target URLs with hard-coded credentials do occur
+// in rule expressions, so the durable URL-quoted Explore link must not carry
+// one (#278). URL escaping happens after this in grafanaExplore, so
+// [REDACTED] stays link-safe.
 func firstExpression(alerts []Alert) string {
 	for _, a := range alerts {
 		for _, key := range []string{"expr", "expression", "query"} {
 			if v := strings.TrimSpace(a.Annotations[key]); v != "" {
-				return v
+				return safeMetadataValue(key, v)
 			}
 		}
 	}
@@ -1167,11 +1187,13 @@ func firstExpression(alerts []Alert) string {
 }
 
 // firstNamespace returns the first non-empty namespace across the group's
-// alerts, mirroring the grouping logic in correlate.go.
+// alerts, mirroring the grouping logic in correlate.go. Redacted like
+// firstExpression: the value becomes the LogQL selector of the Explore logs
+// link, which is as durable as the metrics one (#278).
 func firstNamespace(alerts []Alert) string {
 	for _, a := range alerts {
 		if ns := a.namespace(); ns != "" {
-			return ns
+			return safeMetadataValue("namespace", ns)
 		}
 	}
 	return ""

@@ -366,8 +366,16 @@ func groupBy(alerts []Alert, claimed []bool, slack time.Duration, kind string, n
 	return out
 }
 
+// newGroup assembles a group. Key and Reason echo alert-supplied bucket
+// values (alert names, namespaces, node names) into every human surface that
+// renders them — the Discord embed footer, the issue body's payload block,
+// the evidence header, the /recent record and the journal — so they are
+// redacted once here, at the single production constructor (#278 review).
+// Bucketing itself partitioned on the raw values before this call, and
+// Namespaces stays raw on purpose: it is the lookup key for enrichment and
+// log queries, not display text; its renderers strip.
 func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Group {
-	g := Group{Key: key, Reason: reason, Alerts: members}
+	g := Group{Key: stripSecrets(key), Reason: stripSecrets(reason), Alerts: members}
 	seenNS := map[string]bool{}
 	for _, a := range members {
 		if ns := a.namespace(); ns != "" && !seenNS[ns] {
@@ -429,14 +437,24 @@ func (g Group) Severity() string {
 }
 
 // Title summarises the group for a message header.
+//
+// Cluster and alert names carry stripSecrets: every consumer of a title is a
+// human-visible or durable surface — the GitHub issue title, the PR title,
+// the Discord embed title, the history JSONL and the journal — and both the
+// cluster and alertname labels are alert-supplied text, so a credential
+// placed in either must not ride all of them (issue #278). Dedup and "seen N
+// times" key on Signature(), which hashes the raw names, and the enrichment
+// cluster-mismatch check compares the raw Cluster field, so redacting here
+// cannot change grouping, matching or evidence gating.
 func (g Group) Title() string {
 	cluster := g.Cluster
 	if cluster == "" {
 		cluster = "default"
 	}
+	cluster = stripSecrets(cluster)
 	names := make([]string, 0, len(g.Alerts))
 	for _, a := range g.Alerts {
-		names = append(names, a.name())
+		names = append(names, stripSecrets(a.name()))
 	}
 	names = dedupe(names)
 	sort.Strings(names)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,6 +175,67 @@ func TestTitleSummarisesMultiple(t *testing.T) {
 	g := Group{Alerts: []Alert{alert("A", "x", "warning", 0), alert("B", "x", "warning", 0)}}
 	if got := g.Title(); got != "[default] A + 1 more" {
 		t.Errorf("want '[default] A + 1 more', got %q", got)
+	}
+}
+
+// #278: every consumer of the title — the GitHub issue title, the PR title,
+// the Discord embed title, the history JSONL — renders this one method, so
+// a credential placed in an alertname label is stripped here rather than at
+// each sink. The benign name and the dedup key must survive.
+func TestTitleRedactsCredentialAlertName(t *testing.T) {
+	g := Group{Alerts: []Alert{alert("BackupFailed password=synthetic-title-secret", "x", "warning", 0)}}
+	got := g.Title()
+	if strings.Contains(got, "synthetic-title-secret") {
+		t.Errorf("credential leaked into title: %q", got)
+	}
+	if want := "[default] BackupFailed [REDACTED]"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+	if g.Signature() == "" {
+		t.Error("redacting the title must not disturb the signature used for dedup")
+	}
+}
+
+// #278 review: the cluster label rides the same title as the alert names.
+func TestTitleRedactsClusterLabel(t *testing.T) {
+	g := Group{Cluster: "prod token=synthetic-cluster-secret", Alerts: []Alert{alert("Incident", "x", "warning", 0)}}
+	got := g.Title()
+	if strings.Contains(got, "synthetic-cluster-secret") {
+		t.Errorf("credential leaked into title: %q", got)
+	}
+	if want := "[prod [REDACTED]] Incident"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+// #278 review: Key and Reason echo the bucket value into the Discord embed
+// footer, the issue payload block, the evidence header, /recent and the
+// journal, so the single production constructor redacts them once. Bucketing
+// itself still partitions on the raw values: two namespaces that share only
+// a redaction marker must not fuse into one incident.
+func TestGroupKeyAndReasonRedactAlertSuppliedBuckets(t *testing.T) {
+	lone := Correlate([]Alert{alert("LoneAlert password=synthetic-single-secret", "", "warning", 0)}, nil, DefaultSignatures(), time.Minute)
+	if len(lone) != 1 {
+		t.Fatalf("expected one isolated group, got %d", len(lone))
+	}
+	if got := lone[0].Key; got != "single/LoneAlert [REDACTED]" {
+		t.Errorf("single-alert Key not redacted: %q", got)
+	}
+
+	shared := []Alert{
+		alert("ZetaAlpha", "payments token=synthetic-bucket-secret", "warning", 0),
+		alert("ZetaBeta", "payments token=synthetic-bucket-secret", "warning", 0),
+	}
+	groups := Correlate(shared, nil, DefaultSignatures(), time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("expected one namespace group, got %d: %+v", len(groups), groups)
+	}
+	g := groups[0]
+	if strings.Contains(g.Key, "synthetic-bucket-secret") || strings.Contains(g.Reason, "synthetic-bucket-secret") {
+		t.Errorf("bucket credential leaked into Key/Reason: %q / %q", g.Key, g.Reason)
+	}
+	if want := "namespace/payments [REDACTED]"; g.Key != want {
+		t.Errorf("want Key %q, got %q", want, g.Key)
 	}
 }
 
