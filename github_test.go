@@ -419,6 +419,27 @@ func TestIssueTitleRedactsCredentialAlertName(t *testing.T) {
 	}
 }
 
+// TestIssueBodyRedactsGroupIdentity (#278 review): the durable payload block
+// embeds Group.Key while every alert field goes through sanitizedAlerts.
+// Driven through the real Correlate constructor so the payload block, the
+// evidence header and the Alerts table are all checked in one body.
+func TestIssueBodyRedactsGroupIdentity(t *testing.T) {
+	gs := Correlate([]Alert{
+		alert("ZetaAlpha", "payments bearer=synthetic-body-bearer", "warning", 0),
+		alert("ZetaBeta", "payments bearer=synthetic-body-bearer", "warning", 0),
+	}, nil, DefaultSignatures(), time.Minute)
+	if len(gs) != 1 {
+		t.Fatalf("expected one namespace group, got %d", len(gs))
+	}
+	body := renderIssueBody(Report{Group: gs[0]}, "sig-x")
+	if strings.Contains(body, "synthetic-body-bearer") {
+		t.Errorf("credential leaked into issue body:\n%s", body)
+	}
+	if !strings.Contains(body, "payments [REDACTED]") {
+		t.Errorf("body should carry the redaction marker:\n%s", body)
+	}
+}
+
 func TestIsCredentialKey(t *testing.T) {
 	secret := []string{"password", "Password", "db_password", "api-key", "API_KEY", "apiKey", "access_token", "secret", "client_secret", "credential", "authorization", "bearer", "private_key", "AWS_SECRET_ACCESS_KEY"}
 	for _, k := range secret {

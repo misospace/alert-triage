@@ -635,7 +635,10 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 			Confidence: r.Triage.Confidence, Actionable: r.Triage.Actionable(),
 		}
 		for _, a := range g.Alerts {
-			rec.Alerts = append(rec.Alerts, a.name())
+			// /recent serves these records over HTTP (auth fail-open when
+			// WEBHOOK_TOKEN is unset), so the alert name enters through the
+			// same gate as every other display of a fixed-key value (#278 review).
+			rec.Alerts = append(rec.Alerts, stripSecrets(a.name()))
 		}
 		if err := Deliver(ctx, cfg, r); err != nil {
 			rec.DeliverErr = err.Error()

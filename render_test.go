@@ -122,6 +122,36 @@ func TestDiscordDescriptionRedactsFixedLabelValues(t *testing.T) {
 	}
 }
 
+// TestRenderEvidenceRedactsHeaderIdentityLines (#278 review): the evidence
+// header echoes the Cluster, Node and Namespaces fields into the prompt, the
+// issue and PR evidence blocks and /recent. Those fields stay raw because
+// enrichment queries key on them, so the renderer is where they must be
+// redacted.
+func TestRenderEvidenceRedactsHeaderIdentityLines(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "namespace/payments [REDACTED]",
+			Reason:     "Alerts share namespace payments [REDACTED] within one window",
+			Cluster:    "prod token=synthetic-hdr-token",
+			Node:       "node-1 bearer abcdef0123456789",
+			Namespaces: []string{"payments password=synthetic-hdr-password"},
+			Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "A", "namespace": "payments"}}},
+		},
+		Enrichment: Enrichment{Scope: "namespaces payments token=synthetic-scope-secret plus cluster node health"},
+	}
+	got := renderEvidence(rpt)
+	for _, secret := range []string{"synthetic-hdr-token", "abcdef0123456789", "synthetic-hdr-password", "synthetic-scope-secret"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("secret %q leaked into evidence header:\n%s", secret, got)
+		}
+	}
+	for _, benign := range []string{"Cluster: prod [REDACTED]", "Node: node-1 [REDACTED]", "Namespaces: payments [REDACTED]"} {
+		if !strings.Contains(got, benign) {
+			t.Errorf("want %q in:\n%s", benign, got)
+		}
+	}
+}
+
 func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})

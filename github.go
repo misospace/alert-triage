@@ -360,6 +360,13 @@ func sanitizedAlerts(alerts []Alert) []Alert {
 	out := make([]Alert, len(alerts))
 	copy(out, alerts)
 	for i := range out {
+		// Fingerprint and Status are as sender-controlled as any label, and
+		// this payload block is a durable verbatim echo. A real Alertmanager
+		// fingerprint is a hex hash, but the webhook token fails open, so a
+		// poster can put anything in either field; both pass the same gate as
+		// the maps (#278 review).
+		out[i].Fingerprint = stripSecrets(out[i].Fingerprint)
+		out[i].Status = stripSecrets(out[i].Status)
 		if out[i].Labels != nil {
 			out[i].Labels = sanitizedMetadata(out[i].Labels)
 		}

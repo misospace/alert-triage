@@ -196,6 +196,49 @@ func TestTitleRedactsCredentialAlertName(t *testing.T) {
 	}
 }
 
+// #278 review: the cluster label rides the same title as the alert names.
+func TestTitleRedactsClusterLabel(t *testing.T) {
+	g := Group{Cluster: "prod token=synthetic-cluster-secret", Alerts: []Alert{alert("Incident", "x", "warning", 0)}}
+	got := g.Title()
+	if strings.Contains(got, "synthetic-cluster-secret") {
+		t.Errorf("credential leaked into title: %q", got)
+	}
+	if want := "[prod [REDACTED]] Incident"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+// #278 review: Key and Reason echo the bucket value into the Discord embed
+// footer, the issue payload block, the evidence header, /recent and the
+// journal, so the single production constructor redacts them once. Bucketing
+// itself still partitions on the raw values: two namespaces that share only
+// a redaction marker must not fuse into one incident.
+func TestGroupKeyAndReasonRedactAlertSuppliedBuckets(t *testing.T) {
+	lone := Correlate([]Alert{alert("LoneAlert password=synthetic-single-secret", "", "warning", 0)}, nil, DefaultSignatures(), time.Minute)
+	if len(lone) != 1 {
+		t.Fatalf("expected one isolated group, got %d", len(lone))
+	}
+	if got := lone[0].Key; got != "single/LoneAlert [REDACTED]" {
+		t.Errorf("single-alert Key not redacted: %q", got)
+	}
+
+	shared := []Alert{
+		alert("ZetaAlpha", "payments token=synthetic-bucket-secret", "warning", 0),
+		alert("ZetaBeta", "payments token=synthetic-bucket-secret", "warning", 0),
+	}
+	groups := Correlate(shared, nil, DefaultSignatures(), time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("expected one namespace group, got %d: %+v", len(groups), groups)
+	}
+	g := groups[0]
+	if strings.Contains(g.Key, "synthetic-bucket-secret") || strings.Contains(g.Reason, "synthetic-bucket-secret") {
+		t.Errorf("bucket credential leaked into Key/Reason: %q / %q", g.Key, g.Reason)
+	}
+	if want := "namespace/payments [REDACTED]"; g.Key != want {
+		t.Errorf("want Key %q, got %q", want, g.Key)
+	}
+}
+
 // Regression: the node signature once triggered on any alert whose text merely
 // contained "node" (KubePodNotReady, CephNodeDiskspaceWarning) and then scoped
 // to everything, fusing an entire window of unrelated alerts into one incident.
