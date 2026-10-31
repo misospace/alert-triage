@@ -969,11 +969,14 @@ func applyDiff(original, diff string) (string, bool) {
 	out = append(out, orig[:oldStart-1]...)
 	out = append(out, added...)
 	out = append(out, orig[oldStart-1+oldCount:]...)
-	res := strings.Join(out, "\n")
-	if strings.HasSuffix(original, "\n") {
-		res += "\n"
-	}
-	return res, true
+	// The hunk body lives in splitLines' trimmed line space and never
+	// mentions trailing newlines, so they must be carried over from the
+	// original byte-for-byte. Re-appending a single break used to normalise
+	// a manifest ending in blank lines, dropping an otherwise valid proposal
+	// at the buildMemoryPatch guard (#281). Lone-CR line breaks stay refused:
+	// splitLines still cannot represent them, and the position walk is not
+	// line-ending-aware.
+	return strings.Join(out, "\n") + strings.Repeat("\n", len(original)-len(strings.TrimRight(original, "\n"))), true
 }
 
 // timeNow is the clock for the daily cap; stubbable in tests.

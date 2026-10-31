@@ -150,6 +150,41 @@ func TestApplyDiffRoundTrip(t *testing.T) {
 	}
 }
 
+func TestApplyDiffPreservesTrailingNewlines(t *testing.T) {
+	// splitLines trims every trailing break, so re-appending a single one
+	// used to normalise a manifest ending in blank lines (#281). Every
+	// trailing break of the original must survive the patch byte-for-byte,
+	// and content without a final break must stay without one.
+	if got, ok := applyDiff("x\n\n\n", "--- a/y\n+++ b/y\n@@ -1,1 +1,1 @@\n-x\n+y"); !ok || got != "y\n\n\n" {
+		t.Errorf("trailing blank lines were not carried over: ok=%v got=%q", ok, got)
+	}
+	if got, ok := applyDiff("x", "--- a/y\n+++ b/y\n@@ -1,1 +1,1 @@\n-x\n+y"); !ok || got != "y" {
+		t.Errorf("content without a final break gained one: ok=%v got=%q", ok, got)
+	}
+}
+
+func TestProposeAppliesThroughTrailingBlankLines(t *testing.T) {
+	// A manifest identical to the accepted fixture except for two blank
+	// lines at the end must still ship a proposal whose applied content
+	// raises exactly the memory scalar (#281).
+	triage := Triage{FixLocation: "git", Confidence: "high"}
+	manifest := patchableManifest + "\n\n"
+	diff := Propose(oomAlerts(), triage, "deploy/web.yaml", manifest)
+	if diff == "" {
+		t.Fatalf("expected a diff from Propose for a manifest ending in blank lines")
+	}
+	patched, ok := applyDiff(manifest, diff)
+	if !ok {
+		t.Fatalf("applyDiff failed on a valid Propose diff:\n%s", diff)
+	}
+	want := strings.Replace(patchableManifest,
+		"cpu: 250m\n              memory: 64Mi",
+		"cpu: 250m\n              memory: 128Mi", 1) + "\n\n"
+	if patched != want {
+		t.Errorf("patched content mismatch:\nwant:\n%q\ngot:\n%q", want, patched)
+	}
+}
+
 func TestApplyDiffRejectsGarbage(t *testing.T) {
 	if _, ok := applyDiff("x", "not a patch"); ok {
 		t.Errorf("garbage patch should fail closed")
