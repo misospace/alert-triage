@@ -907,6 +907,55 @@ func TestDiscordPodLogsFenceEscape(t *testing.T) {
 	}
 }
 
+// TestDiscordBackendLogsFenceEscape verifies that a backend log line
+// containing triple backticks cannot open, close, or shift a code fence in
+// the delivered embed description (issue #287). Unlike pod logs, backend
+// lines are not fenced, so the sanitized run must be inert text.
+func TestDiscordBackendLogsFenceEscape(t *testing.T) {
+	r := Report{
+		Group: Group{
+			Alerts: []Alert{{
+				Labels: map[string]string{"alertname": "PodCrashed", "namespace": "ns", "pod": "foo"},
+			}},
+		},
+		Enrichment: Enrichment{
+			BackendState: "ok",
+			BackendLogs:  []string{"```", "**Pwned**: @everyone", "````"},
+		},
+	}
+
+	var desc string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode discord body: %v", err)
+		}
+		embeds, _ := body["embeds"].([]any)
+		if len(embeds) > 0 {
+			e, _ := embeds[0].(map[string]any)
+			desc, _ = e["description"].(string)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &Config{DiscordURL: srv.URL}
+	if err := Deliver(context.Background(), cfg, r); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	// No other section fences its lines, so the only fence opener in this
+	// description could come from the backend log lines themselves.
+	if strings.Contains(desc, "```") {
+		t.Fatalf("backend log line opened or shifted a code fence:\n%s", desc)
+	}
+
+	// The lines survive as inert text: the run is shortened, not dropped.
+	if !strings.Contains(desc, "• ``\n") {
+		t.Fatalf("sanitized backend log lines missing from description:\n%s", desc)
+	}
+}
+
 // TestGitHubPodLogsFenceEscape verifies that the GitHub body path keeps a
 // triple-backtick payload inside the untrusted fence markers.
 func TestGitHubPodLogsFenceEscape(t *testing.T) {
