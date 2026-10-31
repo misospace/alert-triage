@@ -222,10 +222,9 @@ func buildMemoryPatch(relPath, original, container string) (string, bool) {
 	}
 	// The write arm commits applyDiff(content, diff), not the content verified
 	// above. Prove the emitted patch reproduces exactly that content under
-	// the same applier before anyone is allowed to ship it. This also refuses
-	// files whose trailing newlines applyDiff would normalise (more than one
-	// final break): the committed content would differ from the original in
-	// bytes the proposal never mentions, so no patch is shipped instead.
+	// the same applier before anyone is allowed to ship it. The applier
+	// carries the original's trailing newlines over unchanged (#281), so any
+	// residual difference is a patch bug and no patch is shipped instead.
 	if applied, ok := applyDiff(original, diff); !ok || applied != patched {
 		log.Printf("propose: dropped, emitted patch does not reproduce patched content for %s", cleanPath)
 		return "", false
