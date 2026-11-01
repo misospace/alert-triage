@@ -29,7 +29,6 @@ package main
 //     to "proposal only". It never blocks the digest.
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -491,19 +490,13 @@ func (g *gitHubClient) listPRs(ctx context.Context, page, perPage int) ([]ghPR, 
 	q.Set("per_page", fmt.Sprintf("%d", perPage))
 	q.Set("page", fmt.Sprintf("%d", page))
 	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	g.setHeaders(req)
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, 0, fmt.Errorf("github pr list: %s: %s", resp.Status, string(body))
+		return nil, 0, githubStatusError("github pr list", resp)
 	}
 	var raw []ghPR
 	body, err := readCappedBody(resp.Body, ghListBodyCap)
@@ -582,12 +575,7 @@ func (g *gitHubClient) adoptBranch(ctx context.Context, patch *filePatch) error 
 // the status code alone.
 func (g *gitHubClient) confirmBranch(ctx context.Context, branch string) error {
 	u := g.apiURL + "/repos/" + g.repo + "/git/ref/heads/" + url.PathEscape(branch)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
@@ -607,19 +595,13 @@ func (g *gitHubClient) confirmBranch(ctx context.Context, branch string) error {
 // SHA of its HEAD, used as the base for new PR branches.
 func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string, err error) {
 	u := g.apiURL + "/repos/" + g.repo
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", "", err
-	}
-	g.setHeaders(req)
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", "", fmt.Errorf("github repo: %s: %s", resp.Status, string(body))
+		return "", "", githubStatusError("github repo", resp)
 	}
 	var out struct {
 		DefaultBranch string `json:"default_branch"`
@@ -636,19 +618,13 @@ func (g *gitHubClient) defaultBranch(ctx context.Context) (name, headSHA string,
 	}
 
 	u2 := g.apiURL + "/repos/" + g.repo + "/git/ref/heads/" + url.PathEscape(out.DefaultBranch)
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, u2, nil)
-	if err != nil {
-		return "", "", err
-	}
-	g.setHeaders(req2)
-	resp2, err := g.hc.Do(req2)
+	resp2, err := g.doRequest(ctx, http.MethodGet, u2, nil)
 	if err != nil {
 		return "", "", err
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp2.Body, 4096))
-		return "", "", fmt.Errorf("github default ref: %s: %s", resp2.Status, string(body))
+		return "", "", githubStatusError("github default ref", resp2)
 	}
 	var ref struct {
 		Object struct {
@@ -683,12 +659,7 @@ const ghFileBodyCap = metricsBodyCap
 // closed at the read, before any write.
 func (g *gitHubClient) getFile(ctx context.Context, branch, file string) (content, sha string, err error) {
 	u := g.apiURL + "/repos/" + g.repo + "/contents/" + url.PathEscape(file) + "?ref=" + url.QueryEscape(branch)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", "", err
-	}
-	g.setHeaders(req)
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -697,8 +668,7 @@ func (g *gitHubClient) getFile(ctx context.Context, branch, file string) (conten
 		return "", "", fmt.Errorf("github get file: %s not found on %s", file, branch)
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", "", fmt.Errorf("github get file: %s: %s", resp.Status, string(body))
+		return "", "", githubStatusError("github get file", resp)
 	}
 	var out struct {
 		Type     string `json:"type"`
@@ -732,17 +702,7 @@ func (g *gitHubClient) createBranch(ctx context.Context, branch, fromSHA string)
 		"ref": "refs/heads/" + branch,
 		"sha": fromSHA,
 	}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPost, u, payload)
 	if err != nil {
 		return err
 	}
@@ -754,8 +714,7 @@ func (g *gitHubClient) createBranch(ctx context.Context, branch, fromSHA string)
 		return errBranchExists
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github create branch: %s: %s", resp.Status, string(body))
+		return githubStatusError("github create branch", resp)
 	}
 	return nil
 }
@@ -772,24 +731,13 @@ func (g *gitHubClient) putFile(ctx context.Context, branch, file, content, sha s
 		"branch":  branch,
 		"sha":     sha,
 	}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPut, u, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github put file: %s: %s", resp.Status, string(body))
+		return githubStatusError("github put file", resp)
 	}
 	return nil
 }
@@ -801,25 +749,14 @@ func (g *gitHubClient) createPR(ctx context.Context, head, base, title, body str
 		"head":  head,
 		"base":  base,
 	}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
 	u := g.apiURL + "/repos/" + g.repo + "/pulls"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPost, u, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github create pr: %s: %s", resp.Status, string(body))
+		return githubStatusError("github create pr", resp)
 	}
 	return nil
 }
@@ -830,24 +767,13 @@ func (g *gitHubClient) updatePR(ctx context.Context, pr *ghPR, r Report, digestU
 	body := fmt.Sprintf("Re-fire for signature `%s`.\n\n%s", r.Group.Signature(), prUpdateBody(r, digestURL))
 	u := fmt.Sprintf("%s/repos/%s/issues/%d/comments", g.apiURL, g.repo, pr.Number)
 	payload := map[string]string{"body": body}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPost, u, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github pr comment: %s: %s", resp.Status, string(body))
+		return githubStatusError("github pr comment", resp)
 	}
 	return nil
 }

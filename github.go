@@ -442,13 +442,7 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 	q.Set("page", fmt.Sprintf("%d", page))
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	g.setHeaders(req)
-
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -457,8 +451,7 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 		return nil, 0, fmt.Errorf("github: repo %q not found or token lacks access", g.repo)
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, 0, fmt.Errorf("github list: %s: %s", resp.Status, string(body))
+		return nil, 0, githubStatusError("github list", resp)
 	}
 
 	var raw []ghIssue
@@ -523,25 +516,13 @@ func (g *gitHubClient) createIssue(ctx context.Context, title, body string, labe
 		"body":   body,
 		"labels": labels,
 	}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return 0, "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.apiURL+"/repos/"+g.repo+"/issues", bytes.NewReader(buf))
-	if err != nil {
-		return 0, "", err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPost, g.apiURL+"/repos/"+g.repo+"/issues", payload)
 	if err != nil {
 		return 0, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return 0, "", fmt.Errorf("github create: %s: %s", resp.Status, string(body))
+		return 0, "", githubStatusError("github create", resp)
 	}
 	var out ghIssue
 	respBody, err := readCappedBody(resp.Body, ghSmallBodyCap)
@@ -556,26 +537,14 @@ func (g *gitHubClient) createIssue(ctx context.Context, title, body string, labe
 
 func (g *gitHubClient) comment(ctx context.Context, number int, body string) error {
 	payload := map[string]string{"body": body}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
 	u := fmt.Sprintf("%s/repos/%s/issues/%d/comments", g.apiURL, g.repo, number)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPost, u, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github comment: %s: %s", resp.Status, string(body))
+		return githubStatusError("github comment", resp)
 	}
 	return nil
 }
@@ -597,26 +566,14 @@ func (g *gitHubClient) setSeverityLabel(ctx context.Context, number int, existin
 	labels = append(labels, want)
 
 	payload := map[string]any{"labels": labels}
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
 	u := fmt.Sprintf("%s/repos/%s/issues/%d/labels", g.apiURL, g.repo, number)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(buf))
-	if err != nil {
-		return err
-	}
-	g.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodPut, u, payload)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("github labels: %s: %s", resp.Status, string(body))
+		return githubStatusError("github labels", resp)
 	}
 	return nil
 }
@@ -626,6 +583,41 @@ func (g *gitHubClient) setHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "alert-triage")
+}
+
+// doRequest builds and sends one GitHub API request. A non-nil payload is
+// JSON-encoded and sent with the matching Content-Type; a nil payload sends no
+// body, which is every read path. Status handling stays at the call sites: a
+// 404, 403 or 422 means something specific enough that folding it into one
+// generic error here would lose it. The response body is left open for the
+// caller to read and close.
+func (g *gitHubClient) doRequest(ctx context.Context, method, rawURL string, payload any) (*http.Response, error) {
+	var body io.Reader
+	if payload != nil {
+		buf, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(buf)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	g.setHeaders(req)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return g.hc.Do(req)
+}
+
+// githubStatusError formats a non-success GitHub response: the caller's label, the
+// HTTP status, and a bounded sample of the body. The sample is capped so a
+// verbose proxy error cannot fill memory; a caller that needs a specific
+// message for a status checks it before reaching here.
+func githubStatusError(prefix string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("%s: %s: %s", prefix, resp.Status, string(body))
 }
 
 // Commit relevance for a Flux reconcile. A healthy Flux reconcile is neutral
@@ -998,13 +990,7 @@ func (g *gitHubClient) fetchCommitFiles(ctx context.Context, ownerRepo, sha stri
 // workload's Git surface, so dropping the old path would turn that into a
 // false "does not touch" (issue #185).
 func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]string, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	g.setHeaders(req)
-
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1018,8 +1004,7 @@ func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]strin
 		return nil, "", fmt.Errorf("github: commit forbidden (rate limit or permissions)")
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", fmt.Errorf("github commit: %s: %s", resp.Status, string(body))
+		return nil, "", githubStatusError("github commit", resp)
 	}
 	var payload struct {
 		Files []struct {
@@ -1079,12 +1064,7 @@ func (g *gitHubClient) fetchCommitMessage(ctx context.Context, ownerRepo, sha st
 		return ""
 	}
 	u := g.apiURL + "/repos/" + ownerRepo + "/commits/" + sha
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return ""
-	}
-	g.setHeaders(req)
-	resp, err := g.hc.Do(req)
+	resp, err := g.doRequest(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return ""
 	}
