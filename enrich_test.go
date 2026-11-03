@@ -96,6 +96,100 @@ func TestEnrichSkipsOnlyWhenBothClustersAreKnownAndDiffer(t *testing.T) {
 	}
 }
 
+// Issue #294: a forbidden, canceled, malformed or oversized node-list read
+// returned an empty findings slice identical to a healthy cluster's, and the
+// renderer asserted "all nodes Ready" from it. Inspection success is now a
+// separate fact, so a failed read cannot masquerade as a ruled-out cause.
+func TestEnrichNodeHealthCarriesReadSuccess(t *testing.T) {
+	const (
+		healthyNodes   = `{"items":[{"metadata":{"name":"n1"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}`
+		unhealthyNodes = `{"items":[{"metadata":{"name":"n1"},"spec":{"unschedulable":true},"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}}]}`
+	)
+
+	tests := []struct {
+		name           string
+		writeNodes     func(http.ResponseWriter)
+		cancelCtx      bool
+		wantInspected  bool
+		wantNodeSubstr string
+	}{
+		{"successful healthy list is inspected", func(w http.ResponseWriter) { io.WriteString(w, healthyNodes) }, false, true, ""},
+		{"successful unhealthy list is inspected", func(w http.ResponseWriter) { io.WriteString(w, unhealthyNodes) }, false, true, "n1 NotReady: KubeletNotReady, cordoned"},
+		{"forbidden read is not inspected", func(w http.ResponseWriter) { http.Error(w, "nope", http.StatusForbidden) }, false, false, ""},
+		{"malformed body is not inspected", func(w http.ResponseWriter) { io.WriteString(w, `{"items":`) }, false, false, ""},
+		// One byte past kubeBodyCap is enough: readCappedBody fails the read
+		// without buffering the rest of the body.
+		{"oversized body is not inspected", func(w http.ResponseWriter) { w.Write(make([]byte, kubeBodyCap+1)) }, false, false, ""},
+		{"canceled read is not inspected", func(w http.ResponseWriter) { io.WriteString(w, healthyNodes) }, true, false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/nodes" {
+					tt.writeNodes(w)
+					return
+				}
+				io.WriteString(w, `{}`)
+			}))
+			defer srv.Close()
+
+			k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+			ctx := context.Background()
+			if tt.cancelCtx {
+				// Cancelled before the call: the apiserver never answers,
+				// which is the timed-out read this regression is about.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			e := k.Enrich(ctx, Group{Key: "single/A", Alerts: []Alert{
+				{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
+			}}, time.Minute, &Config{}, nil)
+
+			if e.NodesInspected != tt.wantInspected {
+				t.Errorf("NodesInspected = %v, want %v", e.NodesInspected, tt.wantInspected)
+			}
+			if !tt.wantInspected && len(e.Nodes) != 0 {
+				t.Errorf("failed read must carry no findings, got %v", e.Nodes)
+			}
+			if tt.wantNodeSubstr != "" && !strings.Contains(strings.Join(e.Nodes, "; "), tt.wantNodeSubstr) {
+				t.Errorf("want finding %q in %v", tt.wantNodeSubstr, e.Nodes)
+			}
+		})
+	}
+}
+
+// A nil client never reads the cluster, so node health must stay uninspected
+// rather than rendering as the healthy negative (#294).
+func TestEnrichNilClientLeavesNodeHealthUninspected(t *testing.T) {
+	var k *kube
+	e := k.Enrich(context.Background(), Group{Key: "single/A"}, time.Minute, &Config{}, nil)
+	if e.NodesInspected || len(e.Nodes) != 0 {
+		t.Errorf("nil client must not claim node health: inspected=%v nodes=%v", e.NodesInspected, e.Nodes)
+	}
+}
+
+// The foreign-cluster skip must also leave node health uninspected even
+// though the local API server answers fine: those nodes describe the wrong
+// cluster, so reporting them - or their silence - is wrong evidence (#294).
+func TestEnrichForeignClusterSkipLeavesNodeHealthUninspected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{cluster: "main", base: srv.URL, token: "tok", hc: srv.Client()}
+	e := k.Enrich(context.Background(), Group{Key: "single/A", Cluster: "utility", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
+	}}, time.Minute, &Config{}, nil)
+	if e.NodesInspected || len(e.Nodes) != 0 {
+		t.Errorf("foreign-cluster skip must not claim node health: inspected=%v nodes=%v", e.NodesInspected, e.Nodes)
+	}
+	if !strings.Contains(e.Scope, "cluster state unavailable") {
+		t.Errorf("skip must still report scope, got %q", e.Scope)
+	}
+}
+
 func TestEnrichment_empty(t *testing.T) {
 	got := Enrichment{}.empty()
 	if !got {

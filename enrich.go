@@ -484,8 +484,16 @@ type jobRef struct {
 
 // Enrichment is the evidence gathered for one group.
 type Enrichment struct {
-	Nodes         []string
-	UnhealthyPods []string
+	Nodes []string
+	// NodesInspected records whether the node list was actually read. An
+	// empty Nodes after a successful read means every node is Ready and may
+	// be rendered as a ruled-out cause; an empty Nodes without it means node
+	// health is unknown. A forbidden, timed-out, malformed or oversized
+	// GET /api/v1/nodes fails the same way a healthy cluster returns
+	// nothing, and the nil-client and foreign-cluster skips never read at
+	// all — all of which used to render as "all nodes Ready" (issue #294).
+	NodesInspected bool
+	UnhealthyPods  []string
 	// PodID carries the declared execution identity and PVC mount
 	// relationships of the pods the alerts resolved to (a named pod, or a pod
 	// owned by a named Job), so permission hypotheses can be grounded in live
@@ -847,7 +855,9 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 
 	// Node health is reported as a direct finding regardless of scope: a node in
 	// trouble plausibly explains almost any alert, and healthy nodes rule that out.
-	e.Nodes = k.unhealthyNodes(ctx)
+	// The success flag is what lets the renderer tell "checked, all fine" from
+	// "the read failed" (issue #294).
+	e.Nodes, e.NodesInspected = k.unhealthyNodes(ctx)
 
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
@@ -1367,12 +1377,14 @@ func ownershipChain(kind, nsName string, refs []ownerRef, identity string) strin
 }
 
 // unhealthyNodes reports nodes that are not Ready, are under pressure, or have
-// been cordoned. A healthy cluster returns nothing, which is itself evidence.
-func (k *kube) unhealthyNodes(ctx context.Context) []string {
+// been cordoned. A healthy cluster returns nothing, which is itself evidence —
+// but only when the second result says the read succeeded. Failed reads return
+// false so the empty list is never rendered as a healthy cluster (issue #294).
+func (k *kube) unhealthyNodes(ctx context.Context) ([]string, bool) {
 	var nodes nodeList
 	if err := k.get(ctx, "/api/v1/nodes", &nodes); err != nil {
 		logf("enrich: nodes: %v", err)
-		return nil
+		return nil, false
 	}
 	var out []string
 	for _, n := range nodes.Items {
@@ -1392,7 +1404,7 @@ func (k *kube) unhealthyNodes(ctx context.Context) []string {
 			out = append(out, n.Metadata.Name+" "+strings.Join(problems, ", "))
 		}
 	}
-	return out
+	return out, true
 }
 
 type subjectKey struct {

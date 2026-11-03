@@ -1439,7 +1439,7 @@ func TestBackendLogsScopedToDirectTier(t *testing.T) {
 func TestExplicitNegativesKeepTheirScopeAcrossTiers(t *testing.T) {
 	got := renderEvidence(Report{
 		Group:      Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}}},
-		Enrichment: Enrichment{Scope: "namespaces ns1 plus cluster node health", EventsScoped: true},
+		Enrichment: Enrichment{Scope: "namespaces ns1 plus cluster node health", EventsScoped: true, NodesInspected: true},
 	})
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")
