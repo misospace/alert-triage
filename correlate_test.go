@@ -533,3 +533,123 @@ func TestCorrelateWithoutConfiguredClusterKeepsDefault(t *testing.T) {
 		t.Errorf("expected default title %q, got %q", want, got)
 	}
 }
+
+// Node attribution used to be keyed and looked up by fingerprint alone. A
+// replayed or hand-built payload carries no fingerprint, so every such alert
+// shared one map key and distinct nodes overwrote each other: two unrelated
+// alerts on different nodes collapsed onto whichever node was resolved last
+// and formed a false shared-node incident (issue #295).
+func TestFingerprintlessAlertsOnDistinctNodesDoNotGroup(t *testing.T) {
+	a := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Alpha", "namespace": "one", "node": "node-a"},
+		StartsAt: base,
+	}
+	b := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Beta", "namespace": "two", "node": "node-b"},
+		StartsAt: base,
+	}
+	nodeOf := map[string]string{a.identity(): "node-a", b.identity(): "node-b"}
+
+	groups := Correlate([]Alert{a, b}, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 2 {
+		t.Fatalf("want two independent alerts, got %d groups: %+v", len(groups), groups)
+	}
+	wantNode := map[string]string{"Alpha": "node-a", "Beta": "node-b"}
+	for _, g := range groups {
+		if g.Key == "node/node-a" || g.Key == "node/node-b" {
+			t.Errorf("alerts on distinct nodes were grouped: %s", g.Key)
+		}
+		if len(g.Alerts) != 1 {
+			t.Errorf("want one alert per group, got %d in %s", len(g.Alerts), g.Key)
+			continue
+		}
+		if got := g.Node; got != wantNode[g.Alerts[0].name()] {
+			t.Errorf("want node attribution %q for %s, got %q", wantNode[g.Alerts[0].name()], g.Alerts[0].name(), got)
+		}
+	}
+}
+
+// The same defect must not separate alerts that genuinely share a node.
+func TestFingerprintlessAlertsOnSameNodeStillGroup(t *testing.T) {
+	a := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Alpha", "namespace": "one", "node": "node-a"},
+		StartsAt: base,
+	}
+	b := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Beta", "namespace": "two", "node": "node-a"},
+		StartsAt: base,
+	}
+	nodeOf := map[string]string{a.identity(): "node-a", b.identity(): "node-a"}
+
+	groups := Correlate([]Alert{a, b}, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("want one shared-node group, got %d groups: %+v", len(groups), groups)
+	}
+	if groups[0].Key != "node/node-a" {
+		t.Errorf("want node/node-a, got %s", groups[0].Key)
+	}
+	if groups[0].Node != "node-a" {
+		t.Errorf("want node attribution node-a, got %q", groups[0].Node)
+	}
+	// The signature must carry the attributed node, so a recurrence of this
+	// incident is recognised as the same shape.
+	want := Group{Node: "node-a", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "Alpha"}},
+		{Labels: map[string]string{"alertname": "Beta"}},
+	}}.Signature()
+	if got := groups[0].Signature(); got != want {
+		t.Errorf("signature %q does not match node-attributed expectation %q", got, want)
+	}
+}
+
+// A batch that mixes fingerprint-bearing and fingerprint-less alerts must
+// attribute each of them to its own node.
+func TestMixedFingerprintAndFingerprintlessBatchKeepTheirNodes(t *testing.T) {
+	withFP := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "Alpha", "namespace": "one", "node": "node-a"},
+		StartsAt:    base,
+		Fingerprint: "fp-1",
+	}
+	withoutFP := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Beta", "namespace": "two", "node": "node-b"},
+		StartsAt: base,
+	}
+	nodeOf := map[string]string{withFP.identity(): "node-a", withoutFP.identity(): "node-b"}
+
+	groups := Correlate([]Alert{withFP, withoutFP}, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 2 {
+		t.Fatalf("want two independent alerts, got %d groups: %+v", len(groups), groups)
+	}
+	nodes := map[string]bool{}
+	for _, g := range groups {
+		nodes[g.Node] = true
+	}
+	if !nodes["node-a"] || !nodes["node-b"] {
+		t.Errorf("want each alert attributed to its own node, got %v", nodes)
+	}
+
+	// Same node, one alert with a fingerprint and one without: they still
+	// belong to one incident.
+	sameNode := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Beta", "namespace": "two", "node": "node-a"},
+		StartsAt: base,
+	}
+	nodeOf = map[string]string{withFP.identity(): "node-a", sameNode.identity(): "node-a"}
+	groups = Correlate([]Alert{withFP, sameNode}, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 1 {
+		t.Fatalf("want one shared-node group, got %d groups: %+v", len(groups), groups)
+	}
+	if groups[0].Key != "node/node-a" {
+		t.Errorf("want node/node-a, got %s", groups[0].Key)
+	}
+	if groups[0].Node != "node-a" {
+		t.Errorf("want node attribution node-a, got %q", groups[0].Node)
+	}
+}

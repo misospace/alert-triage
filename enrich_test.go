@@ -216,6 +216,103 @@ func TestResolveNodesNilReceiver(t *testing.T) {
 	}
 }
 
+// Node attribution used to be keyed by fingerprint alone. A replayed or
+// hand-built payload carries no fingerprint, so every such alert shared one
+// map key and the last node resolved won: distinct nodes overwrote each
+// other's attribution and unrelated alerts looked like a shared-node incident
+// (issue #295).
+func TestResolveNodesKeepsFingerprintlessAlertsApart(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p1"},"spec":{"nodeName":"worker-1"}},{"metadata":{"name":"p2"},"spec":{"nodeName":"worker-2"}}]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Labels: map[string]string{"alertname": "Alpha", "pod": "p1", "namespace": "ns-a"}},
+		{Labels: map[string]string{"alertname": "Beta", "pod": "p2", "namespace": "ns-a"}},
+	}
+	got := k.ResolveNodes(context.Background(), alerts)
+	if len(got) != 2 {
+		t.Fatalf("want one attribution per alert, got %d: %#v", len(got), got)
+	}
+	if got[alerts[0].identity()] != "worker-1" {
+		t.Errorf("want worker-1 for the first alert, got %q", got[alerts[0].identity()])
+	}
+	if got[alerts[1].identity()] != "worker-2" {
+		t.Errorf("want worker-2 for the second alert, got %q", got[alerts[1].identity()])
+	}
+	if _, ok := got[""]; ok {
+		t.Error("attribution keyed by the empty fingerprint, so alerts overwrite each other")
+	}
+}
+
+// Fingerprint-less alerts that already name their node must keep their own
+// attribution too.
+func TestResolveNodesFingerprintlessExplicitNodes(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Labels: map[string]string{"alertname": "Alpha", "node": "node-a"}},
+		{Labels: map[string]string{"alertname": "Beta", "node": "node-b"}},
+	}
+	got := k.ResolveNodes(context.Background(), alerts)
+	if len(got) != 2 {
+		t.Fatalf("want one attribution per alert, got %d: %#v", len(got), got)
+	}
+	if got[alerts[0].identity()] != "node-a" {
+		t.Errorf("want node-a for the first alert, got %q", got[alerts[0].identity()])
+	}
+	if got[alerts[1].identity()] != "node-b" {
+		t.Errorf("want node-b for the second alert, got %q", got[alerts[1].identity()])
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Fatalf("unexpected API hits for node-labelled alerts: %d", hits)
+	}
+}
+
+// The path the service actually runs: node attribution is resolved from the
+// cluster first and correlation reads it back. Two fingerprint-less alerts on
+// different nodes used to collapse into one shared-node incident, because the
+// attribution map held a single empty-fingerprint entry that both alerts
+// looked up (issue #295).
+func TestFingerprintlessAlertsStayIndependentEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p1"},"spec":{"nodeName":"node-a"}},{"metadata":{"name":"p2"},"spec":{"nodeName":"node-b"}}]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Status: "firing", Labels: map[string]string{"alertname": "Alpha", "pod": "p1", "namespace": "one"}, StartsAt: time.Now()},
+		{Status: "firing", Labels: map[string]string{"alertname": "Beta", "pod": "p2", "namespace": "two"}, StartsAt: time.Now()},
+	}
+	nodeOf := k.ResolveNodes(context.Background(), alerts)
+	groups := Correlate(alerts, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 2 {
+		t.Fatalf("want two independent alerts, got %d groups: %+v", len(groups), groups)
+	}
+	nodes := map[string]bool{}
+	for _, g := range groups {
+		if len(g.Alerts) != 1 {
+			t.Errorf("want one alert per group, got %d in %s", len(g.Alerts), g.Key)
+			continue
+		}
+		nodes[g.Node] = true
+	}
+	if !nodes["node-a"] || !nodes["node-b"] {
+		t.Errorf("want each alert attributed to its own node, got %v", nodes)
+	}
+}
+
 // TestKubeGetContextCancelled verifies that a stalled apiserver call is
 // cancelled promptly when the caller's context is cancelled, rather than
 // blocking for the full http.Client.Timeout (15s).

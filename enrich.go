@@ -770,8 +770,13 @@ func alertNamespace(a Alert) string {
 	return ""
 }
 
-// ResolveNodes maps alert fingerprints to the node their pod runs on, so
+// ResolveNodes maps alert identities to the node their pod runs on, so
 // correlation can group by node even though most alerts only carry pod labels.
+//
+// The key is the alert's identity rather than its fingerprint: replayed and
+// hand-built payloads omit the fingerprint, and keying every such alert by the
+// empty fingerprint would let distinct nodes overwrite each other's
+// attribution (issue #295). Correlation looks the map up by the same identity.
 func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]string {
 	out := map[string]string{}
 	if k == nil {
@@ -780,7 +785,7 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 	byNS := map[string][]Alert{}
 	for _, a := range alerts {
 		if a.Labels["node"] != "" {
-			out[a.Fingerprint] = a.Labels["node"]
+			out[a.identity()] = a.Labels["node"]
 			continue
 		}
 		if a.namespace() != "" && a.Labels["pod"] != "" {
@@ -799,7 +804,7 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 		}
 		for _, a := range list {
 			if n := node[a.Labels["pod"]]; n != "" {
-				out[a.Fingerprint] = n
+				out[a.identity()] = n
 			}
 		}
 	}

@@ -35,6 +35,11 @@ func (a Alert) cluster() string   { return a.Labels["cluster"] }
 // fingerprint, but replayed and hand-built payloads routinely omit it, and an
 // empty fingerprint shared by every alert would make unrelated alerts look like
 // copies of one. Fall back to the labels, which are what a fingerprint hashes.
+//
+// This is the one effective identity of an alert: the buffer dedupes on it and
+// node attribution is keyed by it. Keying attribution on the raw fingerprint
+// instead would make every fingerprint-less alert share one map key, so
+// distinct nodes would overwrite each other (issue #295).
 func (a Alert) identity() string {
 	if a.Fingerprint != "" {
 		return a.Fingerprint
@@ -211,7 +216,9 @@ func overlaps(a, b Alert, slack time.Duration) bool {
 }
 
 // Correlate groups alerts that plausibly share a root cause. It is pure: node
-// attribution must already be resolved into nodeOf, keyed by fingerprint.
+// attribution must already be resolved into nodeOf, keyed by alert identity
+// (Alert.identity), which is the fingerprint when Alertmanager sent one and a
+// labels hash when it did not.
 //
 // Alerts are first partitioned by their resolved cluster so that incidents from
 // different clusters never fuse together (namespace names collide across
@@ -260,6 +267,17 @@ func resolveCluster(label, configured string) string {
 	return "default"
 }
 
+// nodeFor returns the node attributed to an alert. The lookup key is the
+// alert's identity, not its fingerprint: replayed and hand-built payloads
+// omit the fingerprint, and every such alert would then share one map key,
+// so distinct nodes would collapse onto whichever was resolved last.
+func nodeFor(a Alert, nodeOf map[string]string) string {
+	if nodeOf == nil {
+		return ""
+	}
+	return nodeOf[a.identity()]
+}
+
 // correlateCluster runs the correlation algorithm on alerts from a single
 // cluster partition.
 func correlateCluster(alerts []Alert, nodeOf map[string]string, sigs []Signature, slack time.Duration) []Group {
@@ -298,7 +316,7 @@ func correlateCluster(alerts []Alert, nodeOf map[string]string, sigs []Signature
 	}
 
 	groups = append(groups, groupBy(alerts, claimed, slack, "node", nodeOf, func(a Alert) string {
-		return nodeOf[a.Fingerprint]
+		return nodeFor(a, nodeOf)
 	})...)
 	// The same alert firing across several namespaces is one story about a
 	// shared cause, not one story per namespace.
@@ -382,8 +400,10 @@ func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Gro
 			seenNS[ns] = true
 			g.Namespaces = append(g.Namespaces, ns)
 		}
-		if g.Node == "" && nodeOf != nil {
-			g.Node = nodeOf[a.Fingerprint]
+		if g.Node == "" {
+			if n := nodeFor(a, nodeOf); n != "" {
+				g.Node = n
+			}
 		}
 		if g.Cluster == "" {
 			g.Cluster = a.cluster()
