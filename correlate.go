@@ -398,24 +398,36 @@ func groupBy(alerts []Alert, claimed []bool, slack time.Duration, kind string, n
 // Bucketing itself partitioned on the raw values before this call, and
 // Namespaces stays raw on purpose: it is the lookup key for enrichment and
 // log queries, not display text; its renderers strip.
+//
+// Node is derived from every member, not the first one that carries one:
+// Signature hashes it, so a first-wins rule made a multi-node incident's
+// identity depend on the order the members arrived (#298). A group whose
+// members share one node keeps that node; a group that spans several takes
+// the smallest node name, which is a defined representative regardless of
+// order.
 func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Group {
 	g := Group{Key: stripSecrets(key), Reason: stripSecrets(reason), Alerts: members}
 	seenNS := map[string]bool{}
+	seenNode := map[string]bool{}
+	var nodes []string
 	for _, a := range members {
 		if ns := a.namespace(); ns != "" && !seenNS[ns] {
 			seenNS[ns] = true
 			g.Namespaces = append(g.Namespaces, ns)
 		}
-		if g.Node == "" {
-			if n := nodeFor(a, nodeOf); n != "" {
-				g.Node = n
-			}
+		if n := nodeFor(a, nodeOf); n != "" && !seenNode[n] {
+			seenNode[n] = true
+			nodes = append(nodes, n)
 		}
 		if g.Cluster == "" {
 			g.Cluster = a.cluster()
 		}
 	}
 	sort.Strings(g.Namespaces)
+	sort.Strings(nodes)
+	if len(nodes) > 0 {
+		g.Node = nodes[0]
+	}
 	return g
 }
 

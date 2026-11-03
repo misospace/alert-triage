@@ -691,3 +691,36 @@ func TestFingerprintMimickingLabelsHashDoesNotImpersonate(t *testing.T) {
 		}
 	}
 }
+
+// A group whose members span two nodes must attribute a node in a way that
+// does not depend on member order: Signature hashes Group.Node, so a
+// first-wins rule reset the "seen N times" counter whenever the same incident
+// arrived with its members reordered (#298).
+func TestMultiNodeGroupNodeIsOrderIndependent(t *testing.T) {
+	a := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Alpha", "namespace": "one", "node": "node-b"},
+		StartsAt: base,
+	}
+	b := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Alpha", "namespace": "two", "node": "node-a"},
+		StartsAt: base,
+	}
+	nodeOf := map[string]string{a.identity(): "node-b", b.identity(): "node-a"}
+
+	forward := Correlate([]Alert{a, b}, nodeOf, nil, 5*time.Minute)
+	reversed := Correlate([]Alert{b, a}, nodeOf, nil, 5*time.Minute)
+	if len(forward) != 1 || len(reversed) != 1 {
+		t.Fatalf("want one group in both orders, got %d and %d: %+v / %+v", len(forward), len(reversed), forward, reversed)
+	}
+	if forward[0].Node != "node-a" {
+		t.Errorf("want smallest node name node-a, got %q", forward[0].Node)
+	}
+	if reversed[0].Node != "node-a" {
+		t.Errorf("want smallest node name node-a regardless of order, got %q", reversed[0].Node)
+	}
+	if forward[0].Signature() != reversed[0].Signature() {
+		t.Errorf("signature depends on member order: %q vs %q", forward[0].Signature(), reversed[0].Signature())
+	}
+}
