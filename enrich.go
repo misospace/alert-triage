@@ -556,6 +556,9 @@ type Enrichment struct {
 	// to a revision; it does not show what changed in that revision, so the
 	// entries must never be phrased as a deploy or a change.
 	FluxActivity []string
+	// FluxInspected records whether both Flux lists were successfully read in
+	// every inspected scope. An absent/failed read is not a quiet window (#300).
+	FluxInspected bool
 	// RecentRestarts flags pods whose containers restarted inside the alert
 	// window. A restart that left the current container healthy is still
 	// evidence the alert is about, so it is surfaced as its own finding rather
@@ -859,13 +862,19 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// "the read failed" (issue #294).
 	e.Nodes, e.NodesInspected = k.unhealthyNodes(ctx)
 
+	// Early returns above leave the flag false; every attempted Flux scope
+	// below must succeed for a quiet-window negative to be meaningful (#300).
+	e.FluxInspected = true
+
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
 		// rather than reporting no evidence. What comes back is context, not
 		// findings about this alert, and is kept separate so it cannot be
 		// mistaken for one.
 		e.Ambient = append(e.Ambient, k.warningEvents(ctx, "", since)...)
-		e.Ambient = append(e.Ambient, k.fluxActivity(ctx, "", since)...)
+		acts, inspected := k.fluxActivity(ctx, "", since)
+		e.Ambient = append(e.Ambient, acts...)
+		e.FluxInspected = e.FluxInspected && inspected
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
 	} else {
 		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
@@ -1102,7 +1111,9 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				return !resolvedSubjects[subject]
 			})...)
 		}
-		e.FluxActivity = append(e.FluxActivity, k.fluxActivity(ctx, esc, since)...)
+		acts, inspected := k.fluxActivity(ctx, esc, since)
+		e.FluxActivity = append(e.FluxActivity, acts...)
+		e.FluxInspected = e.FluxInspected && inspected
 	}
 
 	// Read the declared identity and PVC relationships of every resolved target

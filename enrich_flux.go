@@ -112,7 +112,10 @@ func safeErr(err error) string {
 
 // fluxActivity reports Flux resources that are failing, and - only when
 // scoped to a namespace - ones whose Ready condition transitioned inside the
-// window.
+// window. The second result records whether both list reads succeeded: a
+// failed read returns the findings gathered so far and false, so an empty
+// slice is only a quiet window when the caller knows the lists were read
+// (issue #300).
 //
 // Cluster-wide reconciles are worthless: a routine sync of the whole repo
 // transitions every resource at once, so a healthy-reconcile listing turns
@@ -125,7 +128,7 @@ func safeErr(err error) string {
 // revision number alone, so this function must not call a sync a deploy or a
 // change. A NotReady transition is a failure, and it keeps the resource's own
 // reason and revision verbatim.
-func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Time) []string {
+func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Time) ([]string, bool) {
 	scoped := namespace != ""
 	apis := []string{
 		"/apis/helm.toolkit.fluxcd.io/v2/helmreleases",
@@ -138,9 +141,16 @@ func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Ti
 		}
 	}
 	var out []string
+	// Both lists must read for the empty result to mean "quiet window": a
+	// cluster without Flux 404s both, and a forbidden or timed-out list hides
+	// exactly the failures this section exists to surface, so either failure
+	// leaves the read uninspected (issue #300).
+	inspected := true
 	for _, api := range apis {
 		var fl fluxList
 		if err := k.get(ctx, api, &fl); err != nil {
+			logf("enrich: flux %s: %v", api, err)
+			inspected = false
 			continue
 		}
 		for _, item := range fl.Items {
@@ -167,7 +177,7 @@ func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Ti
 			}
 		}
 	}
-	return out
+	return out, inspected
 }
 
 func shortRev(rev string) string {

@@ -802,7 +802,10 @@ func TestFluxActivityHealthyReconcileIsNeutral(t *testing.T) {
 		fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), "True"),
 	)
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
-	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	got, inspected := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if !inspected {
+		t.Fatalf("a successful read must report inspected")
+	}
 	if len(got) != 1 {
 		t.Fatalf("expected one healthy-reconcile line, got %d: %v", len(got), got)
 	}
@@ -823,7 +826,10 @@ func TestFluxActivityHealthyReconcileOutsideWindowIsDropped(t *testing.T) {
 	old := time.Now().Add(-10 * time.Hour).UTC().Format(time.RFC3339)
 	srv := fluxServer(t, fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, old, "True"))
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
-	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	got, inspected := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if !inspected {
+		t.Fatalf("a successful read must report inspected")
+	}
 	if len(got) != 0 {
 		t.Fatalf("a healthy reconcile outside the window must not surface, got %v", got)
 	}
@@ -837,7 +843,10 @@ func TestFluxActivityNotReadyIsFailureSignal(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	srv := fluxServer(t, fluxItem(t, "llm", "kustomization-llm", "kustomizations", rev, now, "False"))
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
-	got := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	got, inspected := k.fluxActivity(context.Background(), "llm", time.Now().Add(-time.Hour))
+	if !inspected {
+		t.Fatalf("a successful read must report inspected")
+	}
 	if len(got) != 1 {
 		t.Fatalf("expected one NotReady line, got %d: %v", len(got), got)
 	}
@@ -855,13 +864,207 @@ func TestFluxActivityNotReadyIsFailureSignal(t *testing.T) {
 		fluxItem(t, "llm", "kustomization-healthy", "kustomizations", "main@11112222333344445555", now, "True"),
 	)
 	k2 := &kube{base: srv2.URL, token: "tok", hc: srv2.Client()}
-	ambient := k2.fluxActivity(context.Background(), "", time.Now().Add(-time.Hour))
+	ambient, inspected := k2.fluxActivity(context.Background(), "", time.Now().Add(-time.Hour))
+	if !inspected {
+		t.Fatalf("a successful cluster-wide read must report inspected")
+	}
 	if len(ambient) != 1 {
 		t.Fatalf("cluster-wide scope must keep only the NotReady line, got %v", ambient)
 	}
 	if !strings.Contains(ambient[0], "NOT READY") {
 		t.Errorf("cluster-wide scope must keep the failure, got %q", ambient[0])
 	}
+}
+
+// Issue #300: a forbidden, canceled, malformed or oversized Flux list read
+// returned an empty findings slice identical to a quiet window's, and the
+// renderer asserted "no Flux reconciles or failures in the window" from it.
+// Read success is now a separate fact, so a failed read cannot masquerade as
+// a ruled-out cause — and a 404 from a cluster without Flux installed counts
+// as a failed read, not a quiet one.
+func TestFluxActivityCarriesReadSuccess(t *testing.T) {
+	const emptyList = `{"items":[]}`
+	notReadyLLMWeb := func(w http.ResponseWriter) {
+		io.WriteString(w, `{"items":[{"metadata":{"name":"web","namespace":"llm"},"status":{"lastAppliedRevision":"main@0982756e1a2b3c4d5e6f","conditions":[{"type":"Ready","status":"False","reason":"ReconciliationFailed","lastTransitionTime":"`+time.Now().UTC().Format(time.RFC3339)+`"}]}}]}`)
+	}
+	tests := []struct {
+		name          string
+		writeHelm     func(http.ResponseWriter)
+		writeKust     func(http.ResponseWriter)
+		cancelCtx     bool
+		wantInspected bool
+		wantFinding   string // non-empty: a finding the partially-read lists must still carry
+	}{
+		{
+			name:          "both lists read empty is a quiet, inspected window",
+			writeHelm:     func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			writeKust:     func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			wantInspected: true,
+		},
+		{
+			name:          "window with transitions is inspected and carries the finding",
+			writeHelm:     notReadyLLMWeb,
+			writeKust:     func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			wantInspected: true,
+			wantFinding:   "llm/web NOT READY: ReconciliationFailed",
+		},
+		{
+			name:      "forbidden helmrelease list is not inspected",
+			writeHelm: func(w http.ResponseWriter) { http.Error(w, "nope", http.StatusForbidden) },
+			writeKust: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+		},
+		{
+			name:      "forbidden kustomization list is not inspected",
+			writeHelm: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			writeKust: func(w http.ResponseWriter) { http.Error(w, "nope", http.StatusForbidden) },
+		},
+		{
+			name:      "404 on both lists (no Flux installed) is not inspected",
+			writeHelm: func(w http.ResponseWriter) { http.NotFound(w, nil) },
+			writeKust: func(w http.ResponseWriter) { http.NotFound(w, nil) },
+		},
+		{
+			name:      "malformed body is not inspected",
+			writeHelm: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			writeKust: func(w http.ResponseWriter) { io.WriteString(w, `{"items":`) },
+		},
+		{
+			// One byte past kubeBodyCap is enough: readCappedBody fails the
+			// read without buffering the rest of the body.
+			name:      "oversized body is not inspected",
+			writeHelm: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			writeKust: func(w http.ResponseWriter) { w.Write(make([]byte, kubeBodyCap+1)) },
+		},
+		{
+			name:      "canceled read is not inspected",
+			writeHelm: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			writeKust: func(w http.ResponseWriter) { io.WriteString(w, emptyList) },
+			cancelCtx: true,
+		},
+		{
+			// The list that did read keeps its findings — the failure
+			// suppresses the quiet-window negative, never the evidence.
+			name:        "partial read is not inspected but keeps its findings",
+			writeHelm:   func(w http.ResponseWriter) { http.Error(w, "nope", http.StatusForbidden) },
+			writeKust:   notReadyLLMWeb,
+			wantFinding: "llm/web NOT READY: ReconciliationFailed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "helmreleases"):
+					tt.writeHelm(w)
+				case strings.Contains(r.URL.Path, "kustomizations"):
+					tt.writeKust(w)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+			ctx := context.Background()
+			if tt.cancelCtx {
+				// Cancelled before the call: the apiserver never answers,
+				// which is the timed-out read this regression is about.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			got, inspected := k.fluxActivity(ctx, "llm", time.Now().Add(-time.Hour))
+			if inspected != tt.wantInspected {
+				t.Errorf("inspected = %v, want %v (findings: %v)", inspected, tt.wantInspected, got)
+			}
+			if tt.wantFinding != "" {
+				if len(got) == 0 || !strings.Contains(strings.Join(got, "; "), tt.wantFinding) {
+					t.Errorf("want finding %q in %v", tt.wantFinding, got)
+				}
+			}
+		})
+	}
+}
+
+// The Enrich wiring must carry the flag through both scope paths — the
+// namespace-scoped read and the cluster-wide fallback — so the renderer can
+// tell a quiet window from a read that never succeeded (#300). A nil client
+// never reads at all and must stay uninspected.
+func TestEnrichFluxCarriesReadSuccess(t *testing.T) {
+	const emptyList = `{"items":[]}`
+	newServer := func(helmCode, kustCode int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			code, body := http.StatusOK, emptyList
+			switch {
+			case strings.Contains(r.URL.Path, "helmreleases"):
+				code = helmCode
+			case strings.Contains(r.URL.Path, "kustomizations"):
+				code = kustCode
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			if code == http.StatusOK {
+				_, _ = io.WriteString(w, body)
+			}
+		}))
+	}
+	namespaced := Group{Key: "single/A", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "A", "namespace": "llm"}},
+	}}
+	clusterWide := Group{Key: "single/A", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "A"}},
+	}}
+
+	t.Run("successful quiet namespace read is inspected", func(t *testing.T) {
+		srv := newServer(http.StatusOK, http.StatusOK)
+		defer srv.Close()
+		k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+		g := namespaced
+		g.Namespaces = []string{"llm"}
+		e := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+		if !e.FluxInspected {
+			t.Errorf("FluxInspected = false, want true after a successful read")
+		}
+		if len(e.FluxActivity) != 0 {
+			t.Errorf("FluxActivity = %v, want none in a quiet window", e.FluxActivity)
+		}
+	})
+	t.Run("failed namespace read is not inspected", func(t *testing.T) {
+		srv := newServer(http.StatusForbidden, http.StatusOK)
+		defer srv.Close()
+		k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+		g := namespaced
+		g.Namespaces = []string{"llm"}
+		e := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+		if e.FluxInspected {
+			t.Errorf("FluxInspected = true, want false after a failed list read")
+		}
+	})
+	t.Run("successful cluster-wide read is inspected", func(t *testing.T) {
+		srv := newServer(http.StatusOK, http.StatusOK)
+		defer srv.Close()
+		k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+		e := k.Enrich(context.Background(), clusterWide, time.Minute, &Config{}, nil)
+		if !e.FluxInspected {
+			t.Errorf("FluxInspected = false, want true after a successful cluster-wide read")
+		}
+	})
+	t.Run("404 cluster-wide read (no Flux installed) is not inspected", func(t *testing.T) {
+		srv := newServer(http.StatusNotFound, http.StatusNotFound)
+		defer srv.Close()
+		k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+		e := k.Enrich(context.Background(), clusterWide, time.Minute, &Config{}, nil)
+		if e.FluxInspected {
+			t.Errorf("FluxInspected = true, want false when both lists 404")
+		}
+	})
+	t.Run("nil client is not inspected", func(t *testing.T) {
+		var k *kube
+		e := k.Enrich(context.Background(), clusterWide, time.Minute, &Config{}, nil)
+		if e.FluxInspected || len(e.FluxActivity) != 0 {
+			t.Errorf("nil client must not claim Flux state: inspected=%v activity=%v", e.FluxInspected, e.FluxActivity)
+		}
+	})
 }
 
 // A healthy reconcile at a new revision must not be labelled a "change": the
@@ -879,6 +1082,9 @@ func TestEnrichmentFluxActivityNotChanges(t *testing.T) {
 	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if len(en.FluxActivity) == 0 {
 		t.Fatalf("expected a FluxActivity entry, got %+v", en)
+	}
+	if !en.FluxInspected {
+		t.Errorf("a successful Flux read must report inspected")
 	}
 	joined := strings.ToLower(strings.Join(en.FluxActivity, " "))
 	for _, word := range []string{"deploy", "change", "trigger"} {

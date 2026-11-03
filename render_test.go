@@ -159,7 +159,7 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	// an "on the subject" negative that would imply an inspection. The node
 	// negative requires NodesInspected: it is only honest after a read that
 	// succeeded (#294).
-	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide", NodesInspected: true}})
+	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide", NodesInspected: true, FluxInspected: true}})
 	for _, want := range []string{"all nodes Ready", "no subject-scoped events were queried", "no Flux reconciles or failures in the window"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, out)
@@ -198,6 +198,37 @@ func TestNodeHealthNegativeRequiresSuccessfulRead(t *testing.T) {
 	}})
 	if !strings.Contains(found, "n1 NotReady: KubeletNotReady, cordoned") {
 		t.Errorf("node findings must render even when the flag is unset:\n%s", found)
+	}
+}
+
+// The quiet-window Flux negative is a finding, not a default: a report whose
+// Flux lists failed to read — or that never read at all (nil client,
+// foreign-cluster skip) — must render Flux state as unavailable instead of
+// asserting there were no reconciles or failures (#300).
+func TestFluxNegativeRequiresSuccessfulRead(t *testing.T) {
+	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
+
+	uninspected := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster state unavailable"}})
+	if strings.Contains(uninspected, "no Flux reconciles or failures in the window") {
+		t.Errorf("uninspected Flux read rendered as a quiet window:\n%s", uninspected)
+	}
+	if !strings.Contains(uninspected, "Flux state unavailable") {
+		t.Errorf("want unavailable wording for uninspected Flux state:\n%s", uninspected)
+	}
+
+	checked := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide", FluxInspected: true}})
+	if !strings.Contains(checked, "no Flux reconciles or failures in the window") {
+		t.Errorf("successful quiet read must keep the explicit negative:\n%s", checked)
+	}
+
+	// Recorded findings render regardless of the flag: a fixture (or a
+	// future writer) that sets FluxActivity without the flag must not lose
+	// the transitions it carries.
+	found := renderEvidence(Report{Group: g, Enrichment: Enrichment{
+		FluxActivity: []string{"llm/kustomization-llm NOT READY: ReconciliationFailed rev=main@0982756"},
+	}})
+	if !strings.Contains(found, "llm/kustomization-llm NOT READY: ReconciliationFailed rev=main@0982756") {
+		t.Errorf("Flux findings must render even when the flag is unset:\n%s", found)
 	}
 }
 
