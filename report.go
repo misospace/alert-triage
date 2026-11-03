@@ -601,7 +601,12 @@ func renderEvidence(r Report) string {
 		nodesNegative = "all nodes Ready, none under pressure or cordoned"
 	}
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, nodesNegative)
-	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
+	// Suppress false quiet-window negatives when a Flux list read failed (#300).
+	fluxNegative := "Flux state unavailable - no successful Flux read, so nothing here rules Flux reconciles or failures in or out"
+	if r.Enrichment.FluxInspected {
+		fluxNegative = "no Flux reconciles or failures in the window"
+	}
+	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, fluxNegative)
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
 		b.WriteString("This is NOT known to involve the alert above. A homelab always has\n")
