@@ -154,11 +154,12 @@ func TestRenderEvidenceRedactsHeaderIdentityLines(t *testing.T) {
 
 func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
-	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide"}})
-
 	// Absence must read as a ruled-out cause, never as missing data. With no
 	// resolved subject the event absence is stated as "not queried" rather than
-	// an "on the subject" negative that would imply an inspection.
+	// an "on the subject" negative that would imply an inspection. The node
+	// negative requires NodesInspected: it is only honest after a read that
+	// succeeded (#294).
+	out := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide", NodesInspected: true}})
 	for _, want := range []string{"all nodes Ready", "no subject-scoped events were queried", "no Flux reconciles or failures in the window"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, out)
@@ -166,6 +167,37 @@ func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	}
 	if strings.Contains(out, "No supporting cluster evidence") {
 		t.Error("evidence block still implies nothing was checked")
+	}
+}
+
+// The healthy node negative is a finding, not a default: a report whose node
+// read failed, or whose client never read at all (nil client, foreign-cluster
+// skip), must render node health as unavailable instead of asserting every
+// node is Ready (#294).
+func TestNodeHealthNegativeRequiresSuccessfulRead(t *testing.T) {
+	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
+
+	uninspected := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster state unavailable"}})
+	if strings.Contains(uninspected, "all nodes Ready") {
+		t.Errorf("uninspected node health rendered as a healthy cluster:\n%s", uninspected)
+	}
+	if !strings.Contains(uninspected, "node health unavailable") {
+		t.Errorf("want unavailable wording for uninspected node health:\n%s", uninspected)
+	}
+
+	checked := renderEvidence(Report{Group: g, Enrichment: Enrichment{Scope: "cluster-wide", NodesInspected: true}})
+	if !strings.Contains(checked, "all nodes Ready, none under pressure or cordoned") {
+		t.Errorf("successful healthy read must keep the explicit negative:\n%s", checked)
+	}
+
+	// Recorded findings render regardless of the flag: a fixture (or a
+	// future writer) that sets Nodes without the flag must not lose the
+	// unhealthy nodes it carries.
+	found := renderEvidence(Report{Group: g, Enrichment: Enrichment{
+		Nodes: []string{"n1 NotReady: KubeletNotReady, cordoned"},
+	}})
+	if !strings.Contains(found, "n1 NotReady: KubeletNotReady, cordoned") {
+		t.Errorf("node findings must render even when the flag is unset:\n%s", found)
 	}
 }
 

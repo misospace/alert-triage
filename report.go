@@ -591,7 +591,16 @@ func renderEvidence(r Report) string {
 		}
 		b.WriteString(untrustedEnd + "\n")
 	}
-	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, "all nodes Ready, none under pressure or cordoned")
+	// The healthy negative is a finding only after a successful read. A
+	// forbidden, timed-out or malformed node list, an absent client, or a
+	// foreign-cluster skip leaves Nodes empty exactly as a healthy cluster
+	// does, and asserting "all nodes Ready" there hands the model a false
+	// explicit negative precisely when enrichment is unavailable (#294).
+	nodesNegative := "node health unavailable - no successful node read, so nothing here rules node problems in or out"
+	if r.Enrichment.NodesInspected {
+		nodesNegative = "all nodes Ready, none under pressure or cordoned"
+	}
+	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, nodesNegative)
 	writeFinding(&b, "Recent Flux activity", r.Enrichment.FluxActivity, "no Flux reconciles or failures in the window")
 	if len(r.Enrichment.Ambient) > 0 {
 		b.WriteString("\nBACKGROUND - everything else happening in the cluster right now.\n")
