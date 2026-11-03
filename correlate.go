@@ -40,9 +40,15 @@ func (a Alert) cluster() string   { return a.Labels["cluster"] }
 // node attribution is keyed by it. Keying attribution on the raw fingerprint
 // instead would make every fingerprint-less alert share one map key, so
 // distinct nodes would overwrite each other (issue #295).
+//
+// Each branch carries a prefix so the two forms occupy separate key spaces.
+// The fingerprint is untrusted sender text — webhook auth fails open — and the
+// hash is computable from a target's labels, so an unprefixed fingerprint of
+// "labels:<hash>" took the identity, and after #295 the node attribution, of
+// the fingerprint-less alert it mimicked (issue #297).
 func (a Alert) identity() string {
 	if a.Fingerprint != "" {
-		return a.Fingerprint
+		return "fp:" + a.Fingerprint
 	}
 	keys := sortedKeys(a.Labels)
 	var b strings.Builder
