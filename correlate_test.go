@@ -68,7 +68,7 @@ func TestSignatureGroupsStorageAcrossNamespaces(t *testing.T) {
 func TestNodeBeatsNamespace(t *testing.T) {
 	a := alert("DiskPressure", "llm", "warning", 0)
 	b := alert("PodEvicted", "media", "warning", time.Minute)
-	nodeOf := map[string]string{a.Fingerprint: "node-a", b.Fingerprint: "node-a"}
+	nodeOf := map[string]string{a.identity(): "node-a", b.identity(): "node-a"}
 
 	groups := Correlate([]Alert{a, b}, nodeOf, nil, 5*time.Minute)
 	if len(groups) != 1 {
@@ -651,5 +651,43 @@ func TestMixedFingerprintAndFingerprintlessBatchKeepTheirNodes(t *testing.T) {
 	}
 	if groups[0].Node != "node-a" {
 		t.Errorf("want node attribution node-a, got %q", groups[0].Node)
+	}
+}
+
+// The fingerprint is untrusted sender text: webhook auth fails open, and the
+// labels hash is computable from a target's labels. Sharing one key space
+// between the fingerprint and the labels-hash fallback let a payload set
+// Fingerprint to "labels:<hash>" and take the identity — and after #295 the
+// node attribution — of the fingerprint-less alert it mimicked (issue #297).
+func TestFingerprintMimickingLabelsHashDoesNotImpersonate(t *testing.T) {
+	target := Alert{
+		Status:   "firing",
+		Labels:   map[string]string{"alertname": "Beta", "namespace": "two", "node": "node-b"},
+		StartsAt: base,
+	}
+	mimic := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "Alpha", "namespace": "one", "node": "node-a"},
+		StartsAt:    base,
+		Fingerprint: target.identity(),
+	}
+	if mimic.identity() == target.identity() {
+		t.Fatalf("mimicking fingerprint took the target identity %q", target.identity())
+	}
+
+	nodeOf := map[string]string{mimic.identity(): "node-a", target.identity(): "node-b"}
+	groups := Correlate([]Alert{mimic, target}, nodeOf, nil, 5*time.Minute)
+	if len(groups) != 2 {
+		t.Fatalf("want two independent alerts, got %d groups: %+v", len(groups), groups)
+	}
+	wantNode := map[string]string{"Alpha": "node-a", "Beta": "node-b"}
+	for _, g := range groups {
+		if len(g.Alerts) != 1 {
+			t.Errorf("want one alert per group, got %d in %s", len(g.Alerts), g.Key)
+			continue
+		}
+		if got := g.Node; got != wantNode[g.Alerts[0].name()] {
+			t.Errorf("want node attribution %q for %s, got %q", wantNode[g.Alerts[0].name()], g.Alerts[0].name(), got)
+		}
 	}
 }

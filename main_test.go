@@ -161,6 +161,26 @@ func TestBufferDedupesWithoutFingerprints(t *testing.T) {
 	}
 }
 
+// A sender who knows a fingerprint-less alert's labels can compute its
+// labels-hash. The fingerprint branch must live in its own key space, so a
+// mimic is buffered alongside the target instead of the target being dropped
+// as a duplicate — while an exact copy of the mimic still collapses (issue #297).
+func TestBufferKeepsFingerprintMimickingLabelsHash(t *testing.T) {
+	target := Alert{Labels: map[string]string{"alertname": "Beta", "namespace": "llm"}}
+	mimic := Alert{
+		Labels:      map[string]string{"alertname": "Alpha", "namespace": "llm"},
+		Fingerprint: target.identity(),
+	}
+	b := &buffer{}
+	b.add([]Alert{mimic, target, {Labels: map[string]string{"alertname": "Alpha again", "namespace": "llm"}, Fingerprint: mimic.Fingerprint}})
+	b.firstAt = time.Now().Add(-time.Second)
+
+	got := b.take(time.Now(), 0, 10*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("expected mimic and target both kept, got %d: %+v", len(got), got)
+	}
+}
+
 func TestBufferNotYetDue(t *testing.T) {
 	b := &buffer{}
 	now := time.Now()

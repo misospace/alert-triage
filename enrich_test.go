@@ -268,11 +268,11 @@ func TestResolveNodesPodLabelNoNodeLabel(t *testing.T) {
 		{Fingerprint: "fp-2", Labels: map[string]string{"pod": "p2", "namespace": "ns-a"}},
 	}
 	got := k.ResolveNodes(context.Background(), alerts)
-	if got["fp-1"] != "worker-1" {
-		t.Fatalf("expected fp-1 -> worker-1, got %q", got["fp-1"])
+	if got[alerts[0].identity()] != "worker-1" {
+		t.Fatalf("expected first alert -> worker-1, got %q", got[alerts[0].identity()])
 	}
-	if got["fp-2"] != "worker-2" {
-		t.Fatalf("expected fp-2 -> worker-2, got %q", got["fp-2"])
+	if got[alerts[1].identity()] != "worker-2" {
+		t.Fatalf("expected second alert -> worker-2, got %q", got[alerts[1].identity()])
 	}
 }
 
@@ -291,8 +291,8 @@ func TestResolveNodesNodeLabelShortCircuit(t *testing.T) {
 		{Fingerprint: "fp-3", Labels: map[string]string{"node": "ctrl-1"}},
 	}
 	got := k.ResolveNodes(context.Background(), alerts)
-	if got["fp-3"] != "ctrl-1" {
-		t.Fatalf("expected fp-3 -> ctrl-1, got %q", got["fp-3"])
+	if got[alerts[0].identity()] != "ctrl-1" {
+		t.Fatalf("expected first alert -> ctrl-1, got %q", got[alerts[0].identity()])
 	}
 	if atomic.LoadInt32(&hits) != 0 {
 		t.Fatalf("unexpected API hits when alert already has node label: %d", hits)
@@ -302,10 +302,11 @@ func TestResolveNodesNodeLabelShortCircuit(t *testing.T) {
 // TestResolveNodesNilReceiver ensures the nil-receiver guard works.
 func TestResolveNodesNilReceiver(t *testing.T) {
 	var k *kube
-	got := k.ResolveNodes(context.Background(), []Alert{{Fingerprint: "fp", Labels: map[string]string{"node": "x"}}})
+	a := Alert{Fingerprint: "fp", Labels: map[string]string{"node": "x"}}
+	got := k.ResolveNodes(context.Background(), []Alert{a})
 	// Nil receiver on a node-labelled alert is allowed to return either
 	// an empty map (the simple guard) or a populated map. Either is fine.
-	if got["fp"] != "" && got["fp"] != "x" {
+	if got[a.identity()] != "" && got[a.identity()] != "x" {
 		t.Fatalf("nil receiver returned unexpected entry: %#v", got)
 	}
 }
