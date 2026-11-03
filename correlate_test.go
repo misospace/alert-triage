@@ -691,6 +691,7 @@ func TestFingerprintMimickingLabelsHashDoesNotImpersonate(t *testing.T) {
 		}
 	}
 }
+
 // A group whose members span two nodes must attribute a node in a way that
 // does not depend on member order: Signature hashes Group.Node, so a
 // first-wins rule reset the "seen N times" counter whenever the same incident
