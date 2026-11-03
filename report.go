@@ -602,7 +602,7 @@ func renderEvidence(r Report) string {
 	}
 	writeFinding(&b, "Unhealthy nodes", r.Enrichment.Nodes, nodesNegative)
 	// Suppress false quiet-window negatives when a Flux list read failed (#300).
-	fluxNegative := "Flux state unavailable - no successful Flux read, so nothing here rules Flux reconciles or failures in or out"
+	fluxNegative := "Flux state unavailable or incomplete - one or more required Flux lists were not read successfully, so missing findings cannot rule reconciles or failures in or out"
 	if r.Enrichment.FluxInspected {
 		fluxNegative = "no Flux reconciles or failures in the window"
 	}
