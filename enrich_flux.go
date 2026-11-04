@@ -227,18 +227,20 @@ func shortRev(rev string) string {
 // (issue #312).
 const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not one path segment (value not shown)"
 
-// fluxSourceNamespaceRefusal and fluxSourceNameRefusal are the fixed
-// markers resolveRepoPaths records when a Kustomization's
-// spec.sourceRef.namespace or spec.sourceRef.name is refused as not one
-// path segment. They mirror argoInstanceRefusal for the Flux side (issue
-// #318): the Kustomization does declare a source, the service just would
-// not read it, and that must not read as a workload that declares no
-// GitOps source. The markers name the refused field and never repeat the
-// value: it comes from Kustomization spec text, which is object-authored
-// and stays out of the digest like the Argo instance value (issue #308).
+// fluxSourceNamespaceRefusal, fluxSourceNameRefusal and fluxSourceKindRefusal
+// are the fixed markers resolveRepoPaths records when a Kustomization's
+// spec.sourceRef.namespace, spec.sourceRef.name or spec.sourceRef.kind is
+// refused as not one path segment. They mirror argoInstanceRefusal for the
+// Flux side (issues #318, #327): the Kustomization does declare a source, the
+// service just would not read it, and that must not read as a workload that
+// declares no GitOps source. The markers name the refused field and never
+// repeat the value: it comes from Kustomization spec text, which is
+// object-authored and stays out of the digest like the Argo instance value
+// (issue #308).
 const (
 	fluxSourceNamespaceRefusal = "flux Kustomization spec.sourceRef.namespace refused: value is not one path segment (value not shown)"
 	fluxSourceNameRefusal      = "flux Kustomization spec.sourceRef.name refused: value is not one path segment (value not shown)"
+	fluxSourceKindRefusal      = "flux Kustomization spec.sourceRef.kind refused: value is not one path segment (value not shown)"
 )
 
 // fluxSourceRefusal maps a fluxPath failure to the marker of the refused
@@ -254,6 +256,8 @@ func fluxSourceRefusal(err error) string {
 		return fluxSourceNamespaceRefusal
 	case errors.Is(err, errFluxSourceNameRefused):
 		return fluxSourceNameRefusal
+	case errors.Is(err, errFluxSourceKindRefused):
+		return fluxSourceKindRefusal
 	}
 	return ""
 }
@@ -270,10 +274,10 @@ func fluxSourceRefusal(err error) string {
 // mapping degrades to today's prose rather than to a fabricated path.
 // The one exception is a refused owner reference: an Argo instance that
 // is not one path segment, or a Flux Kustomization whose declared
-// sourceRef namespace or name is not one path segment. The pod does
+// sourceRef namespace, name or kind is not one path segment. The pod does
 // declare an owner, the service just would not read it, so that refusal
 // is not silence — it comes back in the second result as a fixed marker
-// naming the field, never the refused value (issues #312, #318).
+// naming the field, never the refused value (issues #312, #318, #327).
 func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) ([]string, []string) {
 	seen := map[string]bool{}
 	var out []string
@@ -680,15 +684,16 @@ func fluxPathSegment(v string) bool {
 	return true
 }
 
-// errFluxSourceNamespaceRefused and errFluxSourceNameRefused are the
-// refusals issued below. The messages are fixed and never echo the
-// offending value, which is author-controlled text that must not reach
-// the digest. They are sentinels so a caller can tell "this value was
-// refused" from "the object could not be read" with errors.Is; only the
-// refusals earn a digest marker (issue #318).
+// errFluxSourceNamespaceRefused, errFluxSourceNameRefused and
+// errFluxSourceKindRefused are the refusals issued below. The messages are
+// fixed and never echo the offending value, which is author-controlled text
+// that must not reach the digest. They are sentinels so a caller can tell
+// "this value was refused" from "the object could not be read" with
+// errors.Is; only the refusals earn a digest marker (issue #318).
 var (
 	errFluxSourceNamespaceRefused = errors.New("flux source namespace is not a valid path segment")
 	errFluxSourceNameRefused      = errors.New("flux source name is not a valid path segment")
+	errFluxSourceKindRefused      = errors.New("flux source kind is not a valid path segment")
 )
 
 // errFluxPathUnresolved marks a fluxPath lookup whose values were all
@@ -708,11 +713,14 @@ var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a
 // the namespace may now come from spec.sourceRef.namespace rather than only
 // from the Kustomization's own namespace, so both are validated as one path
 // segment before use: a value carrying a separator would address a different
-// object than the one declared. A refused value fails the lookup outright —
+// object than the one declared. The kind reaches the same path through
+// pluralLower and is validated the same way — through its plural, since that
+// is the segment actually sent. A refused value fails the lookup outright —
 // there is no second namespace to fall back to, because falling back is how a
 // same-named source the Kustomization does not use gets resolved. The
 // refusal errors are the sentinel vars above, so resolveRepoPaths can mark
-// the refused field without re-deriving why the lookup failed (issue #318).
+// the refused field without re-deriving why the lookup failed (issues #318,
+// #327).
 //
 // An absent value is told apart from a refused one before any refusal
 // sentinel is assigned: a sourceRef that declares no name (or no namespace
@@ -723,6 +731,12 @@ var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a
 // so a Kustomization that simply declares no source keeps its previous
 // output: the same commit-relevance reason, no path and no marker.
 func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
+	// The kind is defaulted before the checks: an absent kind is not an
+	// absence failure but Flux's own default (GitRepository), and the
+	// segment check below must judge the value that would actually be sent.
+	if srcKind == "" {
+		srcKind = "GitRepository"
+	}
 	// The refusals are decided before the absences, so a declared value
 	// this service refuses is still reported when the other value is
 	// absent: an absence must not mask a refusal.
@@ -732,14 +746,25 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 	if srcName != "" && !fluxPathSegment(srcName) {
 		return "", errFluxSourceNameRefused
 	}
+	// The kind reaches the path only through pluralLower, so that output is
+	// what the segment check must judge: the declared kinds are CamelCase
+	// ("GitRepository") and would fail a direct check, but their plurals
+	// are what is interpolated. Checking the plural catches the dangerous
+	// classes in the kind: separators, traversal pairs and encoding
+	// characters survive ToLower unchanged (Go's simple case mapping never
+	// produces punctuation) and so fail the check on the plural. The
+	// refusal is the kind's own sentinel, not a rewrite to the
+	// GitRepository default: like a refused name or namespace, a declared
+	// kind the service would not send must not read as a kind it never
+	// declared (issue #327).
+	if !fluxPathSegment(pluralLower(srcKind)) {
+		return "", errFluxSourceKindRefused
+	}
 	if ns == "" {
 		return "", errors.New("flux source namespace is not a valid path segment")
 	}
 	if srcName == "" {
 		return "", errors.New("flux source name is not a valid path segment")
-	}
-	if srcKind == "" {
-		srcKind = "GitRepository"
 	}
 	var src struct {
 		Spec struct {
@@ -755,9 +780,10 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 
 // fluxPath resolves the repo+path pair of one Flux Kustomization. The
 // error says why a pair did not resolve, and the distinction is only for
-// the caller that renders evidence: errFluxSourceNamespaceRefused and
-// errFluxSourceNameRefused mark a sourceRef value refused as not one path
-// segment — a decision this service made about a value it had read —
+// the caller that renders evidence: errFluxSourceNamespaceRefused,
+// errFluxSourceNameRefused and errFluxSourceKindRefused mark a sourceRef
+// value refused as not one path segment — a decision this service made
+// about a value it had read —
 // while every other failure (missing object or source, empty spec.path or
 // spec.url, a sourceRef that declares no source) means the pair simply
 // could not be read. A namespace refusal for a sourceRef that declares no
