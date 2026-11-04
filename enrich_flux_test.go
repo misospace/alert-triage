@@ -394,6 +394,25 @@ func TestResolveRepoPathsFluxSourceNameHostile(t *testing.T) {
 	if strings.Contains(refusals[0], hostile) || strings.Contains(refusals[0], "payments") {
 		t.Fatalf("the marker must never repeat the refused value, got %q", refusals[0])
 	}
+	// The relevance path degrades to "unknown" with a one-line reason that
+	// carries neither the refused value nor the pod's own names.
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+	rel := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(rel) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(rel))
+	}
+	if rel[0].State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
+	}
+	if !strings.Contains(rel[0].Reason, "not readable") {
+		t.Fatalf("reason must name the unreadable source: %q", rel[0].Reason)
+	}
+	if strings.Contains(rel[0].Reason, hostile) {
+		t.Fatalf("reason must not echo the refused name: %q", rel[0].Reason)
+	}
+	if strings.Contains(rel[0].Reason, "\n") {
+		t.Fatalf("reason must be one line: %q", rel[0].Reason)
+	}
 }
 
 // TestResolveRepoPathsFluxSourceRefAbsent pins the absence case (issue
@@ -483,6 +502,55 @@ func TestResolveRepoPathsFluxSourceRefAbsent(t *testing.T) {
 				t.Fatalf("reason must be one line: %q", rel[0].Reason)
 			}
 		})
+	}
+}
+
+// TestResolveRepoPathsFluxSourceRefAbsentDoesNotMaskRefusal pins the
+// other side of the absence rule (issue #318): a sourceRef that declares
+// no name still leaves a declared hostile namespace to be refused. An
+// absence must not swallow the refusal of another value, or the digest
+// would state that a declared owner reference was absent when this
+// service had in fact refused to read it.
+func TestResolveRepoPathsFluxSourceRefAbsentDoesNotMaskRefusal(t *testing.T) {
+	const hostile = "sources/../workloads"
+	var sourceHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/flux-system/kustomizations/payments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"kind":"GitRepository","namespace":"`+hostile+`"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			sourceHits.Add(1)
+			t.Errorf("a refused source namespace must not be requested: %s", r.URL.Path)
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+		},
+	}}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path for a refused source namespace, got %#v", got)
+	}
+	if len(refusals) != 1 || refusals[0] != fluxSourceNamespaceRefusal {
+		t.Fatalf("expected the namespace refusal marker, got %#v", refusals)
+	}
+	if strings.Contains(refusals[0], hostile) {
+		t.Fatalf("the marker must never repeat the refused value, got %q", refusals[0])
+	}
+	if sourceHits.Load() != 0 {
+		t.Fatalf("a refused source namespace must not be requested, got %d hits", sourceHits.Load())
 	}
 }
 
