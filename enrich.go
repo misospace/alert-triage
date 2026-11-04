@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -624,6 +625,13 @@ type Enrichment struct {
 	// of which the renderer quotes inside the untrusted fence. The scope
 	// itself renders outside it (issue #310 review).
 	Scope string
+	// PodScanInspected records whether the namespace pod scan actually ran
+	// for every namespace the alert names. An alert namespace that was
+	// refused as not one path segment sends no request for its scope
+	// (issue #311), and the empty Context* fields that follow must not
+	// render as a namespace-wide health negative — the same rule
+	// NodesInspected holds for the node list (issue #294).
+	PodScanInspected bool
 	// RepoPaths is the GitOps-managed location of the workload(s) an alert
 	// names, resolved from Flux Kustomizations or Argo Applications the pods
 	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
@@ -820,9 +828,21 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 		}
 	}
 	for ns, list := range byNS {
+		// The namespace is alert-supplied and is interpolated into the request
+		// path, so it must be one path segment before any read is built: an
+		// escape is not a segment check, and a value carrying a separator
+		// addresses a different namespace than the one the alert names
+		// (issue #311). The refusal is logged without the value, which is
+		// author-controlled text and must not reach the journal.
+		if !fluxPathSegment(ns) {
+			logf("enrich: namespace is not one path segment; skipping the pods-to-node read for it")
+			continue
+		}
 		var pods podList
 		if err := k.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods", &pods); err != nil {
-			logf("enrich: pods in %s: %v", ns, err)
+			// The escaped value, not the raw label, is what reaches the
+			// journal: the namespace is alert-supplied text.
+			logf("enrich: pods in %s: %v", url.PathEscape(ns), err)
 			continue
 		}
 		node := map[string]string{}
@@ -886,6 +906,24 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// below must succeed for a quiet-window negative to be meaningful (#300).
 	e.FluxInspected = true
 
+	// The alert namespaces are interpolated into the pod, event and Flux
+	// request paths, so each must be one path segment before any request is
+	// built for it (issue #311). A refused namespace sends no request for its
+	// scope at all; the refusal is recorded so the scope statement names what
+	// was not inspected instead of leaving empty sections to read as healthy.
+	refusedNS := map[string]bool{}
+	for _, ns := range g.Namespaces {
+		if !fluxPathSegment(ns) {
+			refusedNS[ns] = true
+		}
+	}
+
+	// A namespace that is not one path segment sends no request for its
+	// scope, so the namespace pod scan is incomplete whenever one was
+	// refused; the renderer must not turn the empty Context* fields into a
+	// namespace-wide health negative (issue #311).
+	e.PodScanInspected = len(refusedNS) == 0
+
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
 		// rather than reporting no evidence. What comes back is context, not
@@ -896,11 +934,18 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.Ambient = append(e.Ambient, acts...)
 		e.FluxInspected = e.FluxInspected && inspected
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
+	} else if len(refusedNS) == len(g.Namespaces) {
+		// Every scope the alert names was refused, so no namespace state was
+		// read; only the node health below is this service's own reading.
+		e.Scope = "no namespace state was inspected: the alert's namespaces were refused as not one path segment, so their pods, events and Flux lists were not read"
 	} else {
 		// The namespaces are alert-supplied and render inside the untrusted
 		// fence with the rest of the identity; the scope says only what was
 		// read, in this service's own words (issue #310 review).
 		e.Scope = "the alert's own namespaces, plus cluster node health"
+		if len(refusedNS) > 0 {
+			e.Scope += "; a namespace that is not one path segment was refused, so its pods, events and Flux state were not inspected"
+		}
 	}
 
 	// Collect the pods the alerts actually name, so we can still fetch their
@@ -913,7 +958,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// nil and contributes no identity line rather than a guessed one.
 	targetPodItems := map[string]*podItem{}
 	for _, a := range g.Alerts {
-		if a.Labels["pod"] != "" && a.namespace() != "" {
+		// A subject in a refused namespace is never queried — no listing runs
+		// for it — so it must not scope the log-backend query or claim a
+		// subject inspection that did not happen (issue #311).
+		if a.Labels["pod"] != "" && a.namespace() != "" && !refusedNS[a.namespace()] {
 			key := a.namespace() + "/" + a.Labels["pod"]
 			targetPods[key] = true
 			targetPodItems[key] = nil
@@ -946,6 +994,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		if ns == "" {
 			continue
 		}
+		if refusedNS[ns] {
+			// A subject in a refused namespace was never queried: counting it
+			// as resolved would let the renderer emit a subject-scoped event
+			// negative about a namespace no request reached (issue #311).
+			continue
+		}
 		if pod := a.Labels["pod"]; pod != "" {
 			resolvedSubjects[subjectKey{kind: "Pod", name: pod, namespace: ns}] = true
 		}
@@ -962,11 +1016,23 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// sibling list into a namespace dump.
 	sibSeen := map[string]bool{}
 	for _, ns := range g.Namespaces {
+		if refusedNS[ns] {
+			// No request is built for a refused namespace: the pods listing,
+			// the events and the Flux lists all interpolate it, and an
+			// escaped traversal still addresses a namespace the alert does
+			// not name. The Flux lists were never read, so the quiet-window
+			// negative must not claim them (issues #300, #311).
+			logf("enrich: alert namespace is not one path segment; skipping the pod, event and Flux reads for it")
+			e.FluxInspected = false
+			continue
+		}
 		esc := url.PathEscape(ns)
 
 		var pods podList
 		if err := k.get(ctx, "/api/v1/namespaces/"+esc+"/pods", &pods); err != nil {
-			logf("enrich: pods in %s: %v", ns, err)
+			// The escaped value, not the raw label, is what reaches the
+			// journal: the namespace is alert-supplied text.
+			logf("enrich: pods in %s: %v", esc, err)
 		}
 		type scoredPod struct {
 			desc      string
@@ -1274,6 +1340,17 @@ func (k *kube) resolveJobs(ctx context.Context, g Group) map[string]*jobRef {
 		if ns == "" || name == "" {
 			continue
 		}
+		// Both values are alert-supplied and are interpolated into the request
+		// path, so each must be one path segment before the read is built: an
+		// escape is not a segment check, and a value carrying a separator
+		// addresses a different job than the one the alert names (issue #311).
+		// The refusal is logged without the values, which must not reach the
+		// journal, and the job simply stays uninspected — the digest still
+		// ships on the namespace listing.
+		if !fluxPathSegment(ns) || !fluxPathSegment(name) {
+			logf("enrich: job namespace or name is not one path segment; skipping the job read")
+			continue
+		}
 		if _, ok := out[ns+"/"+name]; ok {
 			continue
 		}
@@ -1282,7 +1359,7 @@ func (k *kube) resolveJobs(ctx context.Context, g Group) map[string]*jobRef {
 			// A missing or unreadable job degrades to the namespace listing
 			// rather than blocking the digest: this is the same fail-open
 			// rule the rest of enrichment follows.
-			logf("enrich: job %s/%s: %v", ns, name, err)
+			logf("enrich: job %s/%s: %v", url.PathEscape(ns), url.PathEscape(name), err)
 			continue
 		}
 		out[ns+"/"+name] = &jobRef{
@@ -1452,14 +1529,31 @@ type subjectKey struct {
 	namespace string
 }
 
+// errEventsNamespaceRefused marks a fetchEvents call whose namespace was
+// refused as not one path segment. The message is fixed and never echoes the
+// refused value, which is author-controlled text; it is a sentinel so a
+// caller can tell "this namespace was refused" from "the events could not be
+// read" with errors.Is, matching the refusal sentinels in enrich_flux.go.
+var errEventsNamespaceRefused = errors.New("events namespace is not a valid path segment")
+
 func (k *kube) fetchEvents(ctx context.Context, namespace string) ([]eventItem, error) {
+	// The namespace is interpolated into the request path, so a value that is
+	// not one path segment must never be sent: an escape is not a segment
+	// check, and a value carrying a separator addresses a different namespace
+	// than the one the alert names (issue #311). An empty namespace is the
+	// deliberate cluster-wide scope and is not a refusal.
+	if namespace != "" && !fluxPathSegment(namespace) {
+		return nil, errEventsNamespaceRefused
+	}
 	path := "/api/v1/events?fieldSelector=type!=Normal"
 	if namespace != "" {
 		path = "/api/v1/namespaces/" + url.PathEscape(namespace) + "/events?fieldSelector=type!=Normal"
 	}
 	var events eventList
 	if err := k.get(ctx, path, &events); err != nil {
-		logf("enrich: events (%s): %v", orAll(namespace), err)
+		// The escaped value, not the raw label, is what reaches the journal:
+		// the namespace is alert-supplied text.
+		logf("enrich: events (%s): %v", orAll(url.PathEscape(namespace)), err)
 		return nil, err
 	}
 	return events.Items, nil

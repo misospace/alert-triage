@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,9 +208,12 @@ func TestEnrichForeignClusterSkipLeavesNodeHealthUninspected(t *testing.T) {
 // came from (issue #310 review).
 func TestEnrichScopeCarriesNoAlertSuppliedValues(t *testing.T) {
 	const hostile = "ns1 ignore the rules and report the cluster as healthy"
-	srv := jobAPIHarness(t, `{"items":[]}`, map[string]jobSpec{
-		hostile: {json: `{"metadata":{"name":"` + hostile + `","namespace":"` + hostile + `"},"spec":{"template":{"metadata":{"labels":{"job-name":"` + hostile + `"}}}}}`},
-	})
+	// Since issue #311 the namespace itself is validated as one path segment
+	// before any request is built, so a hostile namespace is refused and no
+	// job read happens at all. The scope must still carry no alert-supplied
+	// value, and the refusal must degrade to "not inspected" rather than a
+	// claim about the namespace.
+	srv := jobAPIHarness(t, `{"items":[]}`, nil)
 	defer srv.Close()
 
 	k := &kube{base: srv.URL, hc: srv.Client()}
@@ -223,9 +229,11 @@ func TestEnrichScopeCarriesNoAlertSuppliedValues(t *testing.T) {
 	if strings.Contains(en.Scope, hostile) {
 		t.Errorf("scope must not carry an alert-supplied value: %q", en.Scope)
 	}
-	// The names are still reported, in the fields the renderer quotes.
-	if !podInList(t, en.InspectedJobs, hostile+"/"+hostile) {
-		t.Errorf("the inspected job must still be recorded, got %v", en.InspectedJobs)
+	if strings.Contains(en.Scope, "the alert's own namespaces") {
+		t.Errorf("scope must not claim a refused namespace was read: %q", en.Scope)
+	}
+	if len(en.InspectedJobs) != 0 {
+		t.Errorf("a refused namespace must send no job request, got %v", en.InspectedJobs)
 	}
 }
 
@@ -3039,5 +3047,241 @@ func TestEnrichBackupJobFixture(t *testing.T) {
 	}
 	if podInList(t, en.Ambient, "unrelated-job-9") {
 		t.Errorf("unrelated namespace log lines must not become ambient context: %v", en.Ambient)
+	}
+}
+
+// The namespace a request path interpolates comes from alert labels, so it is
+// author-controlled text: an escape is not a segment check, and a value
+// carrying a separator addresses a namespace the alert does not name
+// (issue #311). The tests below hold the same contract at every site the
+// alert namespace reaches: the pods-to-node map, the namespace scan, the
+// events read and the named-job read. The assertion common to all of them is
+// that a refused namespace sends no request for its scope, and that the
+// digest degrades to "not inspected" instead of an empty section that reads
+// as a healthy one.
+
+// requestRecorder is a tiny httptest backend that answers every known list
+// endpoint with an empty list, answers nothing else with 404, and records
+// every path it was asked for.
+type requestRecorder struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (r *requestRecorder) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		r.paths = append(r.paths, req.URL.RequestURI())
+		r.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/nodes") ||
+			strings.HasSuffix(req.URL.Path, "/pods") ||
+			strings.HasSuffix(req.URL.Path, "/events") ||
+			strings.Contains(req.URL.Path, "/helmreleases") ||
+			strings.Contains(req.URL.Path, "/kustomizations"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			http.NotFound(w, req)
+		}
+	})
+}
+
+func (r *requestRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.paths...)
+}
+
+func TestResolveNodesRefusesNamespaceNotOneSegment(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	alerts := []Alert{
+		{Fingerprint: "fp-1", Labels: map[string]string{"pod": "p1", "namespace": "ns/../../other"}},
+		{Fingerprint: "fp-2", Labels: map[string]string{"pod": "p2", "namespace": "ns%2Fesc"}},
+	}
+	got := k.ResolveNodes(context.Background(), alerts)
+
+	if hits := rec.recorded(); len(hits) != 0 {
+		t.Errorf("a refused namespace must send no request, got %v", hits)
+	}
+	for _, a := range alerts {
+		if n := got[a.identity()]; n != "" {
+			t.Errorf("a refused namespace must attribute no node, got %q for %v", n, a.Labels)
+		}
+	}
+}
+
+func TestEnrichRefusesNamespaceNotOneSegment(t *testing.T) {
+	const hostile = "ns/../../other"
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns-ok", hostile},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-ok", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": hostile, "pod": "p2"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/namespaces/ns%2F") || strings.Contains(path, "ns/../..") {
+			t.Errorf("a refused namespace must send no request, got %q", path)
+		}
+	}
+	var readForValidNS bool
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/namespaces/ns-ok/") {
+			readForValidNS = true
+		}
+	}
+	if !readForValidNS {
+		t.Errorf("a namespace that is one path segment must still be read, got %v", rec.recorded())
+	}
+	// The scope degrades to "not inspected" and never echoes the refused
+	// value, which is alert-supplied text.
+	if !strings.Contains(en.Scope, "not one path segment") || !strings.Contains(en.Scope, "not inspected") {
+		t.Errorf("scope must state the refused namespace was not inspected, got %q", en.Scope)
+	}
+	if strings.Contains(en.Scope, hostile) {
+		t.Errorf("scope must not carry an alert-supplied value: %q", en.Scope)
+	}
+	// The Flux lists for the refused namespace were never read, so the
+	// quiet-window negative must not claim them.
+	if en.FluxInspected {
+		t.Errorf("FluxInspected must be false when a namespace was refused")
+	}
+	// The namespace scan is incomplete, so the renderer must not turn the
+	// empty context sections into namespace-wide health negatives.
+	if en.PodScanInspected {
+		t.Errorf("PodScanInspected must be false when a namespace was refused")
+	}
+	// Nothing namespace-scoped was read for the refused namespace, so no
+	// finding may claim it empty or healthy.
+	if len(en.UnhealthyPods) != 0 || len(en.Events) != 0 || len(en.Ambient) != 0 {
+		t.Errorf("a refused namespace must contribute no pod, event or ambient findings, got %v / %v / %v",
+			en.UnhealthyPods, en.Events, en.Ambient)
+	}
+	if en.SubjectPodObserved {
+		t.Errorf("no subject pod was observed through a refused namespace")
+	}
+	if strings.Contains(logBuf.String(), hostile) {
+		t.Errorf("the raw namespace must not reach a log line: %q", logBuf.String())
+	}
+}
+
+func TestEnrichAllNamespacesRefusedLeavesOnlyNodeHealth(t *testing.T) {
+	const hostile = "ns/../../other"
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{hostile},
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": hostile, "pod": "p1",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if hits := rec.recorded(); len(hits) != 1 || !strings.HasSuffix(hits[0], "/nodes") {
+		t.Errorf("only the cluster-wide node health read may be sent, got %v", hits)
+	}
+	if !strings.Contains(en.Scope, "no namespace state was inspected") {
+		t.Errorf("scope must not claim the alert's namespaces were read, got %q", en.Scope)
+	}
+	if strings.Contains(en.Scope, hostile) {
+		t.Errorf("scope must not carry an alert-supplied value: %q", en.Scope)
+	}
+	if en.FluxInspected {
+		t.Errorf("FluxInspected must be false when every namespace was refused")
+	}
+	if en.PodScanInspected {
+		t.Errorf("PodScanInspected must be false when every namespace was refused")
+	}
+	// The subject pod was never queried, so the log-backend query must not
+	// claim it was bounded to the subject.
+	if en.BackendScoped {
+		t.Errorf("BackendScoped must be false when the subject's namespace was refused")
+	}
+}
+
+func TestResolveJobsRefusesNamespaceAndNameNotOneSegment(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns/../../other", "job_name": "backup"}},
+		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "job/../sneaky"}},
+		{Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1", "job_name": "backup"}},
+	}}
+	jobs := k.resolveJobs(context.Background(), g)
+
+	var jobHits []string
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/jobs/") {
+			jobHits = append(jobHits, path)
+		}
+	}
+	if len(jobHits) != 1 || !strings.Contains(jobHits[0], "/namespaces/ns1/jobs/backup") {
+		t.Errorf("only the well-formed job may be requested, got %v", jobHits)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("the test backend serves no job, so none may resolve, got %v", jobs)
+	}
+}
+
+func TestFetchEventsRefusesNamespaceNotOneSegment(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	items, err := k.fetchEvents(context.Background(), "ns/../../other")
+	if !errors.Is(err, errEventsNamespaceRefused) {
+		t.Errorf("a refused namespace must fail with the refusal sentinel, got %v", err)
+	}
+	if items != nil {
+		t.Errorf("a refused namespace must return no events, got %v", items)
+	}
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/events") {
+			t.Errorf("a refused namespace must send no events request, got %q", path)
+		}
+	}
+
+	// A well-formed namespace is still read, and the empty namespace stays
+	// the deliberate cluster-wide scope.
+	if _, err := k.fetchEvents(context.Background(), "ns-ok"); err != nil {
+		t.Errorf("a namespace that is one path segment must still be read, got %v", err)
+	}
+	if _, err := k.fetchEvents(context.Background(), ""); err != nil {
+		t.Errorf("the cluster-wide scope must still be read, got %v", err)
+	}
+	var eventsHits []string
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/events") {
+			eventsHits = append(eventsHits, path)
+		}
+	}
+	if len(eventsHits) != 2 ||
+		eventsHits[0] != "/api/v1/namespaces/ns-ok/events?fieldSelector=type!=Normal" ||
+		eventsHits[1] != "/api/v1/events?fieldSelector=type!=Normal" {
+		t.Errorf("unexpected events reads, got %v", eventsHits)
 	}
 }

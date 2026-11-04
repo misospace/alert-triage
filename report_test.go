@@ -1664,7 +1664,7 @@ func TestRenderEvidencePodIDNegatives(t *testing.T) {
 			Namespaces: []string{"ns1"},
 			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
 		},
-		Enrichment: Enrichment{SubjectPodObserved: true},
+		Enrichment: Enrichment{SubjectPodObserved: true, PodScanInspected: true},
 	}
 	got := renderEvidence(rpt)
 	for _, want := range []string{
@@ -1673,6 +1673,39 @@ func TestRenderEvidencePodIDNegatives(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, got)
+		}
+	}
+}
+
+// A refused namespace leaves the namespace scan incomplete, so the
+// namespace-wide context sections must state the gap instead of the "none"
+// negatives a completed scan earns (issue #311).
+func TestRenderEvidenceRefusedNamespaceNotInspected(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "single/A",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
+		},
+		Enrichment: Enrichment{SubjectPodObserved: true},
+	}
+	got := renderEvidence(rpt)
+	for _, banned := range []string{
+		"no other unhealthy pods in the namespace",
+		"no other terminated containers in the namespace",
+		"no other terminated containers left a message",
+		"no other pod in the namespace mounts a claim",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("an incomplete namespace scan must not render the negative %q:\n%s", banned, got)
+		}
+	}
+	for _, want := range []string{
+		"namespace state unavailable or incomplete",
+		"not one path segment",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected the not-inspected statement %q in:\n%s", want, got)
 		}
 	}
 }
