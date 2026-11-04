@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -631,12 +632,19 @@ const (
 	untrustedEnd   = "--- END UNTRUSTED ALERT TEXT ---"
 )
 
+// dashRun matches any run a closing fence could be carved out of.
+var dashRun = regexp.MustCompile("-{3,}")
+
 // untrusted renders a value as inert data. Collapsing whitespace is the load
 // bearing part: line structure is what lets injected text pose as a new section
-// or a closing fence. Runs of dashes are broken up for the same reason.
+// or a closing fence. Runs of dashes are broken up for the same reason, and the
+// breaking is a fixed point: every maximal run of three or more dashes is
+// rewritten to "- - -", which itself contains no dash run and sits between
+// non-dash characters, so no input can produce a surviving "---". A single
+// non-overlapping pass of "---" left runs of length 2 mod 3 re-formed.
 func untrusted(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
-	return strings.ReplaceAll(s, "---", "- - -")
+	return dashRun.ReplaceAllString(s, "- - -")
 }
 
 // sanitizeFenceContent prevents log content from breaking out of a
