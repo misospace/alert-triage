@@ -631,26 +631,30 @@ func renderEvidence(r Report) string {
 
 	b.WriteString("\nCONTEXT / BACKGROUND (read from the neighborhood: namespace pod health, node\n")
 	b.WriteString("health, Flux / GitOps timing and events not attached to the subject above)\n")
+	// The namespace sections exist because the alert names a namespace. An
+	// alert that names none has no namespace scope, so the sections say so
+	// instead of reporting on a namespace that does not exist.
+	namespaced := len(r.Group.Namespaces) > 0
 	// A namespace the alert names can be refused before any request is built
-	// (issue #311), leaving the namespace scan incomplete exactly as a failed
-	// read does. The namespace-wide negatives must then state the gap rather
-	// than read as a clean bill of health, the same rule NodesInspected and
-	// FluxInspected hold for their scopes (#294, #300).
+	// (issue #311), and a namespace pod read can fail, leaving the namespace
+	// scan incomplete either way. The namespace-wide negatives must then state
+	// the gap rather than read as a clean bill of health, the same rule
+	// NodesInspected and FluxInspected hold for their scopes (#294, #300).
 	writeFinding(&b, "Other unhealthy pods in the namespace (context, not the alert's subject)", r.Enrichment.ContextPods,
-		podScanNegative(r.Enrichment.PodScanInspected, "no other unhealthy pods in the namespace"))
+		podScanNegative(r.Enrichment.PodScanInspected, namespaced, "no other unhealthy pods in the namespace"))
 	if len(r.Enrichment.ContextRestarts) > 0 {
 		writeFinding(&b, "Other recent restarts in the namespace", r.Enrichment.ContextRestarts, "")
 	}
 	writeFinding(&b, "Other container terminations in the namespace", r.Enrichment.ContextContainerDiagnostics,
-		podScanNegative(r.Enrichment.PodScanInspected, "no other terminated containers in the namespace"))
+		podScanNegative(r.Enrichment.PodScanInspected, namespaced, "no other terminated containers in the namespace"))
 	writeUntrustedFinding(&b, "Other container termination messages in the namespace", r.Enrichment.ContextContainerTerminationMessages,
-		podScanNegative(r.Enrichment.PodScanInspected, "no other terminated containers left a message"))
+		podScanNegative(r.Enrichment.PodScanInspected, namespaced, "no other terminated containers left a message"))
 	writePodLogBlock(&b, "Other pod logs in the namespace", r.Enrichment.ContextPodLogs, r.Enrichment.ContextPodLogProvenance)
 	// Same-claim siblings are comparison context, never the subject: they
 	// mount a claim the subject mounts, but that relationship alone does not
 	// say what workload the claim serves.
 	writeFinding(&b, "Same-claim siblings (comparison context only)", r.Enrichment.PVCSiblings,
-		podScanNegative(r.Enrichment.PodScanInspected, "no other pod in the namespace mounts a claim the resolved subject pod mounts"))
+		podScanNegative(r.Enrichment.PodScanInspected, namespaced, "no other pod in the namespace mounts a claim the resolved subject pod mounts"))
 	// Metric scope is per source: alert-rule expression results and fixed
 	// metrics without a pod label may span the namespace or cluster, so they
 	// render as context and are never described as evidence about the subject.
@@ -692,15 +696,23 @@ func renderEvidence(r Report) string {
 	return b.String()
 }
 
-// podScanNegative swaps a namespace-wide context section's "none" negative
-// for the refusal statement when the namespace scan was incomplete — a
-// namespace the alert names was refused before any request was built — so a
-// refused namespace never renders as a clean bill of health (issue #311).
-func podScanNegative(inspected bool, none string) string {
+// podScanNegative returns the "none" negative for a namespace-wide context
+// section, or the statement of the gap when the namespace pod scan did not
+// complete: a namespace refused as not one path segment (issue #311), a
+// namespace pod read that failed, or no namespace in scope at all. It names
+// no cause it did not observe — the scope line says which namespaces were
+// read — so an incomplete scan never renders as a clean bill of health.
+func podScanNegative(inspected, namespaced bool, none string) string {
 	if inspected {
 		return none
 	}
-	return "namespace state unavailable or incomplete - a namespace the alert names was refused as not one path segment, so missing findings cannot rule problems in or out"
+	if !namespaced {
+		// The alert names no namespace, so there was no namespace pod scan
+		// to fail or to complete. Say that, rather than a gap the reader
+		// would take for a failed read.
+		return "the alert names no namespace, so no namespace pod health was gathered"
+	}
+	return "namespace state unavailable or incomplete - one or more required namespace pod lists were not read successfully, so missing findings cannot rule problems in or out"
 }
 
 // Alert text is chosen by whatever emitted the alert: a rule author, a workload

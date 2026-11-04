@@ -3219,6 +3219,94 @@ func TestEnrichAllNamespacesRefusedLeavesOnlyNodeHealth(t *testing.T) {
 	}
 }
 
+// A namespace that is one path segment but whose pod list read fails leaves
+// the namespace uninspected, so the scan is incomplete exactly as it is for a
+// refused namespace: the empty context sections must not read as a healthy
+// namespace (issue #311 review). A namespace that was read successfully does
+// not rescue the flag: one unread namespace is enough to make the whole
+// namespace view incomplete.
+func TestEnrichFailedNamespacePodReadLeavesScanIncomplete(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(req.URL.Path, "/pods") {
+			if strings.Contains(req.URL.Path, "/namespaces/ns-bad/") {
+				http.Error(w, `{"message":"pods is forbidden"}`, http.StatusInternalServerError)
+				return
+			}
+			_, _ = io.WriteString(w, `{"items":[]}`)
+			return
+		}
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/nodes") ||
+			strings.HasSuffix(req.URL.Path, "/events") ||
+			strings.Contains(req.URL.Path, "/helmreleases") ||
+			strings.Contains(req.URL.Path, "/kustomizations"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns-ok", "ns-bad"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-ok", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-bad", "pod": "p2"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.PodScanInspected {
+		t.Errorf("PodScanInspected must be false when one namespace pod read failed")
+	}
+	// The scope names the gap the refusal wording would not explain: this
+	// namespace was not refused, its read simply failed.
+	if !strings.Contains(en.Scope, "did not succeed") {
+		t.Errorf("scope must name the failed pod read, got %q", en.Scope)
+	}
+	// The Flux lists were read successfully, so the gap stays scoped to the
+	// pod scan and the quiet-window negative is still earned.
+	if !en.FluxInspected {
+		t.Errorf("FluxInspected must stay true when only the pod read failed")
+	}
+	// The digest states the gap instead of claiming a healthy namespace.
+	out := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(out, "no other unhealthy pods in the namespace") {
+		t.Errorf("a failed namespace pod read must not render a clean namespace:\n%s", out)
+	}
+	if !strings.Contains(out, "namespace state unavailable or incomplete") {
+		t.Errorf("expected the incomplete-scan statement in:\n%s", out)
+	}
+}
+
+// An alert that names no namespace has no namespace pod scan to complete, so
+// the namespace-wide sections must state the gap rather than claim a
+// namespace is healthy (issue #311 review).
+func TestEnrichClusterWideScopeLeavesPodScanUninspected(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "ClusterExporterDown"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.PodScanInspected {
+		t.Errorf("PodScanInspected must be false when the alert names no namespace")
+	}
+	out := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(out, "no other unhealthy pods in the namespace") {
+		t.Errorf("a cluster-wide scope must not claim a healthy namespace:\n%s", out)
+	}
+	if !strings.Contains(out, "the alert names no namespace") {
+		t.Errorf("expected the no-namespace statement in:\n%s", out)
+	}
+}
+
 func TestResolveJobsRefusesNamespaceAndNameNotOneSegment(t *testing.T) {
 	rec := &requestRecorder{}
 	srv := httptest.NewServer(rec.handler())

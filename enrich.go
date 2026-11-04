@@ -625,12 +625,14 @@ type Enrichment struct {
 	// of which the renderer quotes inside the untrusted fence. The scope
 	// itself renders outside it (issue #310 review).
 	Scope string
-	// PodScanInspected records whether the namespace pod scan actually ran
-	// for every namespace the alert names. An alert namespace that was
-	// refused as not one path segment sends no request for its scope
-	// (issue #311), and the empty Context* fields that follow must not
-	// render as a namespace-wide health negative — the same rule
-	// NodesInspected holds for the node list (issue #294).
+	// PodScanInspected records whether the namespace pod scan completed for
+	// every namespace the alert names. An alert namespace that was refused
+	// as not one path segment sends no request for its scope (issue #311),
+	// a namespace whose pod read failed was not inspected either, and an
+	// alert that names no namespace has no namespace pod scan to complete.
+	// In none of those cases may the empty Context* fields render as a
+	// namespace-wide health negative — the same rule NodesInspected holds for
+	// the node list (issue #294).
 	PodScanInspected bool
 	// RepoPaths is the GitOps-managed location of the workload(s) an alert
 	// names, resolved from Flux Kustomizations or Argo Applications the pods
@@ -918,11 +920,16 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 	}
 
-	// A namespace that is not one path segment sends no request for its
-	// scope, so the namespace pod scan is incomplete whenever one was
-	// refused; the renderer must not turn the empty Context* fields into a
-	// namespace-wide health negative (issue #311).
-	e.PodScanInspected = len(refusedNS) == 0
+	// The namespace pod scan is complete only when every namespace the alert
+	// names was read successfully. A refused namespace sends no request for
+	// its scope, a namespace whose pod read failed was not inspected, and an
+	// alert that names no namespace has no namespace pod scan at all — so the
+	// renderer must not turn the empty Context* fields into a namespace-wide
+	// health negative in any of those cases (issue #311 review).
+	podScanInspected := true
+	// podReadFailed records that a namespace's pod read did not succeed, so
+	// the scope can name the gap the refusal alone would not explain.
+	podReadFailed := false
 
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
@@ -934,6 +941,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.Ambient = append(e.Ambient, acts...)
 		e.FluxInspected = e.FluxInspected && inspected
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
+		// No namespace was named, so no namespace pod list was read: the
+		// namespace-wide sections must state the gap rather than claim a
+		// namespace is healthy (issue #311 review).
+		podScanInspected = false
 	} else if len(refusedNS) == len(g.Namespaces) {
 		// Every scope the alert names was refused, so no namespace state was
 		// read; only the node health below is this service's own reading.
@@ -1024,6 +1035,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			// negative must not claim them (issues #300, #311).
 			logf("enrich: alert namespace is not one path segment; skipping the pod, event and Flux reads for it")
 			e.FluxInspected = false
+			podScanInspected = false
 			continue
 		}
 		esc := url.PathEscape(ns)
@@ -1033,6 +1045,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			// The escaped value, not the raw label, is what reaches the
 			// journal: the namespace is alert-supplied text.
 			logf("enrich: pods in %s: %v", esc, err)
+			// The namespace was not inspected, so the empty context
+			// sections must not read as a clean namespace: the scan is
+			// incomplete exactly as it is for a refused namespace (issue
+			// #311 review).
+			podScanInspected = false
+			podReadFailed = true
 		}
 		type scoredPod struct {
 			desc      string
@@ -1208,6 +1226,17 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		acts, inspected := k.fluxActivity(ctx, esc, since)
 		e.FluxActivity = append(e.FluxActivity, acts...)
 		e.FluxInspected = e.FluxInspected && inspected
+	}
+
+	// The scan completed only if every namespace the alert names was read
+	// successfully; the renderer gates the namespace-wide negatives on it.
+	e.PodScanInspected = podScanInspected
+	if podReadFailed {
+		// Name the gap the scope statement does not already explain: the
+		// namespace was not refused, its read simply failed, and the digest
+		// must say which so no reader takes the empty section for a healthy
+		// namespace (issue #311 review).
+		e.Scope += "; a namespace pod read did not succeed, so its pods were not inspected"
 	}
 
 	// Read the declared identity and PVC relationships of every resolved target
