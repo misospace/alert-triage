@@ -243,10 +243,11 @@ const (
 
 // fluxSourceRefusal maps a fluxPath failure to the marker of the refused
 // field, or "" when the failure is not a refusal of a value the service
-// actually read — a missing object, an empty spec.path or spec.url, or a
-// source read error. Only a refusal is this service's own decision about
-// a declared source, so only a refusal earns a digest line; every other
-// failure keeps degrading to silence plus the GITOPS_REPO fallback.
+// actually read — a missing object, an empty spec.path or spec.url, a
+// sourceRef that declares no source, or a source read error. Only a
+// refusal is this service's own decision about a declared source, so only
+// a refusal earns a digest line; every other failure keeps degrading to
+// silence plus the GITOPS_REPO fallback.
 func fluxSourceRefusal(err error) string {
 	switch {
 	case errors.Is(err, errFluxSourceNamespaceRefused):
@@ -634,10 +635,17 @@ var (
 	errFluxSourceNameRefused      = errors.New("flux source name is not a valid path segment")
 )
 
+// errFluxSourceUndeclared marks a sourceRef that declares no value to
+// read: no source name, or no namespace to address. There is no value to
+// refuse, so this is an absence and not a decision — a Kustomization that
+// declares no source keeps the output it had before issue #318: no path
+// and no marker.
+var errFluxSourceUndeclared = errors.New("flux source declares no source to read")
+
 // errFluxPathUnresolved marks a fluxPath lookup whose values were all
 // readable but whose repo+path pair is simply not there: an empty
-// spec.path or an empty source spec.url. It is not a refusal and never
-// yields a marker.
+// spec.path, an empty source spec.url, or a sourceRef that declares no
+// source to read. It is not a refusal and never yields a marker.
 var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a repo path")
 
 // fluxSourceURL reads the source object a Kustomization's sourceRef names and
@@ -654,12 +662,26 @@ var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a
 // same-named source the Kustomization does not use gets resolved. The
 // refusal errors are the sentinel vars above, so resolveRepoPaths can mark
 // the refused field without re-deriving why the lookup failed (issue #318).
+//
+// An absent value is told apart from a refused one before any sentinel is
+// assigned. A sourceRef that declares no name (or no namespace to address)
+// has no value to refuse, and reporting it as refused would state a
+// decision about a value the object never declared: the digest would name
+// a refused field that does not exist, and a workload that declares no
+// GitOps source would read as one whose source the service rejected.
+// Absent is therefore undeclared, and only a refusal earns a marker.
 func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
-	if !fluxPathSegment(ns) {
+	// The refusals are decided before the absences, so a declared value
+	// this service refuses is still reported when the other value is
+	// absent: an absence must not mask a refusal.
+	if ns != "" && !fluxPathSegment(ns) {
 		return "", errFluxSourceNamespaceRefused
 	}
-	if !fluxPathSegment(srcName) {
+	if srcName != "" && !fluxPathSegment(srcName) {
 		return "", errFluxSourceNameRefused
+	}
+	if ns == "" || srcName == "" {
+		return "", errFluxSourceUndeclared
 	}
 	if srcKind == "" {
 		srcKind = "GitRepository"
@@ -682,12 +704,12 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 // errFluxSourceNameRefused mark a sourceRef value refused as not one path
 // segment — a decision this service made about a value it had read —
 // while every other failure (missing object or source, empty spec.path or
-// spec.url) means the pair simply could not be read. A namespace refusal
-// for a sourceRef that declares no namespace is folded into
-// errFluxPathUnresolved, because the refused value is then the inherited
-// Kustomization namespace — the service's own lookup key, not an
-// object-declared field. Callers that do not distinguish treat err != nil
-// exactly as the old false and degrade as before (issue #318).
+// spec.url, a sourceRef that declares no source) means the pair simply
+// could not be read. A namespace refusal for a sourceRef that declares no
+// namespace is folded into errFluxPathUnresolved, because the refused value
+// is then the inherited Kustomization namespace — the service's own lookup
+// key, not an object-declared field. Callers that do not distinguish treat
+// err != nil exactly as the old false and degrade as before (issue #318).
 func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, error) {
 	kuz, _, err := k.fluxKustomization(ctx, ns, name)
 	if err != nil {
@@ -698,6 +720,13 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, e
 	}
 	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil {
+		if errors.Is(err, errFluxSourceUndeclared) {
+			// The Kustomization declares no source to read, so there is
+			// no value to refuse: this is the absence it was before
+			// issue #318 — no path, no marker, and the GITOPS_REPO
+			// fallback still replaces the missing path.
+			return "", "", errFluxPathUnresolved
+		}
 		if errors.Is(err, errFluxSourceNamespaceRefused) && kuz.SourceRef.Namespace == "" {
 			// The refused value is not a namespace the object declared but
 			// the Kustomization's own namespace, inherited from the pod's

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -392,6 +393,136 @@ func TestResolveRepoPathsFluxSourceNameHostile(t *testing.T) {
 	}
 	if strings.Contains(refusals[0], hostile) || strings.Contains(refusals[0], "payments") {
 		t.Fatalf("the marker must never repeat the refused value, got %q", refusals[0])
+	}
+}
+
+// TestResolveRepoPathsFluxSourceRefAbsent pins the absence case (issue
+// #318): a Kustomization that declares no sourceRef, or declares one with
+// no name, is an object that declares no GitOps source — not one whose
+// source this service refused. The output must stay exactly what it was
+// before the marker existed: no path, no marker, and the configured
+// fallback still replacing the missing path.
+func TestResolveRepoPathsFluxSourceRefAbsent(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+	}{
+		{"no sourceRef", `{"spec":{"path":"apps/payments"}}`},
+		{"sourceRef without a name", `{"spec":{"path":"apps/payments","sourceRef":{"kind":"GitRepository"}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sourceHits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/namespaces/flux-system/kustomizations/payments"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, tc.spec)
+				case strings.Contains(r.URL.Path, "/gitrepositories/"):
+					sourceHits.Add(1)
+					t.Errorf("an undeclared source must not be requested: %s", r.URL.Path)
+					http.NotFound(w, r)
+				default:
+					t.Errorf("unexpected API hit for %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			pods := []podRef{{
+				Name:      "p1",
+				Namespace: "ns-a",
+				Annotations: map[string]string{
+					"kustomize.toolkit.fluxcd.io/name":      "payments",
+					"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+				},
+			}}
+			got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+			if len(got) != 0 {
+				t.Fatalf("expected no GitOps path for an undeclared source, got %#v", got)
+			}
+			// Nothing was refused, so nothing is stated about a refusal:
+			// an absent sourceRef must not read as a source the service
+			// rejected (issue #318).
+			if len(refusals) != 0 {
+				t.Fatalf("an undeclared source must not produce a refusal marker, got %#v", refusals)
+			}
+			if sourceHits.Load() != 0 {
+				t.Fatalf("an undeclared source must not be requested, got %d hits", sourceHits.Load())
+			}
+			// The fallback still applies, as it did before issue #318.
+			cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
+			got, refusals = k.resolveRepoPaths(context.Background(), pods, cfg)
+			if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
+				t.Fatalf("expected the configured fallback, got %#v", got)
+			}
+			if len(refusals) != 0 {
+				t.Fatalf("the fallback must not turn an absence into a refusal marker, got %#v", refusals)
+			}
+			if sourceHits.Load() != 0 {
+				t.Fatalf("an undeclared source must not be requested, got %d hits", sourceHits.Load())
+			}
+			// The relevance path degrades to "unknown" and must not
+			// describe the absent name as a value this service refused.
+			gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+			rel := k.resolveCommitRelevance(context.Background(), gh, pods)
+			if len(rel) != 1 {
+				t.Fatalf("expected 1 CommitRelevance, got %d", len(rel))
+			}
+			if rel[0].State != commitRelevanceUnknown {
+				t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
+			}
+			if !strings.Contains(rel[0].Reason, "not readable") {
+				t.Fatalf("reason must name the unreadable source: %q", rel[0].Reason)
+			}
+			if strings.Contains(rel[0].Reason, "not a valid path segment") {
+				t.Fatalf("an absent name must not be described as a refused value: %q", rel[0].Reason)
+			}
+			if strings.Contains(rel[0].Reason, "\n") {
+				t.Fatalf("reason must be one line: %q", rel[0].Reason)
+			}
+		})
+	}
+}
+
+// TestFluxSourceURLClassifiesAbsenceAndRefusal pins the classification
+// the markers rest on (issue #318): a value that is present and not one
+// path segment is refused, a value that is absent is undeclared, and
+// neither is ever requested. A refusal is decided even when the other
+// value is absent, so an absence can never mask a refusal.
+func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
+	cases := []struct {
+		name    string
+		ns      string
+		srcName string
+		want    error
+	}{
+		{"declared namespace refused", "sources/../workloads", "config", errFluxSourceNamespaceRefused},
+		{"declared name refused", "workloads", "payments/../other", errFluxSourceNameRefused},
+		{"absent name", "workloads", "", errFluxSourceUndeclared},
+		{"absent namespace", "", "config", errFluxSourceUndeclared},
+		{"absent namespace, refused name", "", "payments/../other", errFluxSourceNameRefused},
+		{"refused namespace, absent name", "sources/../workloads", "", errFluxSourceNamespaceRefused},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			_, err := k.fluxSourceURL(context.Background(), tc.ns, "GitRepository", tc.srcName)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if hits.Load() != 0 {
+				t.Fatalf("a refused or undeclared source must not be requested, got %d hits", hits.Load())
+			}
+		})
 	}
 }
 
