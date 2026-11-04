@@ -2162,3 +2162,79 @@ func TestEnrichReportsRefusedArgoInstance(t *testing.T) {
 		t.Fatalf("a refused instance must not be requested, got %d hits", appHits.Load())
 	}
 }
+
+// TestEvidenceArgoRefusalKeepsRefusedValueFenced pins the boundary the
+// marker design relies on end to end (Enrich → renderEvidence). The claim
+// "the refused value never appears" is deliberately two-sided, because
+// identityTags whitelists argocd.argoproj.io/instance: the very pod whose
+// reference was refused echoes the raw annotation into its Ownership chain
+// as workload-authored text. The service's own text (the marker, headings,
+// logs) must never carry the refused value; author text carrying it may
+// appear only inside the untrusted fence. A job-owned pod exercises both
+// sides in one digest so a fence regression is caught at render level, not
+// only at lookup.
+func TestEvidenceArgoRefusalKeepsRefusedValueFenced(t *testing.T) {
+	// No whitespace runs and no dash runs, so untrusted() leaves the value
+	// verbatim and containment checks compare against the raw annotation.
+	const refused = "sneaky/../../elsewhere"
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/applications/"):
+			t.Errorf("a refused instance must not be requested: %s", r.URL.Path)
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/jobs/"):
+			_, _ = io.WriteString(w, `{"metadata":{"name":"backup","namespace":"ns-a","uid":"u1"}}`)
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"argocd.argoproj.io/instance":"`+refused+`"},"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job","name":"backup","uid":"u1"}]},"spec":{"nodeName":"n1"},"status":{"phase":"Failed"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	g := Group{
+		Key:        "KubeJobFailed",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubeJobFailed", "namespace": "ns-a", "job_name": "backup"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
+	evidence := renderEvidence(Report{Group: g, Enrichment: en})
+
+	// Both channels must have run, or the fence assertions below would
+	// pass vacuously: the marker for the refusal, and the identityTags
+	// echo that makes a blanket "never appears" claim false.
+	if len(en.RepoPathRefusals) != 1 || en.RepoPathRefusals[0] != argoInstanceRefusal {
+		t.Fatalf("expected one fixed refusal marker, got %#v", en.RepoPathRefusals)
+	}
+	if !strings.Contains(strings.Join(en.Ownership, "\n"), refused) {
+		t.Fatalf("expected identityTags to echo the annotation into Ownership, got %#v", en.Ownership)
+	}
+
+	// The marker is the service's own finding: it renders outside the
+	// fence and names the field, not the value.
+	if !strings.Contains(evidence, "RepoPaths:\n- "+argoInstanceRefusal) {
+		t.Fatalf("refusal marker missing from RepoPaths:\n%s", evidence)
+	}
+	at := strings.Index(evidence, argoInstanceRefusal)
+	if strings.LastIndex(evidence[:at], untrustedBegin) > strings.LastIndex(evidence[:at], untrustedEnd) {
+		t.Errorf("the refusal marker was rendered inside an untrusted fence:\n%s", evidence)
+	}
+	// The refused value must appear nowhere outside the fence...
+	if stripped := stripFences(evidence); strings.Contains(stripped, refused) {
+		t.Errorf("the refused value escaped the untrusted fence:\nstripped=%q\nfull=\n%s", stripped, evidence)
+	}
+	// ...and must actually be fenced, not merely dropped: it is the
+	// annotation echo in the Ownership chain, author text like every
+	// other identityTags value.
+	if !messageInsideFence(evidence, refused) {
+		t.Errorf("expected the annotation echo inside the untrusted fence:\n%s", evidence)
+	}
+	if strings.Count(evidence, untrustedBegin) != strings.Count(evidence, untrustedEnd) {
+		t.Fatalf("unbalanced fences:\n%s", evidence)
+	}
+}
