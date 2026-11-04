@@ -249,6 +249,7 @@ const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not o
 const (
 	fluxSourceNamespaceRefusal = "flux Kustomization spec.sourceRef.namespace refused: value is not one path segment (value not shown)"
 	fluxSourceNameRefusal      = "flux Kustomization spec.sourceRef.name refused: value is not one path segment (value not shown)"
+	fluxSourceGroupRefusal     = "flux Kustomization spec.sourceRef.group refused: value is not one path segment (value not shown)"
 	fluxSourceKindRefusal      = "flux Kustomization spec.sourceRef.kind refused: value is not one path segment (value not shown)"
 )
 
@@ -265,6 +266,8 @@ func fluxSourceRefusal(err error) string {
 		return fluxSourceNamespaceRefusal
 	case errors.Is(err, errFluxSourceNameRefused):
 		return fluxSourceNameRefusal
+	case errors.Is(err, errFluxSourceGroupRefused):
+		return fluxSourceGroupRefusal
 	case errors.Is(err, errFluxSourceKindRefused):
 		return fluxSourceKindRefusal
 	}
@@ -830,44 +833,13 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, group, srcKind, srcName st
 	if srcName == "" {
 		return "", errors.New("flux source name is not a valid path segment")
 	}
-	if srcKind == "" {
-		srcKind = "GitRepository"
-	}
-	// The refusals are decided before the absences, so a declared value
-	// this service refuses is still reported when the other value is
-	// absent: an absence must not mask a refusal.
-	if ns != "" && !fluxPathSegment(ns) {
-		return "", errFluxSourceNamespaceRefused
-	}
-	if srcName != "" && !fluxPathSegment(srcName) {
-		return "", errFluxSourceNameRefused
-	}
-	// The kind reaches the path only through pluralLower, so that output is
-	// what the segment check must judge: the declared kinds are CamelCase
-	// ("GitRepository") and would fail a direct check, but their plurals
-	// are what is interpolated. Checking the plural catches the dangerous
-	// classes in the kind: separators, traversal pairs and encoding
-	// characters survive ToLower unchanged (Go's simple case mapping never
-	// produces punctuation) and so fail the check on the plural. The
-	// refusal is the kind's own sentinel, not a rewrite to the
-	// GitRepository default: like a refused name or namespace, a declared
-	// kind the service would not send must not read as a kind it never
-	// declared (issue #327).
-	if !fluxPathSegment(pluralLower(srcKind)) {
-		return "", errFluxSourceKindRefused
-	}
-	if ns == "" {
-		return "", errors.New("flux source namespace is not a valid path segment")
-	}
-	if srcName == "" {
-		return "", errors.New("flux source name is not a valid path segment")
-	}
+	plural := pluralLower(srcKind)
 	var src struct {
 		Spec struct {
 			URL string `json:"url"`
 		} `json:"spec"`
 	}
-	p := "/apis/" + group + "/" + fluxSourceGroupVersion(group) + "/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + srcName
+	p := "/apis/" + group + "/" + fluxSourceGroupVersion(group) + "/namespaces/" + ns + "/" + plural + "/" + srcName
 	if err := k.get(ctx, p, &src); err != nil {
 		return "", err
 	}

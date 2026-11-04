@@ -303,29 +303,91 @@ func TestFluxSourceURLGroup(t *testing.T) {
 	}
 }
 
-// TestFluxSourceURLGroupHostile pins the guard on the declared group: like
-// the namespace and the name it is interpolated into an apiserver path, so a
-// value that is not one path segment must fail the lookup without any
-// request. The error is fixed text and must not echo the hostile value
+// TestFluxSourceURLGroupHostile pins the guards on the declared group and on
+// the plural of the declared kind: both are interpolated into an apiserver
+// path, so a value that is not one path segment must fail the lookup without
+// any request. The errors are fixed text and must not echo the hostile value
 // (issue #307).
 func TestFluxSourceURLGroupHostile(t *testing.T) {
-	const hostile = "source.toolkit.fluxcd.io/../../other"
-	var hits atomic.Int32
+	cases := []struct {
+		name    string
+		group   string
+		kind    string
+		hostile string
+	}{
+		{
+			name:    "group",
+			group:   "source.toolkit.fluxcd.io/../../other",
+			kind:    "GitRepository",
+			hostile: "source.toolkit.fluxcd.io/../../other",
+		},
+		{
+			// The pluraliser lowercases and appends, so a traversal in the
+			// kind arrives in the resource segment with its ".." pair.
+			name:    "kind",
+			group:   "",
+			kind:    "GitRepository/../helmreleases",
+			hostile: "GitRepository/../helmreleases",
+		},
+	}
+	for _, tc := range cases {
+		t.Run("refuses hostile "+tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			_, err := k.fluxSourceURL(context.Background(), "sources", tc.group, tc.kind, "config")
+			if err == nil {
+				t.Fatal("a value that is not one path segment must fail the lookup")
+			}
+			if strings.Contains(err.Error(), tc.hostile) {
+				t.Fatalf("error must not echo the refused value: %v", err)
+			}
+			if hits.Load() != 0 {
+				t.Fatalf("a refused value must not be requested, got %d hits", hits.Load())
+			}
+		})
+	}
+}
+
+// TestResolveRepoPathsFluxNonGitSourceConfiguredFallback pins what an
+// OCI-sourced workload does when the operator configured a default: the Flux
+// lookup reports no path, and the existing fallback for unresolved pods
+// applies the configured GITOPS_REPO. This is the same degradation a failed
+// lookup already had. The alternative was an oci:// URL in the GitOps paths,
+// which is the wrong sentence this lookup must not say (issue #307).
+func TestResolveRepoPathsFluxNonGitSourceConfiguredFallback(t *testing.T) {
+	var srcHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		http.NotFound(w, r)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/kustomizations/demo"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"OCIRepository","name":"demo-src"}}}`)
+		default:
+			srcHits.Add(1)
+			http.NotFound(w, r)
+		}
 	}))
 	defer srv.Close()
 	k := &kube{hc: srv.Client(), base: srv.URL}
-	_, err := k.fluxSourceURL(context.Background(), "sources", hostile, "GitRepository", "config")
-	if err == nil {
-		t.Fatal("a group that is not one path segment must fail the lookup")
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	cfg := &Config{GitOpsRepo: "https://github.com/example/configs", GitOpsPath: "clusters/staging"}
+	got, _ := k.resolveRepoPaths(context.Background(), pods, cfg)
+	if len(got) != 1 || got[0] != "https://github.com/example/configs/clusters/staging" {
+		t.Fatalf("expected only the configured fallback, got %#v", got)
 	}
-	if strings.Contains(err.Error(), hostile) {
-		t.Fatalf("error must not echo the refused group: %v", err)
-	}
-	if hits.Load() != 0 {
-		t.Fatalf("a refused group must not be requested, got %d hits", hits.Load())
+	if srcHits.Load() != 0 {
+		t.Fatalf("the non-Git source must not be read for a repo path, got %d hits", srcHits.Load())
 	}
 }
 
