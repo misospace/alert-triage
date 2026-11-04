@@ -427,8 +427,8 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 //     backslash, or percent are refused before rendering — the same
 //     rejection set resolveRepoPaths applies to the same class of value.
 //     A refused singular field (spec.path, the sourceRef name, a declared
-//     sourceRef group) renders an explicit "refused" marker so it never
-//     reads as an absent one; refused
+//     sourceRef group, a declared sourceRef kind) renders an explicit
+//     "refused" marker so it never reads as an absent one; refused
 //     list entries are dropped, leaving their subsection saying "none safe".
 //     No path.Clean here, unlike resolveRepoPaths: components legitimately
 //     carry `..` segments (`../base/common`) and OCI references that a
@@ -476,6 +476,15 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 			// cannot honestly name one object, so the whole fragment is
 			// refused rather than presenting an ambiguous reference as
 			// identified.
+			src = "refused"
+		case spec.SourceRef.Kind != "" && !safe(spec.SourceRef.Kind):
+			// The kind is only quoted into the fragment here — this
+			// record never builds an apiserver path from it — but a
+			// declared kind that fails the same character check cannot
+			// just drop out: composing the fragment without it reads as
+			// a kind-less reference, as if no kind had been declared.
+			// Like a refused name or group, the whole fragment is
+			// refused (#326).
 			src = "refused"
 		default:
 			src = spec.SourceRef.Name
