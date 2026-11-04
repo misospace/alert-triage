@@ -1149,7 +1149,7 @@ func assertHostileKustomizationDegrades(t *testing.T, k *kube, hits *atomic.Int3
 		t.Fatalf("expected the Kustomization read of %q/%q to fail", ns, name)
 	}
 
-	if paths := k.resolveRepoPaths(context.Background(), pods, &Config{}); len(paths) != 0 {
+	if paths, _ := k.resolveRepoPaths(context.Background(), pods, &Config{}); len(paths) != 0 {
 		t.Fatalf("expected no GitOps path for a refused Kustomization, got %#v", paths)
 	}
 
