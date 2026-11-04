@@ -1687,11 +1687,19 @@ func TestResolveCommitRelevanceFluxAndGitHub(t *testing.T) {
 	if !strings.Contains(evidence, "Recent reconciled commit (GitHub):") {
 		t.Errorf("evidence missing header:\n%s", evidence)
 	}
-	if !strings.Contains(evidence, "touches workload: apps/payments") {
+	if !strings.Contains(evidence, "- touches workload:") {
 		t.Errorf("evidence missing state line:\n%s", evidence)
 	}
+	// The workload path is quoted from the Kustomization's spec, so it sits
+	// inside the fence with the matching files, not beside the state line.
+	if !messageInsideFence(evidence, "apps/payments") {
+		t.Errorf("expected the workload path inside the untrusted fence:\n%s", evidence)
+	}
+	if strings.Contains(stripFences(evidence), "apps/payments") {
+		t.Errorf("the workload path must not render outside the untrusted fence:\n%s", evidence)
+	}
 	if strings.Count(evidence, untrustedBegin) < 2 {
-		// one for alerts, one for matching files
+		// one for alerts, one for the quoted path and matching files
 		t.Errorf("expected matching files inside untrusted fence:\n%s", evidence)
 	}
 }
@@ -2096,6 +2104,12 @@ func TestRenderEvidenceRepoPathRefusal(t *testing.T) {
 	if strings.Count(evidence, "RepoPaths:") != 1 {
 		t.Errorf("expected exactly one RepoPaths section:\n%s", evidence)
 	}
+	// The marker is this service's own fixed text, so it renders outside the
+	// fence: fencing it would tell the model to distrust our own finding
+	// (issue #320).
+	if messageInsideFence(evidence, argoInstanceRefusal) {
+		t.Errorf("the refusal marker must stay outside the untrusted fence:\n%s", evidence)
+	}
 
 	// Refusal alongside a resolved (fallback) path: both render, the path
 	// first, and the marker still does not carry the refused value.
@@ -2108,6 +2122,17 @@ func TestRenderEvidenceRepoPathRefusal(t *testing.T) {
 	j := strings.Index(evidence, argoInstanceRefusal)
 	if i < 0 || j < 0 || i > j {
 		t.Errorf("expected the path then the marker under RepoPaths:\n%s", evidence)
+	}
+	// The path is quoted from the GitOps resource's own spec, so it renders
+	// inside the untrusted fence; the marker stays outside it.
+	if !messageInsideFence(evidence, "https://github.com/example/fallback/deploy/staging") {
+		t.Errorf("the GitOps path must render inside the untrusted fence:\n%s", evidence)
+	}
+	if messageInsideFence(evidence, argoInstanceRefusal) {
+		t.Errorf("the refusal marker must stay outside the untrusted fence:\n%s", evidence)
+	}
+	if !strings.Contains(stripFences(evidence), argoInstanceRefusal) {
+		t.Errorf("the refusal marker must still render outside the fence:\n%s", evidence)
 	}
 
 	// Nothing resolved and nothing refused: no section, unchanged.
