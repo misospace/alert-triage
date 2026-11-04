@@ -415,6 +415,103 @@ func TestResolveRepoPathsFluxSourceNameHostile(t *testing.T) {
 	}
 }
 
+// TestResolveRepoPathsFluxSourceKindHostile pins the sourceRef.kind twin of
+// the namespace and name guards (issues #318, #322): a Kustomization whose
+// declared kind is not one path segment yields no path, no source request,
+// and exactly one fixed marker naming spec.sourceRef.kind — never the
+// refused value. Without the guard the kind is lowercased with an "s"
+// appended and copied into the request path as it stands, so the service
+// asks the apiserver for a path it did not mean to ask for.
+func TestResolveRepoPathsFluxSourceKindHostile(t *testing.T) {
+	const hostile = "../../secrets"
+	var sourceHits, kuzHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/kustomizations/demo"):
+			kuzHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"`+hostile+`","name":"config"}}}`)
+		case strings.HasPrefix(r.URL.Path, "/apis/source.toolkit.fluxcd.io/"):
+			sourceHits.Add(1)
+			t.Errorf("a refused source kind must not be requested, got %s", r.URL.Path)
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	// Two pods of one deployment share the Kustomization: the marker names
+	// the field, not the value, so every refusal collapses to one line.
+	pods := []podRef{
+		{
+			Name:      "p1",
+			Namespace: "ns-a",
+			Annotations: map[string]string{
+				"kustomize.toolkit.fluxcd.io/name":      "demo",
+				"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+			},
+		},
+		{
+			Name:      "p2",
+			Namespace: "ns-a",
+			Annotations: map[string]string{
+				"kustomize.toolkit.fluxcd.io/name":      "demo",
+				"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+			},
+		},
+	}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path for a refused source kind, got %#v", got)
+	}
+	if sourceHits.Load() != 0 {
+		t.Fatalf("a refused source kind must not be requested, got %d hits", sourceHits.Load())
+	}
+	if len(refusals) != 1 || refusals[0] != fluxSourceKindRefusal {
+		t.Fatalf("expected one fixed kind refusal marker for two pods of one Kustomization, got %#v", refusals)
+	}
+	if strings.Contains(refusals[0], hostile) || strings.Contains(refusals[0], "secrets") {
+		t.Fatalf("the marker must never repeat the refused value, got %q", refusals[0])
+	}
+	if kuzHits.Load() == 0 {
+		t.Fatalf("expected the Kustomization to be read before the source lookup")
+	}
+	// With a fallback configured the refusal degrades to that fallback and
+	// the marker travels alongside it (issue #318).
+	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
+	got, refusals = k.resolveRepoPaths(context.Background(), pods, cfg)
+	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
+		t.Fatalf("expected the configured fallback, got %#v", got)
+	}
+	if len(refusals) != 1 || refusals[0] != fluxSourceKindRefusal {
+		t.Fatalf("the marker must survive the fallback, got %#v", refusals)
+	}
+	if sourceHits.Load() != 0 {
+		t.Fatalf("a refused source kind must not be requested, got %d hits", sourceHits.Load())
+	}
+	// The relevance path degrades to "unknown" with a one-line reason that
+	// carries neither the refused value nor the pod's own names.
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+	rel := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(rel) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(rel))
+	}
+	if rel[0].State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
+	}
+	if !strings.Contains(rel[0].Reason, "not readable") {
+		t.Fatalf("reason must name the unreadable source: %q", rel[0].Reason)
+	}
+	if strings.Contains(rel[0].Reason, hostile) || strings.Contains(rel[0].Reason, "secrets") {
+		t.Fatalf("reason must not echo the refused kind: %q", rel[0].Reason)
+	}
+	if strings.Contains(rel[0].Reason, "\n") {
+		t.Fatalf("reason must be one line: %q", rel[0].Reason)
+	}
+}
+
 // TestResolveRepoPathsFluxSourceRefAbsent pins the absence case (issue
 // #318): a Kustomization that declares no sourceRef, or declares one with
 // no name, is an object that declares no GitOps source — not one whose
@@ -564,16 +661,19 @@ func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 	cases := []struct {
 		name    string
 		ns      string
+		kind    string
 		srcName string
 		want    error  // refusal sentinel, or nil for the pre-#318 absence errors
 		wantMsg string // exact message when want == nil
 	}{
-		{"declared namespace refused", "sources/../workloads", "config", errFluxSourceNamespaceRefused, ""},
-		{"declared name refused", "workloads", "payments/../other", errFluxSourceNameRefused, ""},
-		{"absent name", "workloads", "", nil, "flux source name is not a valid path segment"},
-		{"absent namespace", "", "config", nil, "flux source namespace is not a valid path segment"},
-		{"absent namespace, refused name", "", "payments/../other", errFluxSourceNameRefused, ""},
-		{"refused namespace, absent name", "sources/../workloads", "", errFluxSourceNamespaceRefused, ""},
+		{"declared namespace refused", "sources/../workloads", "GitRepository", "config", errFluxSourceNamespaceRefused, ""},
+		{"declared name refused", "workloads", "GitRepository", "payments/../other", errFluxSourceNameRefused, ""},
+		{"declared kind refused", "workloads", "../../secrets", "config", errFluxSourceKindRefused, ""},
+		{"absent name", "workloads", "GitRepository", "", nil, "flux source name is not a valid path segment"},
+		{"absent namespace", "", "GitRepository", "config", nil, "flux source namespace is not a valid path segment"},
+		{"absent namespace, refused name", "", "GitRepository", "payments/../other", errFluxSourceNameRefused, ""},
+		{"refused namespace, absent name", "sources/../workloads", "GitRepository", "", errFluxSourceNamespaceRefused, ""},
+		{"refused kind, absent name", "workloads", "Bucket/../../other", "", errFluxSourceKindRefused, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,7 +685,7 @@ func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 			defer srv.Close()
 
 			k := &kube{hc: srv.Client(), base: srv.URL}
-			_, err := k.fluxSourceURL(context.Background(), tc.ns, "GitRepository", tc.srcName)
+			_, err := k.fluxSourceURL(context.Background(), tc.ns, tc.kind, tc.srcName)
 			if tc.want != nil {
 				if !errors.Is(err, tc.want) {
 					t.Fatalf("err = %v, want %v", err, tc.want)
@@ -596,12 +696,54 @@ func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 				if err == nil || err.Error() != tc.wantMsg {
 					t.Fatalf("err = %v, want exactly %q", err, tc.wantMsg)
 				}
-				if errors.Is(err, errFluxSourceNameRefused) || errors.Is(err, errFluxSourceNamespaceRefused) {
+				if errors.Is(err, errFluxSourceNameRefused) || errors.Is(err, errFluxSourceNamespaceRefused) || errors.Is(err, errFluxSourceKindRefused) {
 					t.Fatalf("an absent value must not be reported as a refusal: %v", err)
 				}
 			}
 			if hits.Load() != 0 {
 				t.Fatalf("a refused or absent source must not be requested, got %d hits", hits.Load())
+			}
+		})
+	}
+}
+
+// TestFluxSourceURLDeclaredKindsKeepWorking pins the other half of the kind
+// guard (issue #322): the refusal must not sweep up legitimate kinds. The
+// kinds Flux declares address the fixed plural their API resources have,
+// and an empty kind still means GitRepository — the default Flux itself
+// applies. A kind the guard would have to refuse to be safe would break a
+// working Kustomization, so this test is what says it does not.
+func TestFluxSourceURLDeclaredKindsKeepWorking(t *testing.T) {
+	cases := []struct {
+		kind string
+		want string // plural path segment expected in the request
+	}{
+		{"", "gitrepositories"},
+		{"GitRepository", "gitrepositories"},
+		{"OCIRepository", "ocirepositories"},
+		{"Bucket", "buckets"},
+		{"HelmChart", "helmcharts"},
+		{"HelmRelease", "helmreleases"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			var got string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.URL.Path
+				_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/config"}}`)
+			}))
+			defer srv.Close()
+
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			url, err := k.fluxSourceURL(context.Background(), "flux-system", tc.kind, "cluster")
+			if err != nil {
+				t.Fatalf("a declared kind must not be refused: %v", err)
+			}
+			if url != "https://github.com/example/config" {
+				t.Fatalf("url = %q", url)
+			}
+			if wantSuffix := "/namespaces/flux-system/" + tc.want + "/cluster"; !strings.HasSuffix(got, wantSuffix) {
+				t.Fatalf("request path %q must address %q", got, wantSuffix)
 			}
 		})
 	}
