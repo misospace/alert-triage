@@ -45,6 +45,31 @@ func stubKube(t *testing.T) (*kube, *int64) {
 	return &kube{hc: srv.Client(), base: srv.URL}, &hits
 }
 
+// settleHits returns the kube hit count once it has been quiet for a
+// full window. The flush loop empties the buffer when take() pops the
+// batch, but process keeps issuing kube reads after the pop — a
+// namespace-less group takes the cluster-wide Flux path — so a snapshot
+// taken the moment the drain is observed counts those in-flight reads
+// as extra flushes on a slow or race-instrumented host (issue #314).
+// The quiet window is comfortably longer than a local kube round-trip
+// yet well under the loop's 1s clamped tick, so hits from a loop that
+// really does flush again after the drain still land after the
+// snapshot. If the counter never goes quiet, the deadline returns the
+// latest value and the caller's assertion reports the growth.
+func settleHits(hits *int64) int64 {
+	const quiet = 500 * time.Millisecond
+	deadline := time.Now().Add(3 * time.Second)
+	last := atomic.LoadInt64(hits)
+	for {
+		time.Sleep(quiet)
+		now := atomic.LoadInt64(hits)
+		if now == last || time.Now().After(deadline) {
+			return now
+		}
+		last = now
+	}
+}
+
 // TestRunFlushLoopTick exercises the tick-driven path of runFlushLoop: an
 // alert pushed into the buffer must be drained by the next tick, and the
 // real process path must run end-to-end without panicking.
@@ -79,29 +104,13 @@ func TestRunFlushLoopTick(t *testing.T) {
 	if got := bufferLen(buf); got != 0 {
 		t.Fatalf("expected buffer drained after flush tick, got %d", got)
 	}
-	// The buffer empties when the tick pops the batch, but process then
-	// runs its kube reads — a namespace-less group takes the cluster-wide
-	// Flux path — so some hits land after the drain is observed.
-	// Snapshotting at that moment miscounts them as an empty-buffer flush
-	// on a slow or race-instrumented host (issue #314). Settle first:
-	// snapshot only once the counter has been quiet for a window
-	// comfortably longer than a local kube round-trip. The original guard
-	// survives — an over-eager loop that flushes again on an empty buffer
-	// fires on the clamped 1s tick, outside any window the real flush's
-	// reads settle into, so its hits still land after the snapshot and
-	// fail the assertion below.
-	const settleQuiet = 500 * time.Millisecond
-	settleBy := time.Now().Add(3 * time.Second)
-	drainedHits := atomic.LoadInt64(hits)
-	for {
-		time.Sleep(settleQuiet)
-		now := atomic.LoadInt64(hits)
-		if now == drainedHits || time.Now().After(settleBy) {
-			drainedHits = now
-			break
-		}
-		drainedHits = now
-	}
+	// Snapshot the counter only after the flush's in-flight kube reads
+	// have settled (see settleHits); the original guard survives — an
+	// over-eager loop that flushes again on an empty buffer fires on the
+	// clamped 1s tick, outside any window the real flush's reads settle
+	// into, so its hits still land after the snapshot and fail the
+	// assertion below.
+	drainedHits := settleHits(hits)
 	time.Sleep(2500 * time.Millisecond)
 	cancel()
 	<-done
@@ -263,9 +272,12 @@ func TestRunFlushLoopExitsOnContextCancelMidTick(t *testing.T) {
 	if bufferLen(buf) != 0 {
 		t.Fatalf("expected buffer drained before cancel, got %d", bufferLen(buf))
 	}
-	// Give process a moment to finish its kube call and return to the select.
-	time.Sleep(50 * time.Millisecond)
-	before := atomic.LoadInt64(hits)
+	// Wait for the flush's in-flight kube reads to settle before
+	// snapshotting (see settleHits, issue #314): a read still landing
+	// from the real flush would otherwise be blamed on a stale process
+	// after cancel. Settling also means the cancel arrives while the
+	// loop is idle in its select, which is what this test guards.
+	before := settleHits(hits)
 
 	// Cancel the context while the loop is in its select (between ticks).
 	cancel()
