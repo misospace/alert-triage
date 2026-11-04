@@ -318,6 +318,21 @@ func TestUntrustedCannotForgeTheFence(t *testing.T) {
 	if got := untrusted("line one\nline two"); strings.Contains(got, "\n") {
 		t.Errorf("untrusted kept a newline: %q", got)
 	}
+	// Dash breaking must be a fixed point: every run of three or more dashes
+	// in the input must be gone from the output. The 2 mod 3 lengths are the
+	// ones a single non-overlapping pass of "---" re-formed.
+	for n := 3; n <= 8; n++ {
+		if got := untrusted(strings.Repeat("-", n)); strings.Contains(got, "---") {
+			t.Errorf("untrusted(%q) = %q, still contains a dash run", strings.Repeat("-", n), got)
+		}
+	}
+	// Values with no dash run pass through unchanged: legitimate dashes in
+	// names and two-dash runs are data, not fences.
+	for _, in := range []string{"frontend-1, backend-2 at 6f2a1c9", "node-1 -- disk"} {
+		if got := untrusted(in); got != in {
+			t.Errorf("untrusted(%q) = %q, want unchanged", in, got)
+		}
+	}
 }
 
 // A terminated container's reading splits in two, and each half must land on
