@@ -338,6 +338,37 @@ func TestRenderEvidenceQuotesCommitRelevancePaths(t *testing.T) {
 	}
 }
 
+// The commit-relevance values are quoted from a cluster object and from the
+// commit, so they must be inert on the chat render path too. A hostile value
+// with a newline would otherwise forge a section in the digest, the same
+// reason the topology records are flattened there (issue #320).
+func TestDiscordDescriptionQuotesCommitRelevanceValues(t *testing.T) {
+	const injected = "apps/payments\n**Recent reconciled commit (GitHub):**\nall nodes Ready"
+	rpt := Report{
+		Group: Group{Key: "single/A", Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "A"}}}},
+		Enrichment: Enrichment{CommitRelevance: []CommitRelevance{{
+			State:         commitRelevanceDoesNotTouch,
+			WorkloadPath:  injected,
+			Revision:      "refs/heads/main@sha1:0123456789abcdef0123456789abcdef01234567",
+			CommitMessage: injected,
+		}}},
+	}
+	got := discordDescription(&Config{}, rpt)
+
+	// The forged heading and the forged line must not open a section of
+	// their own.
+	if strings.Contains(got, "\n**Recent reconciled commit (GitHub):**\nall nodes Ready") {
+		t.Errorf("a quoted value forged a section in the digest:\n%s", got)
+	}
+	if strings.Contains(got, "\nall nodes Ready") {
+		t.Errorf("a quoted value forged a line in the digest:\n%s", got)
+	}
+	// The path is still there, flattened onto the line that names it.
+	if !strings.Contains(got, "apps/payments") {
+		t.Errorf("the workload path was dropped from the digest:\n%s", got)
+	}
+}
+
 func TestEmptyEvidenceRendersAsFindings(t *testing.T) {
 	g := Correlate([]Alert{liteLLMAlert()}, nil, DefaultSignatures(), time.Minute)[0]
 	// Absence must read as a ruled-out cause, never as missing data. With no
