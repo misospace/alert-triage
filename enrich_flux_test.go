@@ -103,6 +103,240 @@ func TestResolveRepoPathsFluxPath(t *testing.T) {
 	}
 }
 
+// TestResolveRepoPathsFluxSourceRefNamespace covers the cross-namespace
+// sourceRef (issue #296): the Kustomization names a source that lives in
+// another namespace, so the source must be read there. A same-named source
+// in the Kustomization's own namespace must never be read — resolving it
+// would put the wrong repository in the digest.
+func TestResolveRepoPathsFluxSourceRefNamespace(t *testing.T) {
+	var localHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/kustomizations/demo"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"GitRepository","name":"config","namespace":"sources"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/sources/gitrepositories/config"):
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/right"}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/gitrepositories/config"):
+			// The same-named local source: reading it would resolve the
+			// wrong repository.
+			localHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/wrong"}}`)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/right/apps/demo" {
+		t.Fatalf("unexpected paths: %#v", got)
+	}
+	if localHits.Load() != 0 {
+		t.Fatalf("the same-named local source must not be read, got %d hits", localHits.Load())
+	}
+}
+
+// TestResolveRepoPathsFluxSourceRefNamespaceMissingSource covers the
+// degraded case: the referenced source does not exist in the namespace the
+// Kustomization declares. The lookup must fail rather than fall back to a
+// same-named source in the Kustomization's own namespace, because that
+// source is not the one the Kustomization uses (issue #296).
+func TestResolveRepoPathsFluxSourceRefNamespaceMissingSource(t *testing.T) {
+	var localHits, kuzHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/kustomizations/demo"):
+			kuzHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"GitRepository","name":"config","namespace":"sources"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/sources/gitrepositories/config"):
+			// The declared source is absent.
+			http.NotFound(w, r)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/gitrepositories/config"):
+			localHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/wrong"}}`)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path when the declared source is missing, got %#v", got)
+	}
+	if localHits.Load() != 0 {
+		t.Fatalf("must not fall back to the same-named local source, got %d hits", localHits.Load())
+	}
+	// The Kustomization itself must have been read: without this the test
+	// would also pass if the lookup stopped at the Kustomization, which is a
+	// different failure than the one it pins.
+	if kuzHits.Load() == 0 {
+		t.Fatalf("expected the Kustomization to be read before the source lookup")
+	}
+}
+
+// TestResolveRepoPathsFluxSourceRefNamespaceOmitted pins the default: a
+// sourceRef without a namespace is resolved in the Kustomization's own
+// namespace, as Flux does (issue #296).
+func TestResolveRepoPathsFluxSourceRefNamespaceOmitted(t *testing.T) {
+	var localHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/kustomizations/demo"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"GitRepository","name":"config"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/gitrepositories/config"):
+			localHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/local"}}`)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/local/apps/demo" {
+		t.Fatalf("unexpected paths: %#v", got)
+	}
+	if localHits.Load() == 0 {
+		t.Fatalf("expected the source in the Kustomization's own namespace to be read")
+	}
+}
+
+// TestFluxSourceNamespaceHostile pins the guard on the declared source
+// namespace: it is interpolated into an apiserver path, so a value carrying
+// a separator must be refused outright rather than addressed as something
+// else. The refusal is fixed text — the hostile value must not travel into
+// the digest.
+func TestFluxSourceNamespaceHostile(t *testing.T) {
+	const hostile = "sources/../workloads"
+	var sourceHits, kuzHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/kustomizations/demo"):
+			kuzHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"GitRepository","name":"config","namespace":"`+hostile+`"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			sourceHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/wrong"}}`)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path for a refused source namespace, got %#v", got)
+	}
+	if sourceHits.Load() != 0 {
+		t.Fatalf("a refused source namespace must not be requested, got %d hits", sourceHits.Load())
+	}
+	if kuzHits.Load() == 0 {
+		t.Fatalf("expected the Kustomization to be read before the source lookup")
+	}
+	// The relevance path degrades to "unknown" with a one-line reason that
+	// does not carry the refused value.
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+	rel := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(rel) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(rel))
+	}
+	if rel[0].State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
+	}
+	if strings.Contains(rel[0].Reason, hostile) {
+		t.Fatalf("reason must not echo the refused namespace: %q", rel[0].Reason)
+	}
+	if strings.Contains(rel[0].Reason, "\n") {
+		t.Fatalf("reason must be one line: %q", rel[0].Reason)
+	}
+	// The reason must name the source lookup, not the Kustomization read:
+	// "Kustomization not found" would satisfy the assertions above for the
+	// wrong reason, since a Kustomization that is never read fails the same way.
+	if !strings.Contains(rel[0].Reason, "not readable") {
+		t.Fatalf("reason must name the unreadable source: %q", rel[0].Reason)
+	}
+}
+
+// TestFluxPathSegment pins the segment check that guards the values
+// interpolated into an apiserver path. The refused set is what keeps a
+// request aimed at the object the Kustomization declares.
+func TestFluxPathSegment(t *testing.T) {
+	valid := []string{"sources", "flux-system", "config", "config.prod", "a1", "s0urces-2"}
+	for _, v := range valid {
+		if !fluxPathSegment(v) {
+			t.Errorf("fluxPathSegment(%q) = false, want true", v)
+		}
+	}
+	invalid := []string{
+		"",
+		".",
+		"..",
+		"a..b",
+		"a b",
+		"a\tb",
+		"a/b",
+		`a\b`,
+		"a%2f",
+		"a?b",
+		"a#b",
+		"Sources",
+		"-sources",
+		"sources-",
+		".sources",
+		"sources.",
+		"sources\x00",
+	}
+	for _, v := range invalid {
+		if fluxPathSegment(v) {
+			t.Errorf("fluxPathSegment(%q) = true, want false", v)
+		}
+	}
+}
+
 // TestResolveRepoPathsMissingKustomization asserts that when a pod carries
 // the Flux annotations but the referenced Kustomization is missing (the
 // API returns 404), resolveRepoPaths still ships (returns cleanly
@@ -1175,6 +1409,144 @@ func TestResolveCommitRelevanceFluxAndGitHub(t *testing.T) {
 	if strings.Count(evidence, untrustedBegin) < 2 {
 		// one for alerts, one for matching files
 		t.Errorf("expected matching files inside untrusted fence:\n%s", evidence)
+	}
+}
+
+// TestResolveCommitRelevanceFluxSourceRefNamespace covers the relevance
+// half of #296: the Kustomization names a source in another namespace, and
+// that source points at a different repository than the same-named local
+// one. The commit must be looked up in, and classified against, the
+// repository the Kustomization actually uses.
+func TestResolveCommitRelevanceFluxSourceRefNamespace(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	var localHits atomic.Int32
+	var ghRepo atomic.Value
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/kustomizations/demo"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"name":"config","kind":"GitRepository","namespace":"sources"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/sources/gitrepositories/config"):
+			// The declared source lives in another namespace and points at
+			// another repository than the local same-named source.
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/other/intended"}}`)
+		case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/gitrepositories/config"):
+			localHits.Add(1)
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/owner/repo"}}`)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer kubeSrv.Close()
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Path: /repos/<owner>/<name>/commits/<sha>
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[1] != "other" || parts[2] != "intended" || parts[4] != validSHA {
+			http.NotFound(w, r)
+			return
+		}
+		ghRepo.Store(parts[1] + "/" + parts[2])
+		_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump demo image"},"files":[{"filename":"apps/demo/kustomization.yaml"}]}`)
+	}))
+	defer ghSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+	gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	got := k.resolveCommitRelevance(context.Background(), gh, pods)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+	}
+	rel := got[0]
+	if rel.RepoURL != "https://github.com/other/intended" {
+		t.Fatalf("repo URL = %q, want the source in the declared namespace", rel.RepoURL)
+	}
+	gotRepo, _ := ghRepo.Load().(string)
+	if gotRepo != "other/intended" {
+		t.Fatalf("commit lookup went to repo %q, want %q", gotRepo, "other/intended")
+	}
+	if rel.State != commitRelevanceTouches {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceTouches, rel.Reason)
+	}
+	if len(rel.MatchingPaths) != 1 || rel.MatchingPaths[0] != "apps/demo/kustomization.yaml" {
+		t.Fatalf("matching paths = %v, want [apps/demo/kustomization.yaml]", rel.MatchingPaths)
+	}
+	if localHits.Load() != 0 {
+		t.Fatalf("the same-named local source must not be read, got %d hits", localHits.Load())
+	}
+}
+
+// TestResolveCommitRelevanceFluxSourceRefNamespaceMissingSource covers the
+// degraded relevance path: the source the Kustomization declares is missing
+// or forbidden in the namespace it names. The lookup must degrade to
+// "unknown" with a one-line reason, must not fall back to the same-named
+// source in the Kustomization's own namespace, and must not classify the
+// commit against a repository it never resolved.
+func TestResolveCommitRelevanceFluxSourceRefNamespaceMissingSource(t *testing.T) {
+	const validSHA = "0123456789abcdef0123456789abcdef01234567"
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var localHits, ghHits atomic.Int32
+			kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/kustomizations/demo"):
+					_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"name":"config","kind":"GitRepository","namespace":"sources"}},"status":{"lastAppliedRevision":"refs/heads/main@sha1:`+validSHA+`"}}`)
+				case strings.HasSuffix(r.URL.Path, "/namespaces/sources/gitrepositories/config"):
+					// The declared source cannot be read.
+					w.WriteHeader(status)
+				case strings.HasSuffix(r.URL.Path, "/namespaces/workloads/gitrepositories/config"):
+					localHits.Add(1)
+					_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/wrong"}}`)
+				default:
+					t.Errorf("unexpected API hit for %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer kubeSrv.Close()
+			ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ghHits.Add(1)
+				_, _ = io.WriteString(w, `{"sha":"`+validSHA+`","commit":{"message":"bump demo image"},"files":[{"filename":"apps/demo/kustomization.yaml"}]}`)
+			}))
+			defer ghSrv.Close()
+
+			k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL}
+			gh := &gitHubClient{token: "t", repo: "owner/repo", hc: ghSrv.Client(), apiURL: ghSrv.URL}
+			pods := []podRef{{
+				Name:      "p",
+				Namespace: "ns-a",
+				Annotations: map[string]string{
+					"kustomize.toolkit.fluxcd.io/name":      "demo",
+					"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+				},
+			}}
+			got := k.resolveCommitRelevance(context.Background(), gh, pods)
+			if len(got) != 1 {
+				t.Fatalf("expected 1 CommitRelevance, got %d", len(got))
+			}
+			rel := got[0]
+			if rel.State != commitRelevanceUnknown {
+				t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceUnknown, rel.Reason)
+			}
+			if !strings.Contains(rel.Reason, "not readable") {
+				t.Fatalf("reason must name the unreadable source: %q", rel.Reason)
+			}
+			if strings.Contains(rel.Reason, "\n") {
+				t.Fatalf("reason must be one line: %q", rel.Reason)
+			}
+			if localHits.Load() != 0 {
+				t.Fatalf("must not fall back to the same-named local source, got %d hits", localHits.Load())
+			}
+			if ghHits.Load() != 0 {
+				t.Fatalf("no commit may be classified without a resolved repository, got %d github hits", ghHits.Load())
+			}
+		})
 	}
 }
 

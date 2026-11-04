@@ -174,10 +174,10 @@ should omit its rules and accept the corresponding gap in evidence.
 | --- | --- | --- | --- | --- |
 | `helm.toolkit.fluxcd.io` | `helmreleases` | `get`, `list` | List, cluster-wide and per namespace | Flux activity feed: NotReady HelmReleases and namespace-scoped Ready transitions. |
 | `kustomize.toolkit.fluxcd.io` | `kustomizations` | `get`, `list` | List (cluster-wide and per namespace) and get per named | Same Flux activity feed for Kustomizations, plus the workload-path and sourceRef lookup that drives the `git`/`partial` decision. |
-| `source.toolkit.fluxcd.io` | `gitrepositories` | `get` | Get, per named, sourceRef-dependent | The Kustomization `sourceRef` is dereferenced to obtain the repository URL for commit classification; only the kinds a resolved Kustomization actually references are read. |
-| `source.toolkit.fluxcd.io` | `ocirepositories` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `OCIRepository`. |
-| `source.toolkit.fluxcd.io` | `buckets` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `Bucket`. |
-| `source.toolkit.fluxcd.io` | `helmcharts` | `get` | Get, per named, sourceRef-dependent | As above, when `sourceRef.kind` is `HelmChart`. |
+| `source.toolkit.fluxcd.io` | `gitrepositories` | `get` | Get, per named, in the namespace `sourceRef.namespace` names, else the Kustomization's own namespace | The Kustomization `sourceRef` is dereferenced to obtain the repository URL for commit classification; only the kinds a resolved Kustomization actually references are read. A `sourceRef` naming another namespace is read there, so a namespace-scoped Role on the source must cover that namespace. |
+| `source.toolkit.fluxcd.io` | `ocirepositories` | `get` | As above | As above, when `sourceRef.kind` is `OCIRepository`. |
+| `source.toolkit.fluxcd.io` | `buckets` | `get` | As above | As above, when `sourceRef.kind` is `Bucket`. |
+| `source.toolkit.fluxcd.io` | `helmcharts` | `get` | As above | As above, when `sourceRef.kind` is `HelmChart`. |
 
 ### Argo CD (optional)
 
