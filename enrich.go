@@ -1309,6 +1309,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				// negative in the prompt next to the very lines we just
 				// routed to BACKGROUND.
 				e.BackendState = "ambient"
+			case res.SkippedRefused:
+				// A refused namespace sent no request, so "empty" would turn
+				// a scope that was never queried into a "the backend has no
+				// lines for it" negative. The gap gets its own state, exactly
+				// as the pod scan does (issue #311 review, #331).
+				e.BackendState = "refused"
 			default:
 				e.BackendState = "empty"
 			}

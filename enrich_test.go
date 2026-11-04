@@ -3219,6 +3219,82 @@ func TestEnrichAllNamespacesRefusedLeavesOnlyNodeHealth(t *testing.T) {
 	}
 }
 
+// TestEnrichRefusedNamespaceSendsNoBackendLogRequest closes the gap the
+// #311 review found on the follow-up head: the no-subject fallback in
+// fetchBackendLogsResult must not query the log backend for a refused
+// namespace either. The requestRecorder records every path, including the
+// backend's query endpoint, so a reverted fix lands here.
+func TestEnrichRefusedNamespaceSendsNoBackendLogRequest(t *testing.T) {
+	const hostile = "ns/../../other"
+	rec := &requestRecorder{}
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{hostile},
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": hostile, "pod": "p1",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	for _, path := range rec.recorded() {
+		if strings.Contains(path, "/loki/") {
+			t.Errorf("a refused namespace must send no backend-log request, got %q", path)
+		}
+	}
+	// No namespace log scope was queried and no lines came back, so the
+	// state must name the gap instead of claiming "no lines for the
+	// namespace".
+	if en.BackendState != "refused" {
+		t.Errorf("backend state must name the refused scope as uninspected, got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Errorf("no subject survived the refusal, so the query was not subject-scoped")
+	}
+}
+
+// TestEnrichPartialRefusalQueriesOnlyInspectedNamespaces pins the mixed case:
+// with no concrete subject the fallback still runs for the namespaces that
+// were inspected, and never for the refused one. Empty results plus a skipped
+// scope must still surface as the gap, not as "the backend has no lines".
+func TestEnrichPartialRefusalQueriesOnlyInspectedNamespaces(t *testing.T) {
+	const hostile = "ns/../../other"
+	var mu sync.Mutex
+	var lokiQueries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(req.URL.Path, "/loki/") {
+			mu.Lock()
+			lokiQueries = append(lokiQueries, req.URL.Query().Get("query"))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns-ok", hostile},
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": hostile,
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lokiQueries) != 1 || lokiQueries[0] != `{namespace="ns-ok"}` {
+		t.Errorf("the fallback must query only the inspected namespace, got %v", lokiQueries)
+	}
+	if en.BackendState != "refused" {
+		t.Errorf("a skipped refused scope with no lines back must state the gap, got %q", en.BackendState)
+	}
+}
+
 // A namespace that is one path segment but whose pod list read fails leaves
 // the namespace uninspected, so the scan is incomplete exactly as it is for a
 // refused namespace: the empty context sections must not read as a healthy

@@ -593,6 +593,11 @@ func renderEvidence(r Report) string {
 		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
 	case "error":
 		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
+	case "refused":
+		// The only way into this state is a namespace refused as not one
+		// path segment, so naming the cause is true here. The wording must
+		// still not call the refused scope empty: it was never queried.
+		b.WriteString("\nSubject log source: configured, but the alert named a namespace that was refused as not one path segment, so its logs were not queried and no backend lines were returned in the window.\n")
 	case "ok":
 		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
 		b.WriteString(untrustedBegin + "\n")
@@ -1011,6 +1016,8 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are the only backend logs in the window and are shown as ambient context, not evidence of the failing resource.")
 	case "error":
 		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
+	case "refused":
+		desc.WriteString("\n**Backend log source:** configured, but a namespace was refused as not one path segment, so its logs were not queried and no backend lines were returned in the window.")
 	case "ok":
 		desc.WriteString("\n**Backend logs (untrusted workload text)**\n")
 		for _, line := range r.Enrichment.BackendLogs {

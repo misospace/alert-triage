@@ -124,6 +124,12 @@ type backendLog struct {
 type backendLogResult struct {
 	Primary []string
 	Ambient []string
+	// SkippedRefused records that at least one namespace the group names was
+	// refused as not one path segment and was never queried. The caller must
+	// not render an empty result as "the backend has no lines for the
+	// namespace": a refused scope is uninspected, not empty (issue #311
+	// review, #331).
+	SkippedRefused bool
 }
 
 // ambientLogMarker prefixes namespace-wide backend-log lines returned when no
@@ -196,12 +202,22 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	// controllers) and drown the primary evidence in plausible but causally
 	// irrelevant text. It is issued only when no subject could be resolved.
 	byNS := targetPodsByNamespace(targetPods)
+	skippedRefused := false
 
-	for _, namespace := range g.Namespaces {
-		namespace = strings.TrimSpace(namespace)
-		if namespace == "" {
+	for _, raw := range g.Namespaces {
+		// The namespace is alert-supplied text. The query quotes it, so the
+		// blast radius here is a lookup under a wrong key rather than an
+		// apiserver path traversal, but #311's rule covers this read too: a
+		// refused namespace sends no request for its scope, including the
+		// namespace-wide fallback (#331). A whitespace-only entry stays the
+		// silent skip it always was; it names no namespace to refuse.
+		if !fluxPathSegment(raw) {
+			if strings.TrimSpace(raw) != "" {
+				skippedRefused = true
+			}
 			continue
 		}
+		namespace := raw
 		var pods []string
 		if len(byNS) > 0 {
 			pods = byNS[namespace]
@@ -245,9 +261,9 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		for i, line := range collapsed {
 			marked[i] = ambientLogMarker + line
 		}
-		return backendLogResult{Ambient: marked}, nil
+		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused}, nil
 	}
-	return backendLogResult{Primary: collapsed}, nil
+	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused}, nil
 }
 
 // quoteLogValue renders a label value as a double-quoted literal with `"` and
