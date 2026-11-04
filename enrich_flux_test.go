@@ -468,9 +468,10 @@ func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 	}))
 	defer srv.Close()
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
-	// Two pods of the same deployment carry the same hostile annotation:
-	// the marker is de-duplicated the way paths are, so one refusal is one
-	// line, not one per replica.
+	// Two pods of the same deployment carry the same hostile annotation and
+	// a third carries a different refused value: the marker names the
+	// field, not the value, so every refusal of this field collapses to one
+	// line — never one per replica, never one per distinct value.
 	pods := []podRef{
 		{
 			Name:      "p1",
@@ -484,6 +485,13 @@ func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 			Namespace: "ns-a",
 			Annotations: map[string]string{
 				"argocd.argoproj.io/instance": hostile,
+			},
+		},
+		{
+			Name:      "p3",
+			Namespace: "ns-a",
+			Annotations: map[string]string{
+				"argocd.argoproj.io/instance": "api%2Felsewhere",
 			},
 		},
 	}
@@ -525,6 +533,46 @@ func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
+	}
+}
+
+// TestResolveRepoPathsFluxResolvedHidesArgoRefusal pins that a pod whose
+// Flux annotation resolves never reaches the Argo branch: its (hostile)
+// argocd.argoproj.io/instance is neither requested nor marked. The pod's
+// GitOps owner was found; a second annotation the service never consulted
+// is not a refusal the digest should announce.
+func TestResolveRepoPathsFluxResolvedHidesArgoRefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/applications/"):
+			t.Errorf("a pod whose Flux annotation resolved must not trigger an Application lookup: %s", r.URL.Path)
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/kustomizations/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/web","sourceRef":{"name":"web-repo","kind":"GitRepository"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/web"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	pods := []podRef{{
+		Name:      "p6",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name": "web",
+			"argocd.argoproj.io/instance":      "web/../../other",
+		},
+	}}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 1 || got[0] != "https://github.com/example/web/apps/web" {
+		t.Fatalf("expected the Flux-resolved path, got %#v", got)
+	}
+	if len(refusals) != 0 {
+		t.Fatalf("a consulted-and-refused reference is the marker's subject; an unconsulted one must not mark, got %#v", refusals)
 	}
 }
 
