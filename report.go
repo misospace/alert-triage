@@ -366,20 +366,23 @@ func renderEvidence(r Report) string {
 	var b strings.Builder
 	// The header block echoes fixed identity fields, all of which originate in
 	// alert labels (cluster, node, namespace). Key and Reason are already
-	// redacted at group construction; these three render raw fields that
-	// enrichment needs unredacted for its lookups, so the renderer strips
-	// instead (#278 review).
+	// redacted at group construction; these render raw fields that enrichment
+	// needs unredacted for its lookups, so the renderer strips secrets
+	// (#278 review) and flattens line structure: a label value carrying a
+	// newline must not forge a header line inside the block the prompt is
+	// told to read as fact. Legitimate values are single-token or
+	// single-spaced, so they flatten to themselves (issue #310 review).
 	cluster := r.Group.Cluster
 	if cluster == "" {
 		cluster = "default"
 	}
-	fmt.Fprintf(&b, "Cluster: %s\n", stripSecrets(cluster))
-	fmt.Fprintf(&b, "Grouping: %s (%s)\n", r.Group.Key, r.Group.Reason)
+	fmt.Fprintf(&b, "Cluster: %s\n", untrusted(stripSecrets(cluster)))
+	fmt.Fprintf(&b, "Grouping: %s (%s)\n", untrusted(r.Group.Key), untrusted(r.Group.Reason))
 	if r.Group.Node != "" {
-		fmt.Fprintf(&b, "Node: %s\n", stripSecrets(r.Group.Node))
+		fmt.Fprintf(&b, "Node: %s\n", untrusted(stripSecrets(r.Group.Node)))
 	}
 	if len(r.Group.Namespaces) > 0 {
-		fmt.Fprintf(&b, "Namespaces: %s\n", stripSecrets(strings.Join(r.Group.Namespaces, ", ")))
+		fmt.Fprintf(&b, "Namespaces: %s\n", untrusted(stripSecrets(strings.Join(r.Group.Namespaces, ", "))))
 	}
 	if len(r.Enrichment.RepoPaths) > 0 {
 		fmt.Fprintf(&b, "RepoPaths:\n")
@@ -470,9 +473,10 @@ func renderEvidence(r Report) string {
 	// every Scope construction, so a value with a newline would otherwise
 	// forge a line inside the section this service narrates outside the
 	// fence. untrusted() flattens line structure the same way the alert
-	// lines above wrap their label values, and leaves a legitimate
-	// namespace list untouched, since a DNS-1123 label carries no
-	// whitespace and no dash run (issue #310 review).
+	// lines above wrap their label values. A DNS-1123 label carries no
+	// whitespace, so a legitimate scope reads byte-identical; a hostile
+	// dash run is broken up on purpose — inert beats pretty (issue #310
+	// review).
 	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", untrusted(stripSecrets(orUnknown(r.Enrichment.Scope))))
 	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
 	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
