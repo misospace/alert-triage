@@ -113,10 +113,11 @@ func safeErr(err error) string {
 
 // fluxActivity reports Flux resources that are failing, and - only when
 // scoped to a namespace - ones whose Ready condition transitioned inside the
-// window. The second result records whether both list reads succeeded: a
-// failed read returns the findings gathered so far and false, so an empty
-// slice is only a quiet window when the caller knows the lists were read
-// (issue #300).
+// window. The second result records whether the scope was read: a failed
+// read returns the findings gathered so far and false, and a namespace
+// refused as not one path segment returns false with nothing read at all,
+// so an empty slice is only a quiet window when the caller knows the lists
+// were read (issue #300).
 //
 // Cluster-wide reconciles are worthless: a routine sync of the whole repo
 // transitions every resource at once, so a healthy-reconcile listing turns
@@ -136,6 +137,31 @@ func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Ti
 		"/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",
 	}
 	if namespace != "" {
+		if !fluxPathSegment(namespace) {
+			// The namespace is interpolated into the request path, so a
+			// value that is not one path segment must never be sent: the
+			// request would address a different namespace than the one
+			// the alert names. Refusing it yields inspected=false, which
+			// is what makes the digest say the Flux state is unavailable
+			// instead of asserting the false quiet-window negative "no
+			// Flux reconciles or failures in the window" (report.go). A
+			// window that was never read was never established, and a
+			// wrong confident sentence is worse than a vague one (issue
+			// #300).
+			//
+			// The value arriving here is already percent-escaped by the
+			// caller: enrich.go escapes the namespace with
+			// url.PathEscape before calling. The escape turns '/' into
+			// '%2F' and leaves '.' alone, so a hostile namespace arrives
+			// as e.g. "ns%2F..%2F..%2Fother" and the segment check
+			// refuses it on '%' and on "..". A value that survives the
+			// check is one path segment, whether or not it names a
+			// namespace that exists, and no legitimate namespace is
+			// refused: a Kubernetes namespace is a DNS-1123 label, so
+			// lowercase alphanumeric and '-' only.
+			logf("enrich: flux namespace is not a valid path segment; skipping the Flux list read")
+			return nil, false
+		}
 		apis = []string{
 			"/apis/helm.toolkit.fluxcd.io/v2/namespaces/" + namespace + "/helmreleases",
 			"/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + namespace + "/kustomizations",
@@ -484,13 +510,15 @@ func fluxSourceNamespace(spec kustomizationSpec, kustomNS string) string {
 //
 // The allow-list is narrow on purpose: a namespace is a lowercase DNS label
 // and an object name a lowercase DNS subdomain, so nothing outside the
-// lowercase-alphanumeric, '-' and '.' set can occur in one. Refusing the
-// complement rather than searching for the dangerous characters is what
-// makes the check impossible to slip past with an encoded form: '%' would
-// smuggle a separator past a check on the literal characters, and '?' or '#'
-// would end the path at the value instead of being part of it. A leading or
-// trailing separator is refused because no label or subdomain has one, and
-// ".." is refused because two separators in a row is a traversal pair.
+// lowercase-alphanumeric, '-' and '.' set can occur in one. An Argo
+// Application name is also a DNS subdomain, so the same check serves it.
+// Refusing the complement rather than searching for the dangerous
+// characters is what makes the check impossible to slip past with an
+// encoded form: '%' would smuggle a separator past a check on the literal
+// characters, and '?' or '#' would end the path at the value instead of
+// being part of it. A leading or trailing separator is refused because no
+// label or subdomain has one, and ".." is refused because two separators in
+// a row is a traversal pair.
 func fluxPathSegment(v string) bool {
 	if v == "" || len(v) > 253 || strings.Contains(v, "..") {
 		return false
@@ -559,6 +587,19 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
+	// The instance is interpolated into the Application path, so a value
+	// that is not one path segment must never be sent: the request would
+	// address a different Application than the one the pod declares. An
+	// Argo Application name is a DNS subdomain, so the same segment check
+	// covers it. Refusing it yields no GitOps path and the caller then
+	// falls back to the configured GitOps repository - the same outcome as
+	// an Application that does not exist. The message is fixed and does
+	// not echo the value, which is author-controlled text that must not
+	// reach the digest.
+	if !fluxPathSegment(instance) {
+		logf("enrich: argo application instance is not a valid path segment; skipping the Argo Application lookup")
+		return "", "", false
+	}
 	var app struct {
 		Spec struct {
 			Source struct {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -408,6 +409,59 @@ func TestResolveRepoPathsArgoApplication(t *testing.T) {
 	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/argo/manifests/web" {
 		t.Fatalf("unexpected paths: %#v", got)
+	}
+}
+
+// TestResolveRepoPathsArgoInstanceHostile pins the guard on the Argo
+// Application instance: the instance is interpolated into the Application
+// path, so a value carrying a separator must be refused outright rather
+// than addressed as a different Application. Nothing may be requested - not
+// even the cluster-wide retry - and the result degrades to "no path from
+// this annotation", so the caller can fall back to the configured GitOps
+// repository.
+func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
+	const hostile = "demo/../../other"
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// The path is not echoed: a hit would carry the refused value
+		// into the test output.
+		t.Errorf("unexpected API hit; a refused instance must not be requested")
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"argocd.argoproj.io/instance": hostile,
+		},
+	}}
+	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path for a refused instance, got %#v", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
+	}
+	// The lookup itself reports "no GitOps path", so the caller keeps
+	// whatever else it knows about the workload's source.
+	if repo, path, ok := k.argocdPath(context.Background(), hostile); ok || repo != "" || path != "" {
+		t.Fatalf("a refused instance must yield no path, got %q %q", repo, path)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
+	}
+	// With a fallback configured the refusal degrades to that fallback,
+	// which is what "no path from this annotation" means.
+	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
+	got = k.resolveRepoPaths(context.Background(), pods, cfg)
+	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
+		t.Fatalf("expected the configured fallback, got %#v", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
 	}
 }
 
@@ -1299,6 +1353,122 @@ func TestEnrichFluxCarriesReadSuccess(t *testing.T) {
 			t.Errorf("nil client must not claim Flux state: inspected=%v activity=%v", e.FluxInspected, e.FluxActivity)
 		}
 	})
+}
+
+// TestFluxActivityNamespaceHostile pins the guard on the namespace the Flux
+// lists are scoped to: the namespace is interpolated into the request path,
+// so a value that is not one path segment must be refused before any request
+// is built. The refusal must leave the read uninspected rather than empty,
+// because an empty result is read as a quiet window and a quiet window that
+// was never established is a false negative (issue #300).
+func TestFluxActivityNamespaceHostile(t *testing.T) {
+	tests := []struct {
+		name          string
+		namespace     string
+		wantInspected bool
+	}{
+		// The raw form: a separator would address a different namespace
+		// than the one the alert names.
+		{name: "raw traversal is refused", namespace: "ns/../../other"},
+		// The form the production caller passes: enrich.go escapes the
+		// namespace with url.PathEscape before calling, so a hostile
+		// value arrives percent-encoded.
+		{name: "escaped traversal is refused", namespace: url.PathEscape("ns/../../other")},
+		{name: "double dot is refused", namespace: "ns..other"},
+		{name: "plain namespace is read", namespace: "llm", wantInspected: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var hits atomic.Int32
+			var wrongScope atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				if !strings.Contains(r.URL.Path, "/namespaces/llm/") {
+					wrongScope.Store(true)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"items":[]}`)
+			}))
+			defer srv.Close()
+			k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+			got, inspected := k.fluxActivity(context.Background(), tt.namespace, time.Now().Add(-time.Hour))
+			if inspected != tt.wantInspected {
+				t.Errorf("inspected = %v, want %v", inspected, tt.wantInspected)
+			}
+			if len(got) != 0 {
+				t.Errorf("expected no Flux lines, got %v", got)
+			}
+			if !tt.wantInspected {
+				if hits.Load() != 0 {
+					t.Errorf("a refused namespace must not be requested, got %d hits", hits.Load())
+				}
+				return
+			}
+			// A plain namespace is still read, and read in the namespace
+			// it names - the guard must not narrow the legitimate scope.
+			if hits.Load() == 0 {
+				t.Fatalf("a plain namespace must still be requested")
+			}
+			if wrongScope.Load() {
+				t.Errorf("the Flux lists were read outside the requested namespace")
+			}
+		})
+	}
+}
+
+// TestEnrichFluxNamespaceHostile walks the whole enrichment path with a
+// group whose namespace carries a separator. The Flux lists must never be
+// requested, the digest must report the Flux state as unavailable instead of
+// as a quiet window, and the rest of the enrichment must still run: a
+// refused namespace must cost the digest its Flux evidence, not its digest.
+func TestEnrichFluxNamespaceHostile(t *testing.T) {
+	const hostile = "ns/../../other"
+	var fluxHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "helmreleases"), strings.Contains(r.URL.Path, "kustomizations"):
+			fluxHits.Add(1)
+			// The path is not echoed: a hit would carry the refused
+			// namespace into the test output.
+			t.Errorf("unexpected Flux API hit; a refused namespace must not be requested")
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.Contains(r.URL.Path, "/events"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/nodes"):
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			t.Errorf("unexpected API hit")
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	g := Group{
+		Key:        "single/A",
+		Namespaces: []string{hostile},
+		Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": hostile}}},
+	}
+	e := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+	if fluxHits.Load() != 0 {
+		t.Errorf("a refused namespace must not reach the Flux list endpoint, got %d hits", fluxHits.Load())
+	}
+	if e.FluxInspected {
+		t.Errorf("FluxInspected = true, want false: the Flux lists were never read")
+	}
+	if len(e.FluxActivity) != 0 {
+		t.Errorf("FluxActivity = %v, want none", e.FluxActivity)
+	}
+	// The rest of the enrichment still ran: the digest is produced with
+	// the evidence that could be read, and only the Flux section is
+	// marked unavailable.
+	if !e.NodesInspected {
+		t.Errorf("the node read must still succeed, got %+v", e)
+	}
+	if e.Scope == "" {
+		t.Errorf("expected the enrichment to carry a scope, got %+v", e)
+	}
 }
 
 // A healthy reconcile at a new revision must not be labelled a "change": the
