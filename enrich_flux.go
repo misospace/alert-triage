@@ -227,6 +227,37 @@ func shortRev(rev string) string {
 // (issue #312).
 const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not one path segment (value not shown)"
 
+// fluxSourceNamespaceRefusal and fluxSourceNameRefusal are the fixed
+// markers resolveRepoPaths records when a Kustomization's
+// spec.sourceRef.namespace or spec.sourceRef.name is refused as not one
+// path segment. They mirror argoInstanceRefusal for the Flux side (issue
+// #318): the Kustomization does declare a source, the service just would
+// not read it, and that must not read as a workload that declares no
+// GitOps source. The markers name the refused field and never repeat the
+// value: it comes from Kustomization spec text, which is object-authored
+// and stays out of the digest like the Argo instance value (issue #308).
+const (
+	fluxSourceNamespaceRefusal = "flux Kustomization spec.sourceRef.namespace refused: value is not one path segment (value not shown)"
+	fluxSourceNameRefusal      = "flux Kustomization spec.sourceRef.name refused: value is not one path segment (value not shown)"
+)
+
+// fluxSourceRefusal maps a fluxPath failure to the marker of the refused
+// field, or "" when the failure is not a refusal of a value the service
+// actually read — a missing object, an empty spec.path or spec.url, a
+// sourceRef that declares no source, or a source read error. Only a
+// refusal is this service's own decision about a declared source, so only
+// a refusal earns a digest line; every other failure keeps degrading to
+// silence plus the GITOPS_REPO fallback.
+func fluxSourceRefusal(err error) string {
+	switch {
+	case errors.Is(err, errFluxSourceNamespaceRefused):
+		return fluxSourceNamespaceRefusal
+	case errors.Is(err, errFluxSourceNameRefused):
+		return fluxSourceNameRefusal
+	}
+	return ""
+}
+
 // resolveRepoPaths walks the pods already gathered and, for each, looks up
 // the GitOps tool that owns it. Flux-managed pods carry
 // kustomize.toolkit.fluxcd.io/name+namespace pointing at a Kustomization;
@@ -237,10 +268,12 @@ const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not o
 // the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
 // de-duplicated; unresolved entries are dropped silently so a missing
 // mapping degrades to today's prose rather than to a fabricated path.
-// The one exception is a refused Argo instance: the pod does declare an
-// owner, the service just would not read it, so that refusal is not
-// silence — it comes back in the second result as a fixed marker naming
-// the field, never the refused value (issue #312).
+// The one exception is a refused owner reference: an Argo instance that
+// is not one path segment, or a Flux Kustomization whose declared
+// sourceRef namespace or name is not one path segment. The pod does
+// declare an owner, the service just would not read it, so that refusal
+// is not silence — it comes back in the second result as a fixed marker
+// naming the field, never the refused value (issues #312, #318).
 func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) ([]string, []string) {
 	seen := map[string]bool{}
 	var out []string
@@ -326,9 +359,23 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 			if kuzNs == "" {
 				kuzNs = p.Namespace
 			}
-			if repo, path, ok := k.fluxPath(ctx, kuzNs, kustom); ok {
+			repo, path, err := k.fluxPath(ctx, kuzNs, kustom)
+			if err == nil {
 				add(repo, path)
 				continue
+			}
+			if marker := fluxSourceRefusal(err); marker != "" {
+				// The Kustomization exists and declares a source; the
+				// service refused to address it. The fall-through below
+				// is unchanged from any other lookup failure — a second
+				// GitOps annotation can still resolve, and GITOPS_REPO
+				// can still replace the missing path — but the refusal
+				// is a decision by this service, so the digest states it
+				// (issue #318). Fixed message: the refused value is
+				// object-authored text and stays out of the logs for the
+				// same reason it stays out of the digest.
+				logf("enrich: flux kustomization sourceRef is not a valid path segment; skipping the Flux source lookup")
+				refuse(marker)
 			}
 		}
 		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
@@ -613,6 +660,25 @@ func fluxPathSegment(v string) bool {
 	return true
 }
 
+// errFluxSourceNamespaceRefused and errFluxSourceNameRefused are the
+// refusals issued below. The messages are fixed and never echo the
+// offending value, which is author-controlled text that must not reach
+// the digest. They are sentinels so a caller can tell "this value was
+// refused" from "the object could not be read" with errors.Is; only the
+// refusals earn a digest marker (issue #318).
+var (
+	errFluxSourceNamespaceRefused = errors.New("flux source namespace is not a valid path segment")
+	errFluxSourceNameRefused      = errors.New("flux source name is not a valid path segment")
+)
+
+// errFluxPathUnresolved marks a fluxPath lookup whose values were all
+// readable but whose repo+path pair is simply not there: an empty
+// spec.path or an empty source spec.url. It is not a refusal and never
+// yields a marker. A sourceRef that declares no source to read keeps the
+// plain error the segment checks returned before issue #318, so its
+// output stays the absence it always was.
+var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a repo path")
+
 // fluxSourceURL reads the source object a Kustomization's sourceRef names and
 // returns its spec.url. An empty kind defaults to GitRepository, matching the
 // sourceRef default Flux applies. The empty-URL case is left to callers: for
@@ -624,14 +690,32 @@ func fluxPathSegment(v string) bool {
 // segment before use: a value carrying a separator would address a different
 // object than the one declared. A refused value fails the lookup outright —
 // there is no second namespace to fall back to, because falling back is how a
-// same-named source the Kustomization does not use gets resolved. The error
-// messages are fixed and do not echo the offending value, which is
-// author-controlled text that must not reach the digest.
+// same-named source the Kustomization does not use gets resolved. The
+// refusal errors are the sentinel vars above, so resolveRepoPaths can mark
+// the refused field without re-deriving why the lookup failed (issue #318).
+//
+// An absent value is told apart from a refused one before any refusal
+// sentinel is assigned: a sourceRef that declares no name (or no namespace
+// to address) has no value to refuse, and reporting it as refused would
+// state a decision about a value the object never declared. Only a refusal
+// earns a marker. An absence is not a new classification either — it
+// returns the exact errors the segment checks returned before issue #318,
+// so a Kustomization that simply declares no source keeps its previous
+// output: the same commit-relevance reason, no path and no marker.
 func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
-	if !fluxPathSegment(ns) {
+	// The refusals are decided before the absences, so a declared value
+	// this service refuses is still reported when the other value is
+	// absent: an absence must not mask a refusal.
+	if ns != "" && !fluxPathSegment(ns) {
+		return "", errFluxSourceNamespaceRefused
+	}
+	if srcName != "" && !fluxPathSegment(srcName) {
+		return "", errFluxSourceNameRefused
+	}
+	if ns == "" {
 		return "", errors.New("flux source namespace is not a valid path segment")
 	}
-	if !fluxPathSegment(srcName) {
+	if srcName == "" {
 		return "", errors.New("flux source name is not a valid path segment")
 	}
 	if srcKind == "" {
@@ -649,16 +733,46 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 	return src.Spec.URL, nil
 }
 
-func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, bool) {
+// fluxPath resolves the repo+path pair of one Flux Kustomization. The
+// error says why a pair did not resolve, and the distinction is only for
+// the caller that renders evidence: errFluxSourceNamespaceRefused and
+// errFluxSourceNameRefused mark a sourceRef value refused as not one path
+// segment — a decision this service made about a value it had read —
+// while every other failure (missing object or source, empty spec.path or
+// spec.url, a sourceRef that declares no source) means the pair simply
+// could not be read. A namespace refusal for a sourceRef that declares no
+// namespace is folded into errFluxPathUnresolved, because the refused value
+// is then the inherited Kustomization namespace — the service's own lookup
+// key, not an object-declared field. Callers that do not distinguish treat
+// err != nil exactly as the old false and degrade as before (issue #318).
+func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, error) {
 	kuz, _, err := k.fluxKustomization(ctx, ns, name)
-	if err != nil || kuz.Path == "" {
-		return "", "", false
+	if err != nil {
+		return "", "", err
+	}
+	if kuz.Path == "" {
+		return "", "", errFluxPathUnresolved
 	}
 	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
-	if err != nil || srcURL == "" {
-		return "", "", false
+	if err != nil {
+		if errors.Is(err, errFluxSourceNamespaceRefused) && kuz.SourceRef.Namespace == "" {
+			// The refused value is not a namespace the object declared but
+			// the Kustomization's own namespace, inherited from the pod's
+			// annotation. A Kustomization read through that value already
+			// succeeded, so no apiserver that served this object can have
+			// treated the value as two segments; if something on the way
+			// collapsed it, the locator was hostile rather than canonical.
+			// Either way this is a refusal of the service's own lookup key,
+			// not of an object-declared source field, and only a declared
+			// field earns a digest line naming it (issue #318).
+			return "", "", errFluxPathUnresolved
+		}
+		return "", "", err
 	}
-	return srcURL, kuz.Path, true
+	if srcURL == "" {
+		return "", "", errFluxPathUnresolved
+	}
+	return srcURL, kuz.Path, nil
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {

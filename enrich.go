@@ -630,13 +630,15 @@ type Enrichment struct {
 	// nothing resolves; the prose must degrade gracefully in that case.
 	RepoPaths []string
 	// RepoPathRefusals carries the fixed markers of GitOps owner references
-	// resolveRepoPaths refused to look up — currently only a refused
-	// argocd.argoproj.io/instance. A pod whose reference was refused does
-	// declare a GitOps owner the service would not read, and that must not
-	// read as a pod that declares none, so the digest states it. Marker
-	// text is constant and names the refused field, never the refused
-	// value, which is author-controlled annotation text (issue #308); it
-	// renders with RepoPaths as the service's own finding (issue #312).
+	// resolveRepoPaths refused to look up: a refused
+	// argocd.argoproj.io/instance (issue #312), or a refused Flux
+	// Kustomization spec.sourceRef.namespace or spec.sourceRef.name
+	// (issue #318). A pod whose reference was refused does declare a
+	// GitOps owner the service would not read, and that must not read as
+	// a pod that declares none, so the digest states it. Marker text is
+	// constant and names the refused field, never the refused value,
+	// which is author-controlled annotation or object text (issue #308);
+	// it renders with RepoPaths as the service's own finding (issue #312).
 	RepoPathRefusals []string
 	// KustomizationTopology is the composition evidence for the Flux
 	// Kustomizations those pods resolved to: one compact record per
