@@ -1259,11 +1259,12 @@ func TestResolveKustomizationTopologyNoneSafeVersusNoneDeclared(t *testing.T) {
 }
 
 // TestResolveKustomizationTopologyRefusedSingularFields pins the singular
-// half of the refused-value rule: a sourceRef name or a spec.path that
-// fails the safe() check renders an explicit "refused" marker in its
-// fragment, so a refused value is never indistinguishable from an absent
-// one — the same distinction the list subsections already make with
-// "none safe". A safe value keeps its exact composed fragment.
+// half of the refused-value rule: a sourceRef name, a declared sourceRef
+// kind, or a spec.path that fails the safe() check renders an explicit
+// "refused" marker in its fragment, so a refused value is never
+// indistinguishable from an absent one — the same distinction the list
+// subsections already make with "none safe". A safe value keeps its exact
+// composed fragment.
 func TestResolveKustomizationTopologyRefusedSingularFields(t *testing.T) {
 	run := func(t *testing.T, kuzJSON string) string {
 		t.Helper()
@@ -1302,6 +1303,38 @@ func TestResolveKustomizationTopologyRefusedSingularFields(t *testing.T) {
 		}
 		if strings.Contains(rec, `apps\web`) {
 			t.Errorf("refused spec.path value leaked into the record: %s", rec)
+		}
+	})
+	t.Run("refused sourceRef kind alone", func(t *testing.T) {
+		// Since #326 a declared kind that fails safe() refuses the
+		// fragment like a refused name: it must not drop out silently,
+		// composing name (namespace) as if no kind had been declared.
+		// Each value is written as it must appear in the JSON document,
+		// so the hostile bytes arrive through JSON escapes: \\ decodes
+		// to a single backslash, \u0000 to NUL, % stays literal.
+		for _, kind := range []string{`Git\\Repository`, `Repo\u0000evil`, `Repo%2F..%2F`} {
+			rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"`+kind+`","name":"main","namespace":"flux-system"}}}`)
+			if !strings.Contains(rec, "source: refused") {
+				t.Errorf("refused sourceRef.kind %q must render source: refused: %s", kind, rec)
+			}
+			if strings.Contains(rec, "GitRepository/main") || strings.Contains(rec, "main (flux-system)") {
+				t.Errorf("refused sourceRef.kind %q must not compose a source fragment: %s", kind, rec)
+			}
+			if strings.Contains(rec, "Repo") || strings.Contains(rec, `\`) || strings.Contains(rec, "\x00") {
+				t.Errorf("refused sourceRef.kind value %q leaked into the record: %s", kind, rec)
+			}
+		}
+	})
+	t.Run("refused sourceRef kind alongside a declared group", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"group":"helm.toolkit.fluxcd.io","kind":"Helm\\Chart","name":"web"}}}`)
+		if !strings.Contains(rec, "source: refused") {
+			t.Errorf("refused sourceRef.kind must render source: refused: %s", rec)
+		}
+		if strings.Contains(rec, "helm.toolkit.fluxcd.io/web") || strings.Contains(rec, "//") {
+			t.Errorf("refused sourceRef.kind must not compose a source fragment: %s", rec)
+		}
+		if strings.Contains(rec, "Chart") || strings.Contains(rec, `\`) {
+			t.Errorf("refused sourceRef.kind value leaked into the record: %s", rec)
 		}
 	})
 	t.Run("safe values render verbatim", func(t *testing.T) {
@@ -1363,17 +1396,6 @@ func TestResolveKustomizationTopologySourceRefGroup(t *testing.T) {
 			if strings.Contains(rec, "GitRepository/main") {
 				t.Errorf("refused sourceRef.group %q must not compose a source fragment: %s", g, rec)
 			}
-		}
-	})
-	t.Run("declared group with unsafe kind", func(t *testing.T) {
-		// A refused kind is dropped (pre-existing), so the fragment
-		// composes as group/name, not group//name.
-		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"group":"helm.toolkit.fluxcd.io","kind":"Helm\\Chart","name":"web"}}}`)
-		if !strings.Contains(rec, "source: helm.toolkit.fluxcd.io/web") {
-			t.Errorf("an unsafe kind must drop out without a doubled separator: %s", rec)
-		}
-		if strings.Contains(rec, "//") || strings.Contains(rec, `\`) {
-			t.Errorf("unsafe kind leaked into the record: %s", rec)
 		}
 	})
 }
