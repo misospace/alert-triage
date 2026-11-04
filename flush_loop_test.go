@@ -79,12 +79,29 @@ func TestRunFlushLoopTick(t *testing.T) {
 	if got := bufferLen(buf); got != 0 {
 		t.Fatalf("expected buffer drained after flush tick, got %d", got)
 	}
-	// Snapshot hits after the buffer is drained. The interval is
-	// clamped to a second, so wait long enough that a second tick
-	// would have fired and assert the loop did not flush an empty
-	// buffer. An over-eager loop that drains a buffer, then drains
-	// again on an empty buffer, would grow the counter here.
+	// The buffer empties when the tick pops the batch, but process then
+	// runs its kube reads — a namespace-less group takes the cluster-wide
+	// Flux path — so some hits land after the drain is observed.
+	// Snapshotting at that moment miscounts them as an empty-buffer flush
+	// on a slow or race-instrumented host (issue #314). Settle first:
+	// snapshot only once the counter has been quiet for a window
+	// comfortably longer than a local kube round-trip. The original guard
+	// survives — an over-eager loop that flushes again on an empty buffer
+	// fires on the clamped 1s tick, outside any window the real flush's
+	// reads settle into, so its hits still land after the snapshot and
+	// fail the assertion below.
+	const settleQuiet = 500 * time.Millisecond
+	settleBy := time.Now().Add(3 * time.Second)
 	drainedHits := atomic.LoadInt64(hits)
+	for {
+		time.Sleep(settleQuiet)
+		now := atomic.LoadInt64(hits)
+		if now == drainedHits || time.Now().After(settleBy) {
+			drainedHits = now
+			break
+		}
+		drainedHits = now
+	}
 	time.Sleep(2500 * time.Millisecond)
 	cancel()
 	<-done
