@@ -88,7 +88,7 @@ func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient,
 	}
 	kuz, revision, err := k.fluxKustomization(ctx, ns, name)
 	if err != nil {
-		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
+		rel.Reason = kustomizationFailureReason(err)
 		return rel
 	}
 	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
@@ -558,11 +558,47 @@ type kustomizationSpec struct {
 	} `json:"dependsOn"`
 }
 
+// The refused values get their own errors so that a caller can tell a
+// refused value from an object that is genuinely absent: the read failed
+// before the request was built, so nothing is known about the Kustomization
+// itself. The messages are fixed and never repeat the refused value, which
+// is author-controlled text that must not reach the digest.
+var (
+	errKustomizationNamespaceRefused = errors.New("kustomization namespace is not a valid path segment")
+	errKustomizationNameRefused      = errors.New("kustomization name is not a valid path segment")
+)
+
+// kustomizationFailureReason renders why a Kustomization read failed.
+//
+// A refused namespace or name is reported as "not read": the value was
+// rejected before the request was built, so claiming the Kustomization is
+// absent would state something the service never checked. Every other
+// failure keeps the "not found" shape the other failed reads use.
+func kustomizationFailureReason(err error) string {
+	if errors.Is(err, errKustomizationNamespaceRefused) || errors.Is(err, errKustomizationNameRefused) {
+		return "Flux Kustomization not read: " + truncate(err.Error(), 160)
+	}
+	return "Flux Kustomization not found: " + truncate(err.Error(), 160)
+}
+
 // fluxKustomization reads one Flux Kustomization and returns its spec plus
 // the status revision it currently reconciles at. Callers that only want the
 // repo+path pair should go through fluxPath, so a failed lookup is never
 // re-issued as a second identical kustomization GET.
+//
+// The namespace and the name are interpolated into an apiserver path, and
+// both can come from a pod annotation, so each is validated as one path
+// segment before use: a value carrying a separator addresses a different
+// object than the one the pod names. A refused value fails the read outright
+// and no request is sent, so every caller degrades to no Kustomization
+// rather than to evidence about some other object.
 func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomizationSpec, string, error) {
+	if !fluxPathSegment(ns) {
+		return kustomizationSpec{}, "", errKustomizationNamespaceRefused
+	}
+	if !fluxPathSegment(name) {
+		return kustomizationSpec{}, "", errKustomizationNameRefused
+	}
 	var kuz struct {
 		Spec   kustomizationSpec `json:"spec"`
 		Status struct {

@@ -1454,6 +1454,97 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 	})
 }
 
+// fluxKustomizationHostileFixture serves a Kustomization read for every
+// path and records how many requests arrived. It is the fixture for the
+// hostile annotation regressions: a refused namespace or name must not
+// produce a request at all, so any hit means the value was interpolated
+// into the path instead of being refused.
+func fluxKustomizationHostileFixture(t *testing.T) (*kube, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		t.Errorf("unexpected API hit for %s", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return &kube{hc: srv.Client(), base: srv.URL}, &hits
+}
+
+// assertHostileKustomizationDegrades checks the shared contract for a
+// refused namespace or name: the read fails without a request, the GitOps
+// path and the topology record are dropped, and the commit relevance stays
+// unknown with a one-line reason that names the refused field and does not
+// repeat the refused value.
+//
+// The refused value is author-controlled text, so a reason that repeats it
+// would put pod-controlled text into the digest.
+func assertHostileKustomizationDegrades(t *testing.T, k *kube, hits *atomic.Int32, ns, name, hostile, wantReason string) {
+	t.Helper()
+	pods := []podRef{{
+		Name:      "p",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      name,
+			"kustomize.toolkit.fluxcd.io/namespace": ns,
+		},
+	}}
+
+	if _, _, err := k.fluxKustomization(context.Background(), ns, name); err == nil {
+		t.Fatalf("expected the Kustomization read of %q/%q to fail", ns, name)
+	}
+
+	if paths, _ := k.resolveRepoPaths(context.Background(), pods, &Config{}); len(paths) != 0 {
+		t.Fatalf("expected no GitOps path for a refused Kustomization, got %#v", paths)
+	}
+
+	if recs := k.resolveKustomizationTopology(context.Background(), pods); len(recs) != 0 {
+		t.Fatalf("expected no topology record for a refused Kustomization, got %#v", recs)
+	}
+
+	rel := k.fluxKustomizationRelevance(context.Background(), nil, ns, name)
+	if rel.State != commitRelevanceUnknown {
+		t.Fatalf("state = %q, want %q (reason=%q)", rel.State, commitRelevanceUnknown, rel.Reason)
+	}
+	if strings.ContainsAny(rel.Reason, "\n") {
+		t.Fatalf("reason must be one line, got %q", rel.Reason)
+	}
+	// The reason names the field that was refused, so a swap of the two
+	// messages cannot pass, and it says the read did not happen instead of
+	// claiming the Kustomization is absent.
+	if rel.Reason != wantReason {
+		t.Fatalf("reason = %q, want %q", rel.Reason, wantReason)
+	}
+	if strings.Contains(rel.Reason, hostile) {
+		t.Fatalf("reason repeats the refused value: %q", rel.Reason)
+	}
+
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("expected no API request for a refused value, got %d", n)
+	}
+}
+
+// TestFluxKustomizationHostileNamespace covers a pod annotation whose
+// Kustomization namespace carries a path separator (issue #306). The
+// namespace is interpolated into the request path, so the value would
+// address a different object than the one the pod names. The read must be
+// refused before the request is built.
+func TestFluxKustomizationHostileNamespace(t *testing.T) {
+	k, hits := fluxKustomizationHostileFixture(t)
+	assertHostileKustomizationDegrades(t, k, hits, "workloads/../../other", "demo",
+		"workloads/../../other", "Flux Kustomization not read: kustomization namespace is not a valid path segment")
+}
+
+// TestFluxKustomizationHostileName covers a pod annotation whose
+// Kustomization name carries a path separator (issue #306). The name is
+// interpolated into the request path as well, so it is refused the same way
+// as the namespace.
+func TestFluxKustomizationHostileName(t *testing.T) {
+	k, hits := fluxKustomizationHostileFixture(t)
+	assertHostileKustomizationDegrades(t, k, hits, "workloads", "demo/../../other",
+		"demo/../../other", "Flux Kustomization not read: kustomization name is not a valid path segment")
+}
+
 // assertRepoURLsSafe fails the test if any entry contains a null byte,
 // an unescaped `..` traversal segment, a percent-encoded traversal
 // segment (the literal substring `%2F` or `%2E` after percent-decoding
