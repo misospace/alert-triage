@@ -217,6 +217,16 @@ func shortRev(rev string) string {
 	return truncate(rev, 24)
 }
 
+// argoInstanceRefusal is the fixed marker resolveRepoPaths returns when a
+// pod's argocd.argoproj.io/instance value is refused as not one path
+// segment. It names the refused field and the reason and never repeats the
+// value: the annotation is workload-authored text, and issue #308
+// established that a refused value must not reach the digest. The renderer
+// prints it alongside RepoPaths so a pod that declares an Argo Application
+// the service would not read does not read as one that declares none
+// (issue #312).
+const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not one path segment (value not shown)"
+
 // resolveRepoPaths walks the pods already gathered and, for each, looks up
 // the GitOps tool that owns it. Flux-managed pods carry
 // kustomize.toolkit.fluxcd.io/name+namespace pointing at a Kustomization;
@@ -227,9 +237,25 @@ func shortRev(rev string) string {
 // the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
 // de-duplicated; unresolved entries are dropped silently so a missing
 // mapping degrades to today's prose rather than to a fabricated path.
-func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) []string {
+// The one exception is a refused Argo instance: the pod does declare an
+// owner, the service just would not read it, so that refusal is not
+// silence — it comes back in the second result as a fixed marker naming
+// the field, never the refused value (issue #312).
+func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) ([]string, []string) {
 	seen := map[string]bool{}
 	var out []string
+	// Refusal markers are de-duplicated by their fixed text, the same way
+	// paths are: a ten-replica deployment with one hostile annotation is
+	// one line in the digest, not ten.
+	seenRefusal := map[string]bool{}
+	var refusals []string
+	refuse := func(marker string) {
+		if seenRefusal[marker] {
+			return
+		}
+		seenRefusal[marker] = true
+		refusals = append(refusals, marker)
+	}
 	add := func(repo, path string) {
 		repo = strings.TrimRight(repo, "/")
 		path = strings.TrimLeft(path, "/")
@@ -306,6 +332,19 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 			}
 		}
 		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
+			if !fluxPathSegment(app) {
+				// The same segment check argocdPath applies at the sender,
+				// applied here so the refusal is visible: argocdPath can
+				// only report "no path", which is also what a pod with no
+				// Application at all yields. A refused value must record
+				// its own marker (issue #312). The logged message is
+				// fixed — the value is author-controlled text and stays
+				// out of the logs for the same reason it stays out of the
+				// digest.
+				logf("enrich: argo application instance is not a valid path segment; skipping the Argo Application lookup")
+				refuse(argoInstanceRefusal)
+				continue
+			}
 			if repo, path, ok := k.argocdPath(ctx, app); ok {
 				add(repo, path)
 				continue
@@ -315,7 +354,7 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 	if len(out) == 0 && cfg.GitOpsRepo != "" {
 		add(cfg.GitOpsRepo, cfg.GitOpsPath)
 	}
-	return out
+	return out, refusals
 }
 
 // resolveKustomizationTopology reads the Flux Kustomization each pod resolved
@@ -591,11 +630,11 @@ func (k *kube) argocdPath(ctx context.Context, instance string) (string, string,
 	// that is not one path segment must never be sent: the request would
 	// address a different Application than the one the pod declares. An
 	// Argo Application name is a DNS subdomain, so the same segment check
-	// covers it. Refusing it yields no GitOps path and the caller then
-	// falls back to the configured GitOps repository - the same outcome as
-	// an Application that does not exist. The message is fixed and does
-	// not echo the value, which is author-controlled text that must not
-	// reach the digest.
+	// covers it. resolveRepoPaths pre-checks the annotation and records a
+	// refusal marker before calling (issue #312); this guard is what keeps
+	// "never send a refused value" an invariant of the sender itself, not
+	// of one caller. The message is fixed and does not echo the value,
+	// which is author-controlled text that must not reach the digest.
 	if !fluxPathSegment(instance) {
 		logf("enrich: argo application instance is not a valid path segment; skipping the Argo Application lookup")
 		return "", "", false

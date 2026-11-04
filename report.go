@@ -384,10 +384,18 @@ func renderEvidence(r Report) string {
 	if len(r.Group.Namespaces) > 0 {
 		fmt.Fprintf(&b, "Namespaces: %s\n", untrusted(stripSecrets(strings.Join(r.Group.Namespaces, ", "))))
 	}
-	if len(r.Enrichment.RepoPaths) > 0 {
+	if len(r.Enrichment.RepoPaths) > 0 || len(r.Enrichment.RepoPathRefusals) > 0 {
 		fmt.Fprintf(&b, "RepoPaths:\n")
 		for _, p := range r.Enrichment.RepoPaths {
 			fmt.Fprintf(&b, "- %s\n", untrusted(p))
+		}
+		// Refusal markers are this service's own finding assembled from
+		// constant text — the refused value, which is author-controlled,
+		// is deliberately absent — so they render like the explicit
+		// negatives elsewhere: outside the fence, unflattened
+		// (issue #312).
+		for _, m := range r.Enrichment.RepoPathRefusals {
+			fmt.Fprintf(&b, "- %s\n", m)
 		}
 	}
 	// The topology heading and framing are this service's own reading and stay

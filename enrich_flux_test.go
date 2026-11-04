@@ -61,7 +61,7 @@ func TestResolveRepoPathsFluxKustomization(t *testing.T) {
 		},
 	}}
 	cfg := &Config{}
-	got := k.resolveRepoPaths(context.Background(), pods, cfg)
+	got, _ := k.resolveRepoPaths(context.Background(), pods, cfg)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 resolved path, got %#v", got)
 	}
@@ -98,7 +98,7 @@ func TestResolveRepoPathsFluxPath(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/payments/apps/payments" {
 		t.Fatalf("unexpected paths: %#v", got)
 	}
@@ -139,7 +139,7 @@ func TestResolveRepoPathsFluxSourceRefNamespace(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/right/apps/demo" {
 		t.Fatalf("unexpected paths: %#v", got)
 	}
@@ -183,7 +183,7 @@ func TestResolveRepoPathsFluxSourceRefNamespaceMissingSource(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 0 {
 		t.Fatalf("expected no GitOps path when the declared source is missing, got %#v", got)
 	}
@@ -227,7 +227,7 @@ func TestResolveRepoPathsFluxSourceRefNamespaceOmitted(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/local/apps/demo" {
 		t.Fatalf("unexpected paths: %#v", got)
 	}
@@ -268,7 +268,7 @@ func TestFluxSourceNamespaceHostile(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 0 {
 		t.Fatalf("expected no GitOps path for a refused source namespace, got %#v", got)
 	}
@@ -373,7 +373,7 @@ func TestResolveRepoPathsMissingKustomization(t *testing.T) {
 			"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 0 {
 		t.Fatalf("expected no GitOps paths when Kustomization is missing, got: %#v", got)
 	}
@@ -406,9 +406,44 @@ func TestResolveRepoPathsArgoApplication(t *testing.T) {
 			"argocd.argoproj.io/instance": "guestbook",
 		},
 	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 1 || got[0] != "https://github.com/example/argo/manifests/web" {
 		t.Fatalf("unexpected paths: %#v", got)
+	}
+	if len(refusals) != 0 {
+		t.Fatalf("a resolved Application must yield no refusal marker, got %#v", refusals)
+	}
+}
+
+// TestResolveRepoPathsArgoMissingApplicationNoMarker pins that an
+// Application which does not exist (every lookup 404s) keeps today's
+// output: no path and no refusal marker. The service refused nothing —
+// the pod's declaration was honoured and simply found no object, which
+// must stay distinguishable from a refused reference (issue #312).
+func TestResolveRepoPathsArgoMissingApplicationNoMarker(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
+	pods := []podRef{{
+		Name:      "p3",
+		Namespace: "ns-b",
+		Annotations: map[string]string{
+			"argocd.argoproj.io/instance": "guestbook",
+		},
+	}}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no paths for a missing Application, got %#v", got)
+	}
+	if len(refusals) != 0 {
+		t.Fatalf("a missing Application is not a refusal and must carry no marker, got %#v", refusals)
+	}
+	if hits.Load() == 0 {
+		t.Fatalf("a valid instance must still be looked up, got 0 hits")
 	}
 }
 
@@ -418,7 +453,9 @@ func TestResolveRepoPathsArgoApplication(t *testing.T) {
 // than addressed as a different Application. Nothing may be requested - not
 // even the cluster-wide retry - and the result degrades to "no path from
 // this annotation", so the caller can fall back to the configured GitOps
-// repository.
+// repository. The refusal is a decision by the service, so it is reported:
+// exactly one fixed marker line naming the field, never repeating the
+// workload-authored value (issue #312).
 func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 	const hostile = "demo/../../other"
 	var hits atomic.Int32
@@ -431,19 +468,40 @@ func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 	}))
 	defer srv.Close()
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client()}
-	pods := []podRef{{
-		Name:      "p1",
-		Namespace: "ns-a",
-		Annotations: map[string]string{
-			"argocd.argoproj.io/instance": hostile,
+	// Two pods of the same deployment carry the same hostile annotation:
+	// the marker is de-duplicated the way paths are, so one refusal is one
+	// line, not one per replica.
+	pods := []podRef{
+		{
+			Name:      "p1",
+			Namespace: "ns-a",
+			Annotations: map[string]string{
+				"argocd.argoproj.io/instance": hostile,
+			},
 		},
-	}}
-	got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+		{
+			Name:      "p2",
+			Namespace: "ns-a",
+			Annotations: map[string]string{
+				"argocd.argoproj.io/instance": hostile,
+			},
+		},
+	}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
 	if len(got) != 0 {
 		t.Fatalf("expected no GitOps path for a refused instance, got %#v", got)
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
+	}
+	if len(refusals) != 1 || refusals[0] != argoInstanceRefusal {
+		t.Fatalf("expected exactly the fixed refusal marker, got %#v", refusals)
+	}
+	// The refused value is workload-authored annotation text; issue #308
+	// keeps it out of the digest, so the marker repeats neither the whole
+	// value nor any recognisable piece of it.
+	if strings.Contains(refusals[0], hostile) || strings.Contains(refusals[0], "demo") {
+		t.Fatalf("the marker must never repeat the refused value, got %q", refusals[0])
 	}
 	// The lookup itself reports "no GitOps path", so the caller keeps
 	// whatever else it knows about the workload's source.
@@ -454,11 +512,16 @@ func TestResolveRepoPathsArgoInstanceHostile(t *testing.T) {
 		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
 	}
 	// With a fallback configured the refusal degrades to that fallback,
-	// which is what "no path from this annotation" means.
+	// which is what "no path from this annotation" means — and the marker
+	// travels alongside it, because a fallback path does not make the
+	// refused declaration disappear.
 	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
-	got = k.resolveRepoPaths(context.Background(), pods, cfg)
+	got, refusals = k.resolveRepoPaths(context.Background(), pods, cfg)
 	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
 		t.Fatalf("expected the configured fallback, got %#v", got)
+	}
+	if len(refusals) != 1 || refusals[0] != argoInstanceRefusal {
+		t.Fatalf("the marker must survive the fallback, got %#v", refusals)
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("a refused instance must not be requested, got %d hits", hits.Load())
@@ -480,7 +543,7 @@ func TestResolveRepoPathsGitOpsFallback(t *testing.T) {
 	k := &kube{hc: srv.Client(), base: srv.URL}
 	pods := []podRef{{Name: "plain", Namespace: "ns", Annotations: map[string]string{}}}
 	cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "deploy/staging"}
-	got := k.resolveRepoPaths(context.Background(), pods, cfg)
+	got, _ := k.resolveRepoPaths(context.Background(), pods, cfg)
 	if len(got) != 1 || got[0] != "https://github.com/example/fallback/deploy/staging" {
 		t.Fatalf("unexpected fallback paths: %#v", got)
 	}
@@ -490,12 +553,15 @@ func TestResolveRepoPathsGitOpsFallback(t *testing.T) {
 // pods with no annotations and no fallback configured.
 func TestResolveRepoPathsEmpty(t *testing.T) {
 	k := &kube{}
-	if got := k.resolveRepoPaths(context.Background(), nil, &Config{}); got != nil {
-		t.Fatalf("expected nil, got %#v", got)
+	if got, refusals := k.resolveRepoPaths(context.Background(), nil, &Config{}); got != nil || refusals != nil {
+		t.Fatalf("expected nil, got %#v / %#v", got, refusals)
 	}
 	cfg := &Config{}
-	if got := k.resolveRepoPaths(context.Background(), []podRef{{Annotations: map[string]string{}}}, cfg); got != nil {
-		t.Fatalf("expected nil when nothing resolves and no fallback configured, got %#v", got)
+	// A pod with no GitOps annotations declares nothing, so it gets no
+	// refusal marker either: the marker is only for a reference that was
+	// present and refused (issue #312).
+	if got, refusals := k.resolveRepoPaths(context.Background(), []podRef{{Annotations: map[string]string{}}}, cfg); got != nil || refusals != nil {
+		t.Fatalf("expected nil when nothing resolves and no fallback configured, got %#v / %#v", got, refusals)
 	}
 }
 
@@ -882,7 +948,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 			}()
 			k := &kube{hc: srv.Client(), base: srv.URL}
 			pods := []podRef{{Name: "p", Namespace: "ns", Annotations: tc.ann}}
-			got := k.resolveRepoPaths(context.Background(), pods, &Config{})
+			got, _ := k.resolveRepoPaths(context.Background(), pods, &Config{})
 			t.Logf("%s -> %#v", tc.name, got)
 			assertRepoURLsSafe(t, tc.name, got)
 		})
@@ -903,7 +969,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "../../etc/secrets"}
-		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got, _ := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_traversal", got)
 		if len(got) != 1 {
@@ -925,7 +991,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "pods\x00evil"}
-		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got, _ := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("nullbyte fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_nullbyte", got)
 		if len(got) != 0 {
@@ -944,7 +1010,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: "podinfo%2F..%2F.."}
-		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got, _ := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("percentencoded fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_percentencoded", got)
 		if len(got) != 0 {
@@ -963,7 +1029,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		}()
 		k := &kube{}
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback", GitOpsPath: `podinfo\..\..`}
-		got := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
+		got, _ := k.resolveRepoPaths(context.Background(), []podRef{{Name: "p", Namespace: "ns", Annotations: map[string]string{}}}, cfg)
 		t.Logf("backslash fallback -> %#v", got)
 		assertRepoURLsSafe(t, "gitops_fallback_backslash", got)
 		if len(got) != 0 {
@@ -983,7 +1049,7 @@ func TestResolveRepoPathsEdgeCaseInputs(t *testing.T) {
 		cfg := &Config{GitOpsRepo: "https://github.com/example/fallback"}
 		cfg.GitOpsPath = "/etc/secrets"
 		pods := []podRef{{Namespace: "ns", Name: "pod"}}
-		got := k.resolveRepoPaths(context.Background(), pods, cfg)
+		got, _ := k.resolveRepoPaths(context.Background(), pods, cfg)
 		if len(got) != 1 {
 			t.Fatalf("gitops_fallback_absolutepath: want one entry, got %#v", got)
 		}
@@ -1961,5 +2027,90 @@ func TestEnrichNoGitHubClientLeavesRelevanceEmpty(t *testing.T) {
 	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
 	if len(en.CommitRelevance) != 0 {
 		t.Fatalf("expected CommitRelevance to be empty without gh, got %d entries: %+v", len(en.CommitRelevance), en.CommitRelevance)
+	}
+}
+
+// TestRenderEvidenceRepoPathRefusal pins the digest shape for a refused
+// Argo instance (issue #312): the RepoPaths section renders with one
+// explicit marker line naming the refused field, with or without resolved
+// paths present, and the refused value never appears. Silence for a
+// refused reference is the bug; no-annotation and missing-Application
+// pods render no section at all (pinned by TestResolveRepoPathsEmpty and
+// TestResolveRepoPathsArgoMissingApplicationNoMarker).
+func TestRenderEvidenceRepoPathRefusal(t *testing.T) {
+	// Only a refusal: the section must still render. "no GitOps path at
+	// all" is exactly what must stop reading like "declares none".
+	en := Enrichment{RepoPathRefusals: []string{argoInstanceRefusal}}
+	evidence := renderEvidence(Report{Enrichment: en})
+	if !strings.Contains(evidence, "RepoPaths:\n- "+argoInstanceRefusal+"\n") {
+		t.Errorf("refusal-only evidence missing the marker line:\n%s", evidence)
+	}
+	if strings.Count(evidence, "RepoPaths:") != 1 {
+		t.Errorf("expected exactly one RepoPaths section:\n%s", evidence)
+	}
+
+	// Refusal alongside a resolved (fallback) path: both render, the path
+	// first, and the marker still does not carry the refused value.
+	en = Enrichment{
+		RepoPaths:        []string{"https://github.com/example/fallback/deploy/staging"},
+		RepoPathRefusals: []string{argoInstanceRefusal},
+	}
+	evidence = renderEvidence(Report{Enrichment: en})
+	i := strings.Index(evidence, "https://github.com/example/fallback/deploy/staging")
+	j := strings.Index(evidence, argoInstanceRefusal)
+	if i < 0 || j < 0 || i > j {
+		t.Errorf("expected the path then the marker under RepoPaths:\n%s", evidence)
+	}
+
+	// Nothing resolved and nothing refused: no section, unchanged.
+	evidence = renderEvidence(Report{Enrichment: Enrichment{}})
+	if strings.Contains(evidence, "RepoPaths:") {
+		t.Errorf("empty enrichment must render no RepoPaths section:\n%s", evidence)
+	}
+}
+
+// TestEnrichReportsRefusedArgoInstance wires the marker through the full
+// enrichment path: a listed pod whose argocd.argoproj.io/instance is
+// refused must land in Enrichment.RepoPathRefusals without any Application
+// request, so the digest states the refusal instead of showing no GitOps
+// path at all (issue #312).
+func TestEnrichReportsRefusedArgoInstance(t *testing.T) {
+	var appHits atomic.Int32
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/applications/") {
+			appHits.Add(1)
+			t.Errorf("a refused instance must not be requested: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/pods") {
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p","namespace":"ns-a","annotations":{"argocd.argoproj.io/instance":"web/../../other"}},"spec":{"nodeName":"n1"},"status":{"phase":"Failed","containerStatuses":[{"name":"c","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer kubeSrv.Close()
+
+	k := &kube{hc: kubeSrv.Client(), base: kubeSrv.URL, cluster: "default"}
+	g := Group{
+		Key:        "KubePodCrashLooping",
+		Cluster:    "default",
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{{
+			Labels:   map[string]string{"alertname": "KubePodCrashLooping", "namespace": "ns-a", "pod": "p"},
+			StartsAt: time.Now().Add(-time.Minute),
+		}},
+	}
+	en := k.Enrich(context.Background(), g, time.Hour, &Config{}, nil)
+	if len(en.RepoPathRefusals) != 1 || en.RepoPathRefusals[0] != argoInstanceRefusal {
+		t.Fatalf("expected the refusal to reach the enrichment, got %#v", en.RepoPathRefusals)
+	}
+	for _, m := range en.RepoPathRefusals {
+		if strings.Contains(m, "web") {
+			t.Errorf("the marker must not repeat the refused value, got %q", m)
+		}
+	}
+	if appHits.Load() != 0 {
+		t.Fatalf("a refused instance must not be requested, got %d hits", appHits.Load())
 	}
 }
