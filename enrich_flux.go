@@ -426,8 +426,9 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 //     namespace, the sourceRef name and namespace) that carry NUL,
 //     backslash, or percent are refused before rendering — the same
 //     rejection set resolveRepoPaths applies to the same class of value.
-//     A refused singular field (spec.path, the sourceRef name) renders an
-//     explicit "refused" marker so it never reads as an absent one; refused
+//     A refused singular field (spec.path, the sourceRef name, a declared
+//     sourceRef group) renders an explicit "refused" marker so it never
+//     reads as an absent one; refused
 //     list entries are dropped, leaving their subsection saying "none safe".
 //     No path.Clean here, unlike resolveRepoPaths: components legitimately
 //     carry `..` segments (`../base/common`) and OCI references that a
@@ -469,10 +470,20 @@ func (k *kube) resolveKustomizationTopology(ctx context.Context, pods []podRef) 
 		case !safe(spec.SourceRef.Name):
 			// A refused name must not read as an absent one.
 			src = "refused"
+		case spec.SourceRef.Group != "" && !safe(spec.SourceRef.Group):
+			// The group disambiguates same-named sources across API
+			// groups (#307): with it declared but refused, the fragment
+			// cannot honestly name one object, so the whole fragment is
+			// refused rather than presenting an ambiguous reference as
+			// identified.
+			src = "refused"
 		default:
 			src = spec.SourceRef.Name
 			if spec.SourceRef.Kind != "" && safe(spec.SourceRef.Kind) {
 				src = spec.SourceRef.Kind + "/" + src
+			}
+			if spec.SourceRef.Group != "" {
+				src = spec.SourceRef.Group + "/" + src
 			}
 			if spec.SourceRef.Namespace != "" && safe(spec.SourceRef.Namespace) {
 				src += " (" + spec.SourceRef.Namespace + ")"

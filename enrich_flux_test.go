@@ -1314,6 +1314,70 @@ func TestResolveKustomizationTopologyRefusedSingularFields(t *testing.T) {
 	})
 }
 
+// TestResolveKustomizationTopologySourceRefGroup pins the declared
+// spec.sourceRef.group in the source fragment (#323): since #307 the same
+// kind and name can exist in two API groups, so the fragment must carry the
+// group that says which object the Kustomization actually uses. An absent
+// group renders as before, and a refused group value never composes a
+// fragment that presents an ambiguous reference as identified.
+func TestResolveKustomizationTopologySourceRefGroup(t *testing.T) {
+	run := func(t *testing.T, kuzJSON string) string {
+		t.Helper()
+		srv := fluxKustomizationAPIHarness(t, "kuz", kuzJSON,
+			`{"spec":{"url":"https://github.com/example/kuz"}}`)
+		defer srv.Close()
+
+		k := &kube{hc: srv.Client(), base: srv.URL}
+		got := k.resolveKustomizationTopology(context.Background(), fluxAnnotatedPod("p-0", "apps", "kuz", ""))
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one topology record, got %#v", got)
+		}
+		return got[0]
+	}
+	t.Run("declared group renders", func(t *testing.T) {
+		// The pre-move Flux case: a HelmChart source in the Helm group
+		// rather than the source group.
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"group":"helm.toolkit.fluxcd.io","kind":"HelmChart","name":"web","namespace":"flux-system"}}}`)
+		if !strings.Contains(rec, "source: helm.toolkit.fluxcd.io/HelmChart/web (flux-system)") {
+			t.Errorf("declared sourceRef.group must render in the source fragment: %s", rec)
+		}
+	})
+	t.Run("absent group renders as before", func(t *testing.T) {
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"kind":"GitRepository","name":"main","namespace":"flux-system"}}}`)
+		if !strings.Contains(rec, "source: GitRepository/main (flux-system)") {
+			t.Errorf("an absent group must not change the fragment shape: %s", rec)
+		}
+	})
+	t.Run("refused group value", func(t *testing.T) {
+		// Each value is written as it must appear in the JSON document,
+		// so the hostile bytes arrive through JSON escapes: \\ decodes to
+		// a single backslash, \u0000 to NUL, % stays literal.
+		for _, g := range []string{`evil\\group`, `pods\u0000evil`, `pods%2F..%2F`} {
+			rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"group":"`+g+`","kind":"GitRepository","name":"main","namespace":"flux-system"}}}`)
+			if !strings.Contains(rec, "source: refused") {
+				t.Errorf("refused sourceRef.group %q must render source: refused: %s", g, rec)
+			}
+			if strings.Contains(rec, "evil") || strings.Contains(rec, `\`) || strings.Contains(rec, "\x00") {
+				t.Errorf("refused sourceRef.group value %q leaked into the record: %s", g, rec)
+			}
+			if strings.Contains(rec, "GitRepository/main") {
+				t.Errorf("refused sourceRef.group %q must not compose a source fragment: %s", g, rec)
+			}
+		}
+	})
+	t.Run("declared group with unsafe kind", func(t *testing.T) {
+		// A refused kind is dropped (pre-existing), so the fragment
+		// composes as group/name, not group//name.
+		rec := run(t, `{"spec":{"path":"apps/kuz","sourceRef":{"group":"helm.toolkit.fluxcd.io","kind":"Helm\\Chart","name":"web"}}}`)
+		if !strings.Contains(rec, "source: helm.toolkit.fluxcd.io/web") {
+			t.Errorf("an unsafe kind must drop out without a doubled separator: %s", rec)
+		}
+		if strings.Contains(rec, "//") || strings.Contains(rec, `\`) {
+			t.Errorf("unsafe kind leaked into the record: %s", rec)
+		}
+	})
+}
+
 // TestResolveRepoPathsEdgeCaseInputs exercises the elevated must-check
 // for edge-case inputs that could lead to path injection if a future
 // regression lets annotation values or GitOps config flow unchecked into
