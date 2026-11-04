@@ -419,8 +419,8 @@ func TestResolveRepoPathsFluxSourceNameHostile(t *testing.T) {
 // #318): a Kustomization that declares no sourceRef, or declares one with
 // no name, is an object that declares no GitOps source — not one whose
 // source this service refused. The output must stay exactly what it was
-// before the marker existed: no path, no marker, and the configured
-// fallback still replacing the missing path.
+// before the marker existed: no path, no marker, the configured fallback
+// still replacing the missing path, and the pre-#318 relevance reason.
 func TestResolveRepoPathsFluxSourceRefAbsent(t *testing.T) {
 	cases := []struct {
 		name string
@@ -482,8 +482,11 @@ func TestResolveRepoPathsFluxSourceRefAbsent(t *testing.T) {
 			if sourceHits.Load() != 0 {
 				t.Fatalf("an undeclared source must not be requested, got %d hits", sourceHits.Load())
 			}
-			// The relevance path degrades to "unknown" and must not
-			// describe the absent name as a value this service refused.
+			// The relevance path degrades to "unknown" with the reason
+			// byte-identical to what the segment check returned before
+			// issue #318: a simply absent sourceRef keeps its current
+			// output. It is a lookup failure, not a refusal — no refusal
+			// marker is emitted for it.
 			gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
 			rel := k.resolveCommitRelevance(context.Background(), gh, pods)
 			if len(rel) != 1 {
@@ -492,11 +495,8 @@ func TestResolveRepoPathsFluxSourceRefAbsent(t *testing.T) {
 			if rel[0].State != commitRelevanceUnknown {
 				t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
 			}
-			if !strings.Contains(rel[0].Reason, "not readable") {
-				t.Fatalf("reason must name the unreadable source: %q", rel[0].Reason)
-			}
-			if strings.Contains(rel[0].Reason, "not a valid path segment") {
-				t.Fatalf("an absent name must not be described as a refused value: %q", rel[0].Reason)
+			if want := "Flux GitRepository not readable: flux source name is not a valid path segment"; rel[0].Reason != want {
+				t.Fatalf("reason = %q, want the unchanged pre-#318 reason %q", rel[0].Reason, want)
 			}
 			if strings.Contains(rel[0].Reason, "\n") {
 				t.Fatalf("reason must be one line: %q", rel[0].Reason)
@@ -556,22 +556,24 @@ func TestResolveRepoPathsFluxSourceRefAbsentDoesNotMaskRefusal(t *testing.T) {
 
 // TestFluxSourceURLClassifiesAbsenceAndRefusal pins the classification
 // the markers rest on (issue #318): a value that is present and not one
-// path segment is refused, a value that is absent is undeclared, and
-// neither is ever requested. A refusal is decided even when the other
-// value is absent, so an absence can never mask a refusal.
+// path segment is refused, and a value that is absent returns the exact
+// error the segment checks returned before issue #318 — never a refusal
+// sentinel, so it can never earn a marker. A refusal is decided even when
+// the other value is absent, so an absence can never mask a refusal.
 func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 	cases := []struct {
 		name    string
 		ns      string
 		srcName string
-		want    error
+		want    error  // refusal sentinel, or nil for the pre-#318 absence errors
+		wantMsg string // exact message when want == nil
 	}{
-		{"declared namespace refused", "sources/../workloads", "config", errFluxSourceNamespaceRefused},
-		{"declared name refused", "workloads", "payments/../other", errFluxSourceNameRefused},
-		{"absent name", "workloads", "", errFluxSourceUndeclared},
-		{"absent namespace", "", "config", errFluxSourceUndeclared},
-		{"absent namespace, refused name", "", "payments/../other", errFluxSourceNameRefused},
-		{"refused namespace, absent name", "sources/../workloads", "", errFluxSourceNamespaceRefused},
+		{"declared namespace refused", "sources/../workloads", "config", errFluxSourceNamespaceRefused, ""},
+		{"declared name refused", "workloads", "payments/../other", errFluxSourceNameRefused, ""},
+		{"absent name", "workloads", "", nil, "flux source name is not a valid path segment"},
+		{"absent namespace", "", "config", nil, "flux source namespace is not a valid path segment"},
+		{"absent namespace, refused name", "", "payments/../other", errFluxSourceNameRefused, ""},
+		{"refused namespace, absent name", "sources/../workloads", "", errFluxSourceNamespaceRefused, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -584,11 +586,22 @@ func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 
 			k := &kube{hc: srv.Client(), base: srv.URL}
 			_, err := k.fluxSourceURL(context.Background(), tc.ns, "GitRepository", tc.srcName)
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("err = %v, want %v", err, tc.want)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("err = %v, want %v", err, tc.want)
+				}
+			} else {
+				// An absence returns the pre-#318 error verbatim and is
+				// never classified as a refusal (issue #318).
+				if err == nil || err.Error() != tc.wantMsg {
+					t.Fatalf("err = %v, want exactly %q", err, tc.wantMsg)
+				}
+				if errors.Is(err, errFluxSourceNameRefused) || errors.Is(err, errFluxSourceNamespaceRefused) {
+					t.Fatalf("an absent value must not be reported as a refusal: %v", err)
+				}
 			}
 			if hits.Load() != 0 {
-				t.Fatalf("a refused or undeclared source must not be requested, got %d hits", hits.Load())
+				t.Fatalf("a refused or absent source must not be requested, got %d hits", hits.Load())
 			}
 		})
 	}

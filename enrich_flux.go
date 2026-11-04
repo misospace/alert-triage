@@ -671,17 +671,12 @@ var (
 	errFluxSourceNameRefused      = errors.New("flux source name is not a valid path segment")
 )
 
-// errFluxSourceUndeclared marks a sourceRef that declares no value to
-// read: no source name, or no namespace to address. There is no value to
-// refuse, so this is an absence and not a decision — a Kustomization that
-// declares no source keeps the output it had before issue #318: no path
-// and no marker.
-var errFluxSourceUndeclared = errors.New("flux source declares no source to read")
-
 // errFluxPathUnresolved marks a fluxPath lookup whose values were all
 // readable but whose repo+path pair is simply not there: an empty
-// spec.path, an empty source spec.url, or a sourceRef that declares no
-// source to read. It is not a refusal and never yields a marker.
+// spec.path or an empty source spec.url. It is not a refusal and never
+// yields a marker. A sourceRef that declares no source to read keeps the
+// plain error the segment checks returned before issue #318, so its
+// output stays the absence it always was.
 var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a repo path")
 
 // fluxSourceURL reads the source object a Kustomization's sourceRef names and
@@ -699,13 +694,14 @@ var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a
 // refusal errors are the sentinel vars above, so resolveRepoPaths can mark
 // the refused field without re-deriving why the lookup failed (issue #318).
 //
-// An absent value is told apart from a refused one before any sentinel is
-// assigned. A sourceRef that declares no name (or no namespace to address)
-// has no value to refuse, and reporting it as refused would state a
-// decision about a value the object never declared: the digest would name
-// a refused field that does not exist, and a workload that declares no
-// GitOps source would read as one whose source the service rejected.
-// Absent is therefore undeclared, and only a refusal earns a marker.
+// An absent value is told apart from a refused one before any refusal
+// sentinel is assigned: a sourceRef that declares no name (or no namespace
+// to address) has no value to refuse, and reporting it as refused would
+// state a decision about a value the object never declared. Only a refusal
+// earns a marker. An absence is not a new classification either — it
+// returns the exact errors the segment checks returned before issue #318,
+// so a Kustomization that simply declares no source keeps its previous
+// output: the same commit-relevance reason, no path and no marker.
 func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
 	// The refusals are decided before the absences, so a declared value
 	// this service refuses is still reported when the other value is
@@ -716,8 +712,11 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 	if srcName != "" && !fluxPathSegment(srcName) {
 		return "", errFluxSourceNameRefused
 	}
-	if ns == "" || srcName == "" {
-		return "", errFluxSourceUndeclared
+	if ns == "" {
+		return "", errors.New("flux source namespace is not a valid path segment")
+	}
+	if srcName == "" {
+		return "", errors.New("flux source name is not a valid path segment")
 	}
 	if srcKind == "" {
 		srcKind = "GitRepository"
@@ -756,13 +755,6 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, e
 	}
 	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil {
-		if errors.Is(err, errFluxSourceUndeclared) {
-			// The Kustomization declares no source to read, so there is
-			// no value to refuse: this is the absence it was before
-			// issue #318 — no path, no marker, and the GITOPS_REPO
-			// fallback still replaces the missing path.
-			return "", "", errFluxPathUnresolved
-		}
 		if errors.Is(err, errFluxSourceNamespaceRefused) && kuz.SourceRef.Namespace == "" {
 			// The refused value is not a namespace the object declared but
 			// the Kustomization's own namespace, inherited from the pod's
