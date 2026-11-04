@@ -682,9 +682,12 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 // errFluxSourceNameRefused mark a sourceRef value refused as not one path
 // segment — a decision this service made about a value it had read —
 // while every other failure (missing object or source, empty spec.path or
-// spec.url) means the pair simply could not be read. Callers that do not
-// distinguish treat err != nil exactly as the old false and degrade as
-// before (issue #318).
+// spec.url) means the pair simply could not be read. A namespace refusal
+// for a sourceRef that declares no namespace is folded into
+// errFluxPathUnresolved, because the refused value is then the inherited
+// Kustomization namespace — the service's own lookup key, not an
+// object-declared field. Callers that do not distinguish treat err != nil
+// exactly as the old false and degrade as before (issue #318).
 func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, error) {
 	kuz, _, err := k.fluxKustomization(ctx, ns, name)
 	if err != nil {
@@ -695,6 +698,18 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, e
 	}
 	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil {
+		if errors.Is(err, errFluxSourceNamespaceRefused) && kuz.SourceRef.Namespace == "" {
+			// The refused value is not a namespace the object declared but
+			// the Kustomization's own namespace, inherited from the pod's
+			// annotation. A Kustomization read through that value already
+			// succeeded, so no apiserver that served this object can have
+			// treated the value as two segments; if something on the way
+			// collapsed it, the locator was hostile rather than canonical.
+			// Either way this is a refusal of the service's own lookup key,
+			// not of an object-declared source field, and only a declared
+			// field earns a digest line naming it (issue #318).
+			return "", "", errFluxPathUnresolved
+		}
 		return "", "", err
 	}
 	if srcURL == "" {

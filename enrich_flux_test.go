@@ -395,6 +395,54 @@ func TestResolveRepoPathsFluxSourceNameHostile(t *testing.T) {
 	}
 }
 
+// TestResolveRepoPathsFluxInheritedNamespaceNotMarked pins the marker
+// attribution (issue #318): when spec.sourceRef declares no namespace and
+// the value refused as not one path segment is the Kustomization namespace
+// inherited from the pod annotation, the lookup failed on the service's own
+// locator, not on an object-declared field — so it yields no marker and no
+// source request, keeping the pre-#318 output. The fake apiserver answers a
+// path the real apiserver would never match (Go sends dot segments raw and
+// the apiserver matches on raw segments, so a read through such a namespace
+// cannot succeed in anger); the contract pinned here is that even for that
+// shape nothing marks and nothing re-requests through the refused value.
+func TestResolveRepoPathsFluxInheritedNamespaceNotMarked(t *testing.T) {
+	const hostile = "x/../flux-system"
+	var sourceHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/kustomizations/payments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/payments","sourceRef":{"kind":"GitRepository","name":"payments-repo"}}}`)
+		case strings.Contains(r.URL.Path, "/gitrepositories/"):
+			sourceHits.Add(1)
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected API hit for %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "payments",
+			"kustomize.toolkit.fluxcd.io/namespace": hostile,
+		},
+	}}
+	got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+	if len(got) != 0 {
+		t.Fatalf("expected no GitOps path for a refused inherited namespace, got %#v", got)
+	}
+	if len(refusals) != 0 {
+		t.Fatalf("a refused inherited namespace must not mark spec.sourceRef.namespace, got %#v", refusals)
+	}
+	if sourceHits.Load() != 0 {
+		t.Fatalf("the source object must not be requested through a refused namespace, got %d hits", sourceHits.Load())
+	}
+}
+
 // TestFluxPathSegment pins the segment check that guards the values
 // interpolated into an apiserver path. The refused set is what keeps a
 // request aimed at the object the Kustomization declares.
