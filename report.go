@@ -465,7 +465,15 @@ func renderEvidence(r Report) string {
 	// The Scope string embeds the inspected namespace list and, on a cluster
 	// mismatch, the group's cluster label — alert-supplied values on a
 	// model-visible and issue-quoted line, so the renderer strips (#278 review).
-	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", stripSecrets(orUnknown(r.Enrichment.Scope)))
+	// Stripping secrets is not enough: Namespaces stays raw on purpose
+	// (correlate.go newGroup) and this line is the single render point for
+	// every Scope construction, so a value with a newline would otherwise
+	// forge a line inside the section this service narrates outside the
+	// fence. untrusted() flattens line structure the same way the alert
+	// lines above wrap their label values, and leaves a legitimate
+	// namespace list untouched, since a DNS-1123 label carries no
+	// whitespace and no dash run (issue #310 review).
+	fmt.Fprintf(&b, "\nEVIDENCE (read live from the Kubernetes API; scope: %s)\n", untrusted(stripSecrets(orUnknown(r.Enrichment.Scope))))
 	b.WriteString("The direct tier was read from the alert's own objects; the context tier\n")
 	b.WriteString("from their neighborhood. Weigh the direct tier first (see the rules\n")
 	b.WriteString("above); the context tier rules causes out and fills gaps - it does not\n")
