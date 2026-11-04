@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	pathpkg "path"
 	"strings"
@@ -90,7 +91,7 @@ func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient,
 		rel.Reason = "Flux Kustomization not found: " + truncate(err.Error(), 160)
 		return rel
 	}
-	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil || srcURL == "" {
 		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
 		return rel
@@ -462,11 +463,74 @@ func (k *kube) fluxKustomization(ctx context.Context, ns, name string) (kustomiz
 	return kuz.Spec, kuz.Status.LastAppliedRevision, nil
 }
 
+// fluxSourceNamespace returns the namespace the source object a Kustomization
+// names in spec.sourceRef lives in.
+//
+// Flux resolves a sourceRef that carries no namespace against the
+// Kustomization's own namespace, so an absent spec.sourceRef.namespace means
+// "the local namespace". An explicit namespace names a different object and is
+// honoured as written: falling back to the local namespace would resolve a
+// same-named source the Kustomization does not use, and the digest would then
+// name the wrong repository and classify a commit against its files.
+func fluxSourceNamespace(spec kustomizationSpec, kustomNS string) string {
+	if spec.SourceRef.Namespace != "" {
+		return spec.SourceRef.Namespace
+	}
+	return kustomNS
+}
+
+// fluxPathSegment reports whether v can be interpolated into an apiserver
+// path as one segment.
+//
+// The allow-list is narrow on purpose: a namespace is a lowercase DNS label
+// and an object name a lowercase DNS subdomain, so nothing outside the
+// lowercase-alphanumeric, '-' and '.' set can occur in one. Refusing the
+// complement rather than searching for the dangerous characters is what
+// makes the check impossible to slip past with an encoded form: '%' would
+// smuggle a separator past a check on the literal characters, and '?' or '#'
+// would end the path at the value instead of being part of it. A leading or
+// trailing separator is refused because no label or subdomain has one, and
+// ".." is refused because two separators in a row is a traversal pair.
+func fluxPathSegment(v string) bool {
+	if v == "" || len(v) > 253 || strings.Contains(v, "..") {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' || c == '.':
+			if i == 0 || i == len(v)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // fluxSourceURL reads the source object a Kustomization's sourceRef names and
 // returns its spec.url. An empty kind defaults to GitRepository, matching the
 // sourceRef default Flux applies. The empty-URL case is left to callers: for
 // relevance it degrades to "not readable", for repo+path lookups to no path.
+//
+// The namespace and the name are interpolated into an apiserver path, and
+// the namespace may now come from spec.sourceRef.namespace rather than only
+// from the Kustomization's own namespace, so both are validated as one path
+// segment before use: a value carrying a separator would address a different
+// object than the one declared. A refused value fails the lookup outright —
+// there is no second namespace to fall back to, because falling back is how a
+// same-named source the Kustomization does not use gets resolved. The error
+// messages are fixed and do not echo the offending value, which is
+// author-controlled text that must not reach the digest.
 func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
+	if !fluxPathSegment(ns) {
+		return "", errors.New("flux source namespace is not a valid path segment")
+	}
+	if !fluxPathSegment(srcName) {
+		return "", errors.New("flux source name is not a valid path segment")
+	}
 	if srcKind == "" {
 		srcKind = "GitRepository"
 	}
@@ -487,7 +551,7 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 	if err != nil || kuz.Path == "" {
 		return "", "", false
 	}
-	srcURL, err := k.fluxSourceURL(ctx, ns, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil || srcURL == "" {
 		return "", "", false
 	}
