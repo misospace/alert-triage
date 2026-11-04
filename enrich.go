@@ -617,13 +617,27 @@ type Enrichment struct {
 	// rendered to the model inside the untrusted fence.
 	Ownership []string
 	// Scope records what was actually inspected, so the narrative can
-	// distinguish "nothing is wrong" from "nothing was looked at".
+	// distinguish "nothing is wrong" from "nothing was looked at". It is
+	// this service's own reading and carries no alert-supplied text: the
+	// namespaces, jobs and cluster it covers are named where they came
+	// from — Group.Namespaces and Group.Cluster, and InspectedJobs — all
+	// of which the renderer quotes inside the untrusted fence. The scope
+	// itself renders outside it (issue #310 review).
 	Scope string
 	// RepoPaths is the GitOps-managed location of the workload(s) an alert
 	// names, resolved from Flux Kustomizations or Argo Applications the pods
 	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
 	// nothing resolves; the prose must degrade gracefully in that case.
 	RepoPaths []string
+	// RepoPathRefusals carries the fixed markers of GitOps owner references
+	// resolveRepoPaths refused to look up — currently only a refused
+	// argocd.argoproj.io/instance. A pod whose reference was refused does
+	// declare a GitOps owner the service would not read, and that must not
+	// read as a pod that declares none, so the digest states it. Marker
+	// text is constant and names the refused field, never the refused
+	// value, which is author-controlled annotation text (issue #308); it
+	// renders with RepoPaths as the service's own finding (issue #312).
+	RepoPathRefusals []string
 	// KustomizationTopology is the composition evidence for the Flux
 	// Kustomizations those pods resolved to: one compact record per
 	// Kustomization carrying its name, source, spec.path, the
@@ -849,7 +863,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// That shipped in 0.1.8 and ran unnoticed for three days, because a
 	// confident story told over no evidence looks exactly like a good one.
 	if k.cluster != "" && g.Cluster != "" && k.cluster != g.Cluster {
-		e.Scope = fmt.Sprintf("cluster state unavailable (group is from cluster %q, this client serves %q)", g.Cluster, k.cluster)
+		// The group's cluster is alert-supplied and is named in the identity
+		// block, inside the untrusted fence. This line is the service's own
+		// reading, so it stays outside and names only the cluster this client
+		// serves, which comes from configuration (issue #310 review).
+		e.Scope = fmt.Sprintf("cluster state unavailable (this client serves cluster %q; the alert names a different cluster)", k.cluster)
 		e.BackendState = "unavailable"
 		return e
 	}
@@ -877,7 +895,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.FluxInspected = e.FluxInspected && inspected
 		e.Scope = "cluster-wide; this alert names no namespace, so nothing below is known to concern it"
 	} else {
-		e.Scope = "namespaces " + strings.Join(g.Namespaces, ", ") + " plus cluster node health"
+		// The namespaces are alert-supplied and render inside the untrusted
+		// fence with the rest of the identity; the scope says only what was
+		// read, in this service's own words (issue #310 review).
+		e.Scope = "the alert's own namespaces, plus cluster node health"
 	}
 
 	// Collect the pods the alerts actually name, so we can still fetch their
@@ -908,8 +929,13 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// jobTargets is a map, so preserve a stable scope statement across runs.
 	sort.Strings(e.InspectedJobs)
 	if len(e.InspectedJobs) > 0 {
-		// Name only Jobs read directly, distinguishing them from a namespace listing.
-		e.Scope += "; jobs " + strings.Join(e.InspectedJobs, ", ") + " were inspected"
+		// Name only Jobs read directly, distinguishing them from a namespace
+		// listing. The names are alert-supplied and render inside the
+		// untrusted fence, so the scope says only that they were read — and
+		// it points at the list, because an alert can name a job that does
+		// not resolve and then no job was inspected for it (issue #310
+		// review).
+		e.Scope += "; jobs listed under Inspected jobs were inspected"
 	}
 
 	resolvedSubjects := map[subjectKey]bool{}
@@ -1223,7 +1249,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.Ownership = append(e.Ownership, entry+" -> Job/"+jkey+tail)
 		}
 	}
-	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
+	e.RepoPaths, e.RepoPathRefusals = k.resolveRepoPaths(ctx, seenPods, cfg)
 	e.KustomizationTopology = k.resolveKustomizationTopology(ctx, seenPods)
 	if gh != nil {
 		e.CommitRelevance = k.resolveCommitRelevance(ctx, gh, seenPods)

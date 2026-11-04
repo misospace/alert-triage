@@ -113,10 +113,11 @@ func safeErr(err error) string {
 
 // fluxActivity reports Flux resources that are failing, and - only when
 // scoped to a namespace - ones whose Ready condition transitioned inside the
-// window. The second result records whether both list reads succeeded: a
-// failed read returns the findings gathered so far and false, so an empty
-// slice is only a quiet window when the caller knows the lists were read
-// (issue #300).
+// window. The second result records whether the scope was read: a failed
+// read returns the findings gathered so far and false, and a namespace
+// refused as not one path segment returns false with nothing read at all,
+// so an empty slice is only a quiet window when the caller knows the lists
+// were read (issue #300).
 //
 // Cluster-wide reconciles are worthless: a routine sync of the whole repo
 // transitions every resource at once, so a healthy-reconcile listing turns
@@ -136,6 +137,31 @@ func (k *kube) fluxActivity(ctx context.Context, namespace string, since time.Ti
 		"/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",
 	}
 	if namespace != "" {
+		if !fluxPathSegment(namespace) {
+			// The namespace is interpolated into the request path, so a
+			// value that is not one path segment must never be sent: the
+			// request would address a different namespace than the one
+			// the alert names. Refusing it yields inspected=false, which
+			// is what makes the digest say the Flux state is unavailable
+			// instead of asserting the false quiet-window negative "no
+			// Flux reconciles or failures in the window" (report.go). A
+			// window that was never read was never established, and a
+			// wrong confident sentence is worse than a vague one (issue
+			// #300).
+			//
+			// The value arriving here is already percent-escaped by the
+			// caller: enrich.go escapes the namespace with
+			// url.PathEscape before calling. The escape turns '/' into
+			// '%2F' and leaves '.' alone, so a hostile namespace arrives
+			// as e.g. "ns%2F..%2F..%2Fother" and the segment check
+			// refuses it on '%' and on "..". A value that survives the
+			// check is one path segment, whether or not it names a
+			// namespace that exists, and no legitimate namespace is
+			// refused: a Kubernetes namespace is a DNS-1123 label, so
+			// lowercase alphanumeric and '-' only.
+			logf("enrich: flux namespace is not a valid path segment; skipping the Flux list read")
+			return nil, false
+		}
 		apis = []string{
 			"/apis/helm.toolkit.fluxcd.io/v2/namespaces/" + namespace + "/helmreleases",
 			"/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/" + namespace + "/kustomizations",
@@ -191,6 +217,16 @@ func shortRev(rev string) string {
 	return truncate(rev, 24)
 }
 
+// argoInstanceRefusal is the fixed marker resolveRepoPaths returns when a
+// pod's argocd.argoproj.io/instance value is refused as not one path
+// segment. It names the refused field and the reason and never repeats the
+// value: the annotation is workload-authored text, and issue #308
+// established that a refused value must not reach the digest. The renderer
+// prints it alongside RepoPaths so a pod that declares an Argo Application
+// the service would not read does not read as one that declares none
+// (issue #312).
+const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not one path segment (value not shown)"
+
 // resolveRepoPaths walks the pods already gathered and, for each, looks up
 // the GitOps tool that owns it. Flux-managed pods carry
 // kustomize.toolkit.fluxcd.io/name+namespace pointing at a Kustomization;
@@ -201,9 +237,25 @@ func shortRev(rev string) string {
 // the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
 // de-duplicated; unresolved entries are dropped silently so a missing
 // mapping degrades to today's prose rather than to a fabricated path.
-func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) []string {
+// The one exception is a refused Argo instance: the pod does declare an
+// owner, the service just would not read it, so that refusal is not
+// silence — it comes back in the second result as a fixed marker naming
+// the field, never the refused value (issue #312).
+func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config) ([]string, []string) {
 	seen := map[string]bool{}
 	var out []string
+	// Refusal markers are de-duplicated by their fixed text, the same way
+	// paths are: a ten-replica deployment with one hostile annotation is
+	// one line in the digest, not ten.
+	seenRefusal := map[string]bool{}
+	var refusals []string
+	refuse := func(marker string) {
+		if seenRefusal[marker] {
+			return
+		}
+		seenRefusal[marker] = true
+		refusals = append(refusals, marker)
+	}
 	add := func(repo, path string) {
 		repo = strings.TrimRight(repo, "/")
 		path = strings.TrimLeft(path, "/")
@@ -280,6 +332,19 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 			}
 		}
 		if app := p.Annotations["argocd.argoproj.io/instance"]; app != "" {
+			if !fluxPathSegment(app) {
+				// The same segment check argocdPath applies at the sender,
+				// applied here so the refusal is visible: argocdPath can
+				// only report "no path", which is also what a pod with no
+				// Application at all yields. A refused value must record
+				// its own marker (issue #312). The logged message is
+				// fixed — the value is author-controlled text and stays
+				// out of the logs for the same reason it stays out of the
+				// digest.
+				logf("enrich: argo application instance is not a valid path segment; skipping the Argo Application lookup")
+				refuse(argoInstanceRefusal)
+				continue
+			}
 			if repo, path, ok := k.argocdPath(ctx, app); ok {
 				add(repo, path)
 				continue
@@ -289,7 +354,7 @@ func (k *kube) resolveRepoPaths(ctx context.Context, pods []podRef, cfg *Config)
 	if len(out) == 0 && cfg.GitOpsRepo != "" {
 		add(cfg.GitOpsRepo, cfg.GitOpsPath)
 	}
-	return out
+	return out, refusals
 }
 
 // resolveKustomizationTopology reads the Flux Kustomization each pod resolved
@@ -484,13 +549,15 @@ func fluxSourceNamespace(spec kustomizationSpec, kustomNS string) string {
 //
 // The allow-list is narrow on purpose: a namespace is a lowercase DNS label
 // and an object name a lowercase DNS subdomain, so nothing outside the
-// lowercase-alphanumeric, '-' and '.' set can occur in one. Refusing the
-// complement rather than searching for the dangerous characters is what
-// makes the check impossible to slip past with an encoded form: '%' would
-// smuggle a separator past a check on the literal characters, and '?' or '#'
-// would end the path at the value instead of being part of it. A leading or
-// trailing separator is refused because no label or subdomain has one, and
-// ".." is refused because two separators in a row is a traversal pair.
+// lowercase-alphanumeric, '-' and '.' set can occur in one. An Argo
+// Application name is also a DNS subdomain, so the same check serves it.
+// Refusing the complement rather than searching for the dangerous
+// characters is what makes the check impossible to slip past with an
+// encoded form: '%' would smuggle a separator past a check on the literal
+// characters, and '?' or '#' would end the path at the value instead of
+// being part of it. A leading or trailing separator is refused because no
+// label or subdomain has one, and ".." is refused because two separators in
+// a row is a traversal pair.
 func fluxPathSegment(v string) bool {
 	if v == "" || len(v) > 253 || strings.Contains(v, "..") {
 		return false
@@ -559,6 +626,19 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, b
 }
 
 func (k *kube) argocdPath(ctx context.Context, instance string) (string, string, bool) {
+	// The instance is interpolated into the Application path, so a value
+	// that is not one path segment must never be sent: the request would
+	// address a different Application than the one the pod declares. An
+	// Argo Application name is a DNS subdomain, so the same segment check
+	// covers it. resolveRepoPaths pre-checks the annotation and records a
+	// refusal marker before calling (issue #312); this guard is what keeps
+	// "never send a refused value" an invariant of the sender itself, not
+	// of one caller. The message is fixed and does not echo the value,
+	// which is author-controlled text that must not reach the digest.
+	if !fluxPathSegment(instance) {
+		logf("enrich: argo application instance is not a valid path segment; skipping the Argo Application lookup")
+		return "", "", false
+	}
 	var app struct {
 		Spec struct {
 			Source struct {
