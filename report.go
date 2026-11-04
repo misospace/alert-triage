@@ -476,14 +476,18 @@ func renderEvidence(r Report) string {
 			default:
 				// Unknown: the lookup did not produce a yes/no answer. The
 				// model still needs to know we tried — silence would read
-				// as "we did not check". The reason is this service's own
-				// sentence and the state it explains is ours, so it stays
-				// outside the fence: fencing it would tell the model to
-				// distrust our own finding. It can carry text from the
-				// cluster object or from the API, so it is flattened: it
-				// must not be able to forge a line or a closing marker.
-				// Issue #320 records why it may stay outside.
-				fmt.Fprintf(&b, "- relevance unknown: %s\n", untrusted(rel.Reason))
+				// as "we did not check". The state line stays outside the
+				// fence: it is this service's own finding. The reason is
+				// this service's sentence, but its producers interpolate
+				// external text — the Flux revision (classifyCommit), API
+				// error strings carrying the source name — so the value
+				// renders inside the fence under its own label, like every
+				// other quoted value here. Flattening alone was not enough:
+				// a single-line value survives untrusted() verbatim and
+				// outside the fence reads as a first-hand finding (issue
+				// #320, review round at bea0734).
+				b.WriteString("- relevance unknown:\n")
+				writeQuotedValue(&b, "reason", rel.Reason)
 			}
 		}
 	}
@@ -760,8 +764,9 @@ func writeUntrustedFinding(b *strings.Builder, title string, items []string, whe
 	b.WriteString(untrustedEnd + "\n")
 }
 
-// writeQuotedValue renders one value quoted from a cluster object under its
-// own label, inside the untrusted fence. The label is this service's word and
+// writeQuotedValue renders one value quoted from outside this service — a
+// cluster object's field, or an API error carrying object text — under its own
+// label, inside the untrusted fence. The label is this service's word and
 // stays outside; the value is external text, so it must land between the
 // markers rather than merely pass through untrusted(): a single-line value
 // survives untrusted() verbatim, and outside the fence the prompt reads it as
