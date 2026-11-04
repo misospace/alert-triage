@@ -204,20 +204,20 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	byNS := targetPodsByNamespace(targetPods)
 	skippedRefused := false
 
-	for _, raw := range g.Namespaces {
+	for _, namespace := range g.Namespaces {
 		// The namespace is alert-supplied text. The query quotes it, so the
 		// blast radius here is a lookup under a wrong key rather than an
 		// apiserver path traversal, but #311's rule covers this read too: a
-		// refused namespace sends no request for its scope, including the
-		// namespace-wide fallback (#331). A whitespace-only entry stays the
-		// silent skip it always was; it names no namespace to refuse.
-		if !fluxPathSegment(raw) {
-			if strings.TrimSpace(raw) != "" {
-				skippedRefused = true
-			}
+		// namespace that is not one path segment sends no request for its
+		// scope, including the namespace-wide fallback (#331). The check is
+		// the same one that gates the apiserver reads (Enrich's refusedNS),
+		// so no surface can call a refused scope empty while another calls
+		// it uninspected. A value that passes is a DNS-1123 label: the old
+		// TrimSpace was a no-op for everything still queried.
+		if !fluxPathSegment(namespace) {
+			skippedRefused = true
 			continue
 		}
-		namespace := raw
 		var pods []string
 		if len(byNS) > 0 {
 			pods = byNS[namespace]

@@ -498,6 +498,16 @@ func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
 			targetPods:  map[string]bool{hostile + "/p1": true},
 			wantQueries: nil,
 		},
+		{
+			// A whitespace-only entry names no namespace. Enrich's
+			// refusal rule (the one that gates the apiserver reads)
+			// treats it as refused, so the backend must state the same
+			// gap rather than render it as an empty scope.
+			name:        "whitespace-only namespace is refused, not silently empty",
+			namespaces:  []string{" "},
+			targetPods:  map[string]bool{},
+			wantQueries: nil,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

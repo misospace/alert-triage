@@ -3295,6 +3295,51 @@ func TestEnrichPartialRefusalQueriesOnlyInspectedNamespaces(t *testing.T) {
 	}
 }
 
+// TestEnrichRefusedSiblingWithSurvivingSubjectKeepsQueryScoped pins the
+// subject-scoped shape of the same gap: a resolved subject in an inspected
+// namespace keeps the query pod-scoped, the refused sibling is never queried,
+// and a query that returns nothing must state the gap even though a subject
+// was scoped. The wording is checked at the render level; here the state must
+// be the one that selects it.
+func TestEnrichRefusedSiblingWithSurvivingSubjectKeepsQueryScoped(t *testing.T) {
+	const hostile = "ns/../../other"
+	var mu sync.Mutex
+	var lokiQueries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(req.URL.Path, "/loki/") {
+			mu.Lock()
+			lokiQueries = append(lokiQueries, req.URL.Query().Get("query"))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{"ns-ok", hostile},
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{
+			"alertname": "KubePodNotReady", "namespace": "ns-ok", "pod": "p1",
+		}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lokiQueries) != 1 || lokiQueries[0] != `{namespace="ns-ok",pod="p1"}` {
+		t.Errorf("the query must stay pod-scoped to the surviving subject, got %v", lokiQueries)
+	}
+	if !en.BackendScoped {
+		t.Errorf("a surviving subject keeps the query subject-scoped")
+	}
+	if en.BackendState != "refused" {
+		t.Errorf("a refused sibling with no lines back must state the gap, got %q", en.BackendState)
+	}
+}
+
 // A namespace that is one path segment but whose pod list read fails leaves
 // the namespace uninspected, so the scan is incomplete exactly as it is for a
 // refused namespace: the empty context sections must not read as a healthy
