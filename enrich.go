@@ -624,6 +624,15 @@ type Enrichment struct {
 	// carry annotations for. Entries are "repoURL + path/to/dir". Empty when
 	// nothing resolves; the prose must degrade gracefully in that case.
 	RepoPaths []string
+	// RepoPathRefusals carries the fixed markers of GitOps owner references
+	// resolveRepoPaths refused to look up — currently only a refused
+	// argocd.argoproj.io/instance. A pod whose reference was refused does
+	// declare a GitOps owner the service would not read, and that must not
+	// read as a pod that declares none, so the digest states it. Marker
+	// text is constant and names the refused field, never the refused
+	// value, which is author-controlled annotation text (issue #308); it
+	// renders with RepoPaths as the service's own finding (issue #312).
+	RepoPathRefusals []string
 	// KustomizationTopology is the composition evidence for the Flux
 	// Kustomizations those pods resolved to: one compact record per
 	// Kustomization carrying its name, source, spec.path, the
@@ -1223,7 +1232,7 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.Ownership = append(e.Ownership, entry+" -> Job/"+jkey+tail)
 		}
 	}
-	e.RepoPaths = k.resolveRepoPaths(ctx, seenPods, cfg)
+	e.RepoPaths, e.RepoPathRefusals = k.resolveRepoPaths(ctx, seenPods, cfg)
 	e.KustomizationTopology = k.resolveKustomizationTopology(ctx, seenPods)
 	if gh != nil {
 		e.CommitRelevance = k.resolveCommitRelevance(ctx, gh, seenPods)
