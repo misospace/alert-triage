@@ -1393,6 +1393,11 @@ func TestEnrichScopesResolvedJobAndOwnedPodEvents(t *testing.T) {
 	if !en.EventsScoped {
 		t.Fatal("resolved job should scope events")
 	}
+	// The events read succeeded, so the subject-events negative is earned
+	// when Events comes back empty (issue #333).
+	if !en.EventsInspected {
+		t.Errorf("EventsInspected must be true when the namespace events read succeeded")
+	}
 	if eventHits != 1 {
 		t.Fatalf("expected one event fetch for the namespace, got %d", eventHits)
 	}
@@ -1410,7 +1415,7 @@ func TestEnrichScopesResolvedJobAndOwnedPodEvents(t *testing.T) {
 }
 
 func TestRenderScopedEventNegative(t *testing.T) {
-	got := renderEvidence(Report{Enrichment: Enrichment{EventsScoped: true}})
+	got := renderEvidence(Report{Enrichment: Enrichment{EventsScoped: true, EventsInspected: true}})
 	if !strings.Contains(got, "no warning events on the resolved subject in the window") {
 		t.Fatalf("missing scoped event negative: %s", got)
 	}
@@ -3398,6 +3403,54 @@ func TestEnrichFailedNamespacePodReadLeavesScanIncomplete(t *testing.T) {
 	}
 	if !strings.Contains(out, "namespace state unavailable or incomplete") {
 		t.Errorf("expected the incomplete-scan statement in:\n%s", out)
+	}
+	// The ownership chains are built from the pods the listing returns, so
+	// a failed pod read leaves nothing inspected for them either: the clean
+	// negative must not render (issue #333).
+	if strings.Contains(out, "no ownership chains recorded") {
+		t.Errorf("a failed namespace pod read must not render the ownership negative:\n%s", out)
+	}
+	if !strings.Contains(out, "ownership state unavailable or incomplete") {
+		t.Errorf("expected the ownership gap statement in:\n%s", out)
+	}
+}
+
+// A namespace whose warning-events read fails leaves Events empty exactly as
+// a quiet window would, so the renderer must state the gap instead of
+// claiming the resolved subject had no warning events (issue #333).
+func TestEnrichFailedNamespaceEventsReadLeavesSubjectEventsUninspected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/events"):
+			http.Error(w, `{"message":"events is forbidden"}`, http.StatusInternalServerError)
+		case strings.HasSuffix(req.URL.Path, "/pods"):
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p1","namespace":"ns1"},"status":{"phase":"Running","containerStatuses":[{"name":"app","ready":true,"state":{"running":{}}}]}}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client()}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1", "pod": "p1"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if !en.EventsScoped {
+		t.Fatal("the alert names a pod, so a subject must be resolved")
+	}
+	if en.EventsInspected {
+		t.Errorf("EventsInspected must be false when the namespace events read failed")
+	}
+	out := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(out, "no warning events on the resolved subject") {
+		t.Errorf("a failed events read must not render the subject-events negative:\n%s", out)
+	}
+	if !strings.Contains(out, "subject warning events unavailable") {
+		t.Errorf("expected the unread-events statement in:\n%s", out)
 	}
 }
 
