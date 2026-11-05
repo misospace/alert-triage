@@ -199,16 +199,12 @@ func labelsFor(r Report) []string {
 	return out
 }
 
+// severityLabel normalises a severity for use as a label value. Every value
+// passes through unchanged apart from case and surrounding space: whether a
+// name is one of the severity labels this service manages is
+// isSeverityLabel's judgement, not this one's.
 func severityLabel(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	switch s {
-	case "critical", "warning", "info":
-		return s
-	}
-	if s == "" {
-		return ""
-	}
-	return s
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // isSeverityLabel reports whether name is one of the severity labels this
@@ -1158,12 +1154,10 @@ func classifyCommit(ctx context.Context, gh *gitHubClient, repoURL, revision, wo
 	}
 	matches := pathIntersects(out.WorkloadPath, out.ComponentPaths, files)
 	out.MatchingPaths = matches
+	out.State = commitRelevanceDoesNotTouch
 	if len(matches) > 0 {
 		out.State = commitRelevanceTouches
-		out.CommitMessage = gh.fetchCommitMessage(ctx, ownerRepo, sha)
-		return out
 	}
-	out.State = commitRelevanceDoesNotTouch
 	out.CommitMessage = gh.fetchCommitMessage(ctx, ownerRepo, sha)
 	return out
 }

@@ -251,7 +251,6 @@ func TestQueryVictoriaLogsOverHTTP(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "victorialogs",
 		limit:  50,
 		hc:     srv.Client(),
@@ -327,7 +326,6 @@ func TestQueryLokiStatusError(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -352,7 +350,6 @@ func TestFetchBackendLogsDedup(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -394,7 +391,6 @@ func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -445,7 +441,6 @@ func TestFetchBackendLogsTargetDedup(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -521,7 +516,6 @@ func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
 
 			b := &logsBackend{
 				url:    srv.URL,
-				base:   srv.URL,
 				flavor: "loki",
 				limit:  50,
 				hc:     srv.Client(),
@@ -565,7 +559,6 @@ func TestFetchBackendLogsNoSubjectIsAmbient(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -609,7 +602,6 @@ func TestFetchBackendLogsLokiSelectors(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -696,7 +688,6 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -739,7 +730,6 @@ func TestFetchBackendLogsConvenienceWrapper(t *testing.T) {
 	t.Cleanup(srv.Close)
 	b := &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
