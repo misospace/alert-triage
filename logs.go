@@ -124,6 +124,12 @@ type backendLog struct {
 type backendLogResult struct {
 	Primary []string
 	Ambient []string
+	// SkippedRefused records that at least one namespace the group names was
+	// refused as not one path segment and was never queried. The caller must
+	// not render an empty result as "the backend has no lines for the
+	// namespace": a refused scope is uninspected, not empty (issue #311
+	// review, #331).
+	SkippedRefused bool
 }
 
 // ambientLogMarker prefixes namespace-wide backend-log lines returned when no
@@ -196,10 +202,20 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	// controllers) and drown the primary evidence in plausible but causally
 	// irrelevant text. It is issued only when no subject could be resolved.
 	byNS := targetPodsByNamespace(targetPods)
+	skippedRefused := false
 
 	for _, namespace := range g.Namespaces {
-		namespace = strings.TrimSpace(namespace)
-		if namespace == "" {
+		// The namespace is alert-supplied text. The query quotes it, so the
+		// blast radius here is a lookup under a wrong key rather than an
+		// apiserver path traversal, but #311's rule covers this read too: a
+		// namespace that is not one path segment sends no request for its
+		// scope, including the namespace-wide fallback (#331). The check is
+		// the same one that gates the apiserver reads (Enrich's refusedNS),
+		// so no surface can call a refused scope empty while another calls
+		// it uninspected. A value that passes is a DNS-1123 label: the old
+		// TrimSpace was a no-op for everything still queried.
+		if !fluxPathSegment(namespace) {
+			skippedRefused = true
 			continue
 		}
 		var pods []string
@@ -245,9 +261,9 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		for i, line := range collapsed {
 			marked[i] = ambientLogMarker + line
 		}
-		return backendLogResult{Ambient: marked}, nil
+		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused}, nil
 	}
-	return backendLogResult{Primary: collapsed}, nil
+	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused}, nil
 }
 
 // quoteLogValue renders a label value as a double-quoted literal with `"` and

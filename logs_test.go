@@ -466,6 +466,89 @@ func TestFetchBackendLogsTargetDedup(t *testing.T) {
 	}
 }
 
+// TestFetchBackendLogsRefusedNamespaceSendsNoQuery pins #311's rule on the
+// last raw consumer of the alert namespace: a namespace that is not one path
+// segment sends no backend-log request, including the namespace-wide fallback
+// issued when no concrete subject survived. The skip must surface to the
+// caller as SkippedRefused so an empty result cannot render as "the backend
+// has no lines for that namespace" (#331).
+func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
+	const hostile = "ns/../../other"
+	cases := []struct {
+		name        string
+		namespaces  []string
+		targetPods  map[string]bool
+		wantQueries []string
+	}{
+		{
+			name:        "no-subject fallback skips the refused sibling",
+			namespaces:  []string{"ns-ok", hostile},
+			targetPods:  map[string]bool{},
+			wantQueries: []string{`{namespace="ns-ok"}`},
+		},
+		{
+			name:        "every namespace refused sends nothing",
+			namespaces:  []string{hostile, "ns%2Fesc"},
+			targetPods:  map[string]bool{},
+			wantQueries: nil,
+		},
+		{
+			name:        "concrete target in a refused namespace sends nothing",
+			namespaces:  []string{hostile},
+			targetPods:  map[string]bool{hostile + "/p1": true},
+			wantQueries: nil,
+		},
+		{
+			// A whitespace-only entry names no namespace. Enrich's
+			// refusal rule (the one that gates the apiserver reads)
+			// treats it as refused, so the backend must state the same
+			// gap rather than render it as an empty scope.
+			name:        "whitespace-only namespace is refused, not silently empty",
+			namespaces:  []string{" "},
+			targetPods:  map[string]bool{},
+			wantQueries: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				queries = append(queries, r.URL.Query().Get("query"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			}))
+			t.Cleanup(srv.Close)
+
+			b := &logsBackend{
+				url:    srv.URL,
+				base:   srv.URL,
+				flavor: "loki",
+				limit:  50,
+				hc:     srv.Client(),
+			}
+			g := Group{
+				Namespaces: tc.namespaces,
+				Alerts:     []Alert{{Labels: map[string]string{"alertname": "SomeAlert"}}},
+			}
+			res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
+			if err != nil {
+				t.Fatalf("fetchBackendLogsResult: %v", err)
+			}
+			if len(queries) != len(tc.wantQueries) {
+				t.Fatalf("queries = %v, want %v", queries, tc.wantQueries)
+			}
+			for i, q := range queries {
+				if q != tc.wantQueries[i] {
+					t.Errorf("query %d = %q, want %q", i, q, tc.wantQueries[i])
+				}
+			}
+			if !res.SkippedRefused {
+				t.Errorf("SkippedRefused must be set when a namespace was refused")
+			}
+		})
+	}
+}
+
 // TestFetchBackendLogsNoSubjectIsAmbient verifies the fallback: with no
 // concrete subject the namespace-wide lookup still runs, but its result is
 // explicitly marked ambient and never placed in the primary evidence.

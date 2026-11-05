@@ -710,6 +710,36 @@ func TestAmbientBackendStateDoesNotClaimNoLines(t *testing.T) {
 	}
 }
 
+// TestRefusedBackendStateNamesTheGap pins the rendering of the "refused"
+// backend state (#311 review, #331): a namespace refused as not one path
+// segment was never queried, so neither surface may reuse the "returned no
+// lines for the namespace" negative, which would present an uninspected
+// scope as an empty one. The wording is fixed and names no value.
+func TestRefusedBackendStateNamesTheGap(t *testing.T) {
+	g := Group{
+		Key:        "sig-refused-backend",
+		Namespaces: []string{"ns/../../other"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns/../../other"}}},
+	}
+	en := Enrichment{BackendState: "refused"}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "refused as not one path segment") || !strings.Contains(model, "were not queried") {
+		t.Errorf("model prompt must state the refused scope was not queried:\n%s", model)
+	}
+	if strings.Contains(model, "returned no lines for the namespace") {
+		t.Errorf("model prompt must not reuse the empty-namespace negative:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "refused as not one path segment") {
+		t.Errorf("discord must state the refused scope was not queried:\n%s", discord)
+	}
+	if strings.Contains(discord, "returned no lines for this window") {
+		t.Errorf("discord must not reuse the empty negative:\n%s", discord)
+	}
+}
+
 func TestParseTriageTolerance(t *testing.T) {
 	want := `{"narrative":"n","fix_location":"git","what_to_change":"w","confidence":"high"}`
 	for name, raw := range map[string]string{

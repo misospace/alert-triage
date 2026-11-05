@@ -1664,7 +1664,7 @@ func TestRenderEvidencePodIDNegatives(t *testing.T) {
 			Namespaces: []string{"ns1"},
 			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
 		},
-		Enrichment: Enrichment{SubjectPodObserved: true},
+		Enrichment: Enrichment{SubjectPodObserved: true, PodScanInspected: true},
 	}
 	got := renderEvidence(rpt)
 	for _, want := range []string{
@@ -1673,6 +1673,87 @@ func TestRenderEvidencePodIDNegatives(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected explicit negative %q in:\n%s", want, got)
+		}
+	}
+}
+
+// A refused namespace leaves the namespace scan incomplete, so the
+// namespace-wide context sections must state the gap instead of the "none"
+// negatives a completed scan earns (issue #311). The scope line names the
+// cause; the sections state the gap, because a section that named a cause it
+// did not observe would be a confident sentence with nothing behind it.
+func TestRenderEvidenceRefusedNamespaceNotInspected(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "single/A",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
+		},
+		Enrichment: Enrichment{
+			SubjectPodObserved: true,
+			Scope:              "the alert's own namespaces, plus cluster node health; a namespace that is not one path segment was refused, so its pods, events and Flux state were not inspected",
+		},
+	}
+	got := renderEvidence(rpt)
+	for _, banned := range []string{
+		"no other unhealthy pods in the namespace",
+		"no other terminated containers in the namespace",
+		"no other terminated containers left a message",
+		"no other pod in the namespace mounts a claim",
+		// The scope line names the refusal. The section must not name it
+		// again: a cause statement belongs to the scope, which knows what
+		// was refused, and the section only knows that the scan is
+		// incomplete.
+		"was refused as not one path segment",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("an incomplete namespace scan must not render the negative %q:\n%s", banned, got)
+		}
+	}
+	for _, want := range []string{
+		"namespace state unavailable or incomplete",
+		"not one path segment",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected the not-inspected statement %q in:\n%s", want, got)
+		}
+	}
+}
+
+// A namespace whose pod read failed leaves the scan incomplete too, and the
+// statement must not name a cause that did not happen: nothing refused that
+// namespace, so the refusal wording would be a claim about a decision this
+// service never made (issue #311 review).
+func TestRenderEvidenceFailedNamespacePodReadNotInspected(t *testing.T) {
+	rpt := Report{
+		Group: Group{
+			Key:        "single/A",
+			Namespaces: []string{"ns1"},
+			Alerts:     []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}},
+		},
+		Enrichment: Enrichment{
+			SubjectPodObserved: true,
+			Scope:              "the alert's own namespaces, plus cluster node health; a namespace pod read did not succeed, so its pods were not inspected",
+		},
+	}
+	got := renderEvidence(rpt)
+	for _, banned := range []string{
+		"no other unhealthy pods in the namespace",
+		"no other terminated containers in the namespace",
+		"no other terminated containers left a message",
+		"no other pod in the namespace mounts a claim",
+		"was refused as not one path segment",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("a failed namespace pod read must not render %q:\n%s", banned, got)
+		}
+	}
+	for _, want := range []string{
+		"namespace state unavailable or incomplete",
+		"a namespace pod read did not succeed",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected the not-inspected statement %q in:\n%s", want, got)
 		}
 	}
 }
