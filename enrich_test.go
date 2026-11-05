@@ -1450,7 +1450,6 @@ func newLogsBackendForTest(t *testing.T, srv *httptest.Server) *logsBackend {
 	t.Helper()
 	return &logsBackend{
 		url:    srv.URL,
-		base:   srv.URL,
 		flavor: "loki",
 		limit:  50,
 		hc:     srv.Client(),
@@ -2922,7 +2921,7 @@ func backupJobFixture(t *testing.T) (Enrichment, string) {
 	t.Cleanup(logsSrv.Close)
 
 	k := &kube{base: srv.URL, token: "tok", hc: srv.Client(),
-		logs: &logsBackend{url: logsSrv.URL, base: logsSrv.URL, flavor: "victorialogs", limit: 100, hc: logsSrv.Client()}}
+		logs: &logsBackend{url: logsSrv.URL, flavor: "victorialogs", limit: 100, hc: logsSrv.Client()}}
 	g := Group{
 		Key:        "single/KubeJobFailed",
 		Reason:     "single",

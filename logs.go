@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -28,7 +29,6 @@ const defaultLogLimit = 50
 // SIGTERM drain, and from the client's own timeout.
 type logsBackend struct {
 	url    string
-	base   string
 	flavor string
 	limit  int
 	hc     *http.Client
@@ -60,7 +60,6 @@ func newLogsBackend() *logsBackend {
 	base := strings.TrimRight(rawURL, "/")
 	logs := &logsBackend{
 		url:    base,
-		base:   base,
 		flavor: flavor,
 		limit:  limit,
 	}
@@ -348,7 +347,7 @@ func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, e
 
 func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
-	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
