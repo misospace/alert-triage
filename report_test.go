@@ -1245,15 +1245,49 @@ func TestCommitMessageInsideUntrustedFence(t *testing.T) {
 }
 
 // The empty chain renders as an explicit negative finding and is never fenced:
-// it is this service's own sentence, not a quote.
+// it is this service's own sentence, not a quote. The negative is earned by a
+// completed inspection — an enrichment that inspected nothing must state the
+// gap instead (issue #333).
 func TestEmptyOwnershipNotFenced(t *testing.T) {
 	rpt := Report{
 		Group:      Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "A"}}}},
-		Enrichment: Enrichment{Ownership: nil},
+		Enrichment: Enrichment{Ownership: nil, PodScanInspected: true},
 	}
 	got := renderEvidence(rpt)
 	if !strings.Contains(got, "Ownership chains: no ownership chains recorded") {
 		t.Errorf("missing explicit negative for ownership:\n%s", got)
+	}
+}
+
+// An enrichment that inspected nothing — a missing client, a foreign cluster,
+// a refused namespace, a failed pod read, or an alert that names no namespace
+// — leaves Ownership empty without any object having been read, so the
+// ownership section must state the gap instead of claiming the inspected
+// objects carried no ownerReferences (issue #333).
+func TestRenderEvidenceInspectedNothingStatesOwnershipGap(t *testing.T) {
+	// A missing client inspects nothing at all; with no namespace named,
+	// there was no namespace scope either.
+	got := renderEvidence(Report{
+		Group:      Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "A"}}}},
+		Enrichment: Enrichment{Scope: "cluster state unavailable"},
+	})
+	if strings.Contains(got, "no ownership chains recorded") {
+		t.Errorf("an enrichment that inspected nothing must not render the ownership negative:\n%s", got)
+	}
+	if !strings.Contains(got, "the alert names no namespace, so no ownership state was read") {
+		t.Errorf("expected the no-namespace ownership statement in:\n%s", got)
+	}
+
+	// A foreign cluster leaves the namespace scopes named but unread.
+	got = renderEvidence(Report{
+		Group:      Group{Key: "single/A", Namespaces: []string{"ns1"}, Alerts: []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}}},
+		Enrichment: Enrichment{Scope: `cluster state unavailable (this client serves cluster "c1"; the alert names a different cluster)`},
+	})
+	if strings.Contains(got, "no ownership chains recorded") {
+		t.Errorf("a foreign-cluster skip must not render the ownership negative:\n%s", got)
+	}
+	if !strings.Contains(got, "ownership state unavailable or incomplete") {
+		t.Errorf("expected the ownership gap statement in:\n%s", got)
 	}
 }
 
@@ -1467,7 +1501,7 @@ func TestBackendLogsScopedToDirectTier(t *testing.T) {
 func TestExplicitNegativesKeepTheirScopeAcrossTiers(t *testing.T) {
 	got := renderEvidence(Report{
 		Group:      Group{Key: "single/A", Alerts: []Alert{{Labels: map[string]string{"alertname": "A", "namespace": "ns1"}}}},
-		Enrichment: Enrichment{Scope: "namespaces ns1 plus cluster node health", EventsScoped: true, NodesInspected: true},
+		Enrichment: Enrichment{Scope: "namespaces ns1 plus cluster node health", EventsScoped: true, EventsInspected: true, NodesInspected: true},
 	})
 	directIdx := strings.Index(got, "DIRECT SUBJECT EVIDENCE")
 	contextIdx := strings.Index(got, "CONTEXT / BACKGROUND")

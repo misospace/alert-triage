@@ -552,6 +552,13 @@ type Enrichment struct {
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
 	EventsScoped bool
+	// EventsInspected records whether the namespace warning-events read
+	// succeeded for every namespace the alert names that was not refused.
+	// A failed read leaves Events empty exactly as a quiet window does, so
+	// the renderer may emit the "no warning events on the resolved subject"
+	// negative only when this flag holds (issue #333) — the same rule
+	// NodesInspected holds for the node list (issue #294).
+	EventsInspected bool
 	// FluxActivity lists recent transitions of Flux resources in the alert's
 	// namespace. A Ready transition only proves the resource synced its source
 	// to a revision; it does not show what changed in that revision, so the
@@ -930,6 +937,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// podReadFailed records that a namespace's pod read did not succeed, so
 	// the scope can name the gap the refusal alone would not explain.
 	podReadFailed := false
+	// The subject-events negative is meaningful only when the namespace
+	// events read succeeded: a failed read leaves Events empty exactly as a
+	// quiet window does (issue #333). A refused namespace sends no events
+	// read for its scope, and its subjects are excluded from the resolved
+	// graph below, so a refusal does not clear the flag.
+	eventsInspected := true
 
 	if len(g.Namespaces) == 0 {
 		// Nothing namespace-scoped to inspect, so widen to the whole cluster
@@ -1222,6 +1235,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.Ambient = append(e.Ambient, aggregateEvents(items, since, func(subject subjectKey) bool {
 				return !resolvedSubjects[subject]
 			})...)
+		} else {
+			// The events were never read, so the empty Events slice must
+			// not read as a quiet window on the subject (issue #333).
+			eventsInspected = false
 		}
 		acts, inspected := k.fluxActivity(ctx, esc, since)
 		e.FluxActivity = append(e.FluxActivity, acts...)
@@ -1231,6 +1248,10 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 	// The scan completed only if every namespace the alert names was read
 	// successfully; the renderer gates the namespace-wide negatives on it.
 	e.PodScanInspected = podScanInspected
+	// The renderer gates the subject-events negative on this: only a read
+	// that succeeded may claim the resolved subject had no warning events
+	// (issue #333).
+	e.EventsInspected = eventsInspected
 	if podReadFailed {
 		// Name the gap the scope statement does not already explain: the
 		// namespace was not refused, its read simply failed, and the digest

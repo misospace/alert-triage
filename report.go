@@ -610,9 +610,17 @@ func renderEvidence(r Report) string {
 	// so they carry the same trust as alert text even though the API served them.
 	// Only a resolved subject graph makes these subject-scoped; without one the
 	// events were routed to Ambient and a subject-scoped negative would claim an
-	// inspection that never happened.
+	// inspection that never happened. And only a successful namespace events
+	// read makes the empty list a finding: a failed read leaves Events empty
+	// exactly as a quiet window does, so the clean negative may render only
+	// when EventsInspected holds (issue #333) — the same rule NodesInspected
+	// holds for the node list (#294).
 	if r.Enrichment.EventsScoped {
-		writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, "no warning events on the resolved subject in the window")
+		eventsNone := "subject warning events unavailable - the namespace events read did not succeed, so missing findings cannot rule subject events in or out"
+		if r.Enrichment.EventsInspected {
+			eventsNone = "no warning events on the resolved subject in the window"
+		}
+		writeUntrustedFinding(&b, "Recent warning events on the subject", r.Enrichment.Events, eventsNone)
 	} else {
 		b.WriteString("\nNo resolved alert subject, so no subject-scoped events were queried; namespace events are shown in the context tier.\n")
 	}
@@ -620,8 +628,22 @@ func renderEvidence(r Report) string {
 	// metadata (ownerReferences and labels are workload-authored), so they
 	// render inside the fence: a forged controller name must read as a
 	// claim about the object, not as a fact this service established.
-	writeUntrustedFinding(&b, "Ownership chains", r.Enrichment.Ownership,
-		"no ownership chains recorded (no ownerReferences on the inspected objects)")
+	// The chains are built from the jobs the alerts named and the pods the
+	// namespace listings returned, so the negative is earned only when
+	// those objects were actually inspected: a missing client, a foreign
+	// cluster, a refused namespace, a failed pod read and an alert that
+	// names no namespace all leave Ownership empty with nothing read.
+	// PodScanInspected is the record of exactly that inspection (issue
+	// #311), so the clean negative may render only when it holds (issue
+	// #333).
+	namespaced := len(r.Group.Namespaces) > 0
+	ownershipNone := "ownership state unavailable or incomplete - one or more required namespace pod lists were not read successfully, so ownership chains cannot be recorded"
+	if r.Enrichment.PodScanInspected {
+		ownershipNone = "no ownership chains recorded (no ownerReferences on the inspected objects)"
+	} else if !namespaced {
+		ownershipNone = "the alert names no namespace, so no ownership state was read"
+	}
+	writeUntrustedFinding(&b, "Ownership chains", r.Enrichment.Ownership, ownershipNone)
 
 	// Metrics evidence from the Prometheus-compatible backend. Label values are
 	// workload-authored and belong inside the untrusted fence.
@@ -639,7 +661,6 @@ func renderEvidence(r Report) string {
 	// The namespace sections exist because the alert names a namespace. An
 	// alert that names none has no namespace scope, so the sections say so
 	// instead of reporting on a namespace that does not exist.
-	namespaced := len(r.Group.Namespaces) > 0
 	// A namespace the alert names can be refused before any request is built
 	// (issue #311), and a namespace pod read can fail, leaving the namespace
 	// scan incomplete either way. The namespace-wide negatives must then state
