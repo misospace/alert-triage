@@ -870,53 +870,61 @@ func credentialSuffixBoundary(piece string) (int, int, bool) {
 			if err != nil {
 				continue
 			}
-			for s := 0; s < len(b); s += 3 {
-				j := bytes.IndexByte(b[s:], ':')
-				if j < 0 {
+			// nextBad[i] is the first password-invalid byte
+			// at or after i (or len(b)): the password of a
+			// credential whose colon sits at j runs to
+			// nextBad[j+1]. One reverse pass answers every
+			// colon, so the scan below is one forward pass
+			// over the colons instead of a rescan per group.
+			nextBad := make([]int, len(b)+1)
+			nextBad[len(b)] = len(b)
+			for i := len(b) - 1; i >= 0; i-- {
+				nextBad[i] = nextBad[i+1]
+				if b[i] < 0x20 || b[i] == 0x7f {
+					nextBad[i] = i
+				}
+			}
+			// For each colon in order, the credential it can
+			// head starts at the earliest group-aligned s
+			// whose user part b[s:j] is printable and whose
+			// first colon is j: s must sit past the last
+			// non-printable byte, past the previous colon,
+			// and below j. The first colon that admits
+			// such an s gives this alignment's earliest
+			// start, so the search stops there.
+			lastBad, prevColon := -1, -1
+			for j := 0; j < len(b); j++ {
+				if b[j] < 0x20 || b[j] > 0x7e {
+					lastBad = j
+				}
+				if b[j] != ':' {
+					continue
+				}
+				s := lastBad + 1
+				if prevColon+1 > s {
+					s = prevColon + 1
+				}
+				s = (s + 2) / 3 * 3
+				if s < j {
+					var end int
+					switch k := nextBad[j+1]; k % 3 {
+					case 0:
+						end = k / 3 * 4
+					case 1:
+						end = (k*4 + 2) / 3
+					case 2:
+						end = (k*4 + 1) / 3
+					}
+					start := a + s/3*4
+					end += a
+					if start < end && end <= len(piece) {
+						if bestEnd == 0 || start < bestStart || start == bestStart && end > bestEnd {
+							bestStart, bestEnd = start, end
+						}
+					}
 					break
 				}
-				j += s
-				if j == s {
-					// An empty user part is no credential;
-					// a later colon in the same group
-					// may still head one, so keep
-					// scanning this start.
-					continue
-				}
-				userOK := true
-				for _, c := range b[s:j] {
-					if c < 0x20 || c > 0x7e {
-						userOK = false
-						break
-					}
-				}
-				if !userOK {
-					continue
-				}
-				k := len(b)
-				for p := j + 1; p < len(b); p++ {
-					if b[p] < 0x20 || b[p] == 0x7f {
-						k = p
-						break
-					}
-				}
-				var end int
-				switch k % 3 {
-				case 0:
-					end = k / 3 * 4
-				case 1:
-					end = (k*4 + 2) / 3
-				case 2:
-					end = (k*4 + 1) / 3
-				}
-				start := a + s/3*4
-				end += a
-				if bestStart == 0 && bestEnd == 0 || start < bestStart || start == bestStart && end > bestEnd {
-					if start < end && end <= len(piece) {
-						bestStart, bestEnd = start, end
-					}
-				}
-				break
+				prevColon = j
 			}
 		}
 	}
