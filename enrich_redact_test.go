@@ -932,6 +932,113 @@ func TestStripSecretsBasicAuthCredentialBeforeResidueGone(t *testing.T) {
 	}
 }
 
+// TestStripSecretsBasicAuthCredentialBehindNonDecodingHeadGone pins that
+// a credential embedded in a piece behind a head the gate cannot decode
+// at all loses its payload (issue #267). The piece-level judges only
+// redacted a decodable prefix, so "zz" + credential shipped the
+// credential in plaintext. The suffix scan answers from four alignments
+// — one decode covers every start in an alignment class, so it stays
+// linear — and what is behind the credential is judged too, because
+// the password stops at the first byte that is not password material
+// and a second credential can start there.
+func TestStripSecretsBasicAuthCredentialBehindNonDecodingHeadGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// The issue's mid-piece head: the head's decoded bytes
+		// put a non-printable byte in what would be the user
+		// part, and the suffix decodes to user:pass.
+		{"basic dXNlcjE6cAzzdXNlcjpwYXNz", "basic [REDACTED]zz[REDACTED]"},
+		{"authorization: key=dXNlcjE6cAzzdXNlcjpwYXNz", "authorization: key=[REDACTED]zz[REDACTED]"},
+		// A credential behind two credentials sharing one piece:
+		// the password stops where the leftover bits begin,
+		// and what is behind that cut is judged too.
+		{"basic dXNlcjE6cAzzzZdXNlcjpwYXNz", "basic [REDACTED]zzzZ[REDACTED]"},
+		// The piece judged on its own: the undecodable head
+		// stays readable, only the credential goes.
+		{"authorization: token=zzdXNlcjpwYXNz", "authorization: [REDACTED]"},
+		// Prose pieces stay byte-identical: the gate, not
+		// the shape of the piece, decides.
+		{"basic credentials expire", "basic credentials expire"},
+		{"authorization: key=authentication", "authorization: key=authentication"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	// The judge re-emits the head it refused, so a second pass
+	// must leave the output unchanged.
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	for _, in := range []string{
+		"basic dXNlcjE6cAzzdXNlcjpwYXNz",
+		"authorization: key=dXNlcjE6cAzzdXNlcjpwYXNz",
+		"basic dXNlcjE6cAzzzZdXNlcjpwYXNz",
+		"authorization: token=zzdXNlcjpwYXNz",
+	} {
+		for _, p := range []string{"dXNlcjE6cA", "dXNlcjpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+}
+
+// TestStripSecretsBasicAuthCredentialBehindGluedWordGone pins that the
+// residue behind a mid-run scheme word is judged, not trusted to be
+// prose (issue #267). The residue does not decode whole but starts a
+// decodable prefix — "dXNlcjE6cA" inside
+// "dXNlcjE6cAdXNlcjE6cA" — and nobody re-judged the re-emission, so
+// both credentials behind the word survived in a tail the shared
+// judge emits. The cut before the word now judges the residue the
+// same way it judges its own, through the prefix boundary and,
+// behind the word, down to the pieces.
+func TestStripSecretsBasicAuthCredentialBehindGluedWordGone(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// The issue's behind-the-word shape, through the
+		// scheme pass and its fixed point.
+		{"basic dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA", "basic [REDACTED]basic[REDACTED]"},
+		{"authorization: key=dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA", "authorization: key=[REDACTED]basic[REDACTED]"},
+		// The residue starts with a credential but decodes
+		// to nothing: the suffix scan reaches behind the
+		// word's own undecodable head as well.
+		{"basic dXNlcjE6cAbasiczzdXNlcjpwYXNz", "basic [REDACTED]basiczz[REDACTED]"},
+		// The tail piece judged on its own: the tail the
+		// shared judge emits loses both credentials and
+		// keeps the word as context.
+		{"authorization: token=dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA", "authorization: [REDACTED]"},
+		// Prose behind a word stays byte-identical: the
+		// residue is judged by the gate, not by its shape.
+		{"basic dXNlcjE6cAbasically yours", "basic [REDACTED]basically yours"},
+	}
+	for _, tt := range tests {
+		if got := stripSecrets(tt.in); got != tt.want {
+			t.Errorf("stripSecrets(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+	for _, tt := range tests {
+		once := stripSecrets(tt.in)
+		if twice := stripSecrets(once); twice != once {
+			t.Errorf("stripSecrets(%q) = %q; second pass = %q", tt.in, once, twice)
+		}
+	}
+	for _, in := range []string{
+		"basic dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA",
+		"authorization: key=dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA",
+		"basic dXNlcjE6cAbasiczzdXNlcjpwYXNz",
+		"authorization: token=dXNlcjE6cAbasicdXNlcjE6cAdXNlcjE6cA",
+	} {
+		for _, p := range []string{"dXNlcjE6cA", "dXNlcjpwYXNz"} {
+			if got := stripSecrets(in); strings.Contains(got, p) {
+				t.Errorf("stripSecrets(%q) = %q; payload %q survived", in, got, p)
+			}
+		}
+	}
+}
+
 // TestStripSecretsBasicAuthVetoedTailJudged pins that a match the decode
 // test declines still loses the credentials its captured tail carries
 // (#226). The tail's character class swallows whole credential segments,
