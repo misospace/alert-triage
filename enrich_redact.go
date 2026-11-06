@@ -506,7 +506,15 @@ func segmentHoldsCredential(seg string) bool {
 		decodesToBasicCredential(strings.Trim(seg, "=_-")) {
 		return true
 	}
-	_, ok := credentialRunBoundary(strings.Trim(seg, schemeGlue))
+	trimmed := strings.Trim(seg, schemeGlue)
+	if _, ok := credentialRunBoundary(trimmed); ok {
+		return true
+	}
+	// A credential that starts behind a head the gate cannot
+	// decode at all is credential material just as much
+	// (issue #267): the skip that asks this question must
+	// not see past it.
+	_, _, ok := credentialSuffixBoundary(trimmed)
 	return ok
 }
 
@@ -615,6 +623,23 @@ func judgeSingleSegment(seg string) (string, bool) {
 func cutCredentialBeforeResidue(trimmed string) (string, bool) {
 	i, ok := credentialRunBoundary(trimmed)
 	if !ok {
+		// The head decodes to no credential, but one can start
+		// behind it (issue #267): cut that one and keep the
+		// undecodable head readable — the residue behind
+		// the credential still gets judged, so a second
+		// credential behind the first is not stranded.
+		if start, end, ok := credentialSuffixBoundary(trimmed); ok {
+			rest := trimmed[end:]
+			if rest != "" {
+				if decodesToBasicCredential(rest) || decodesToBasicCredential(strings.Trim(rest, schemeGlue)) {
+					return trimmed[:start] + "[REDACTED]", true
+				}
+				if judged := judgeResiduePieces(rest); judged != rest {
+					return trimmed[:start] + "[REDACTED]" + judged, true
+				}
+			}
+			return trimmed[:start] + "[REDACTED]" + rest, true
+		}
 		return "", false
 	}
 	for _, m := range embeddedSchemeWord.FindAllStringIndex(trimmed, -1) {
@@ -705,7 +730,25 @@ func judgeResiduePiece(piece string) string {
 		return "[REDACTED]"
 	}
 	if i, ok := credentialRunBoundary(piece); ok {
-		return "[REDACTED]" + piece[i:]
+		// The head goes, and what is behind it is judged
+		// rather than trusted to be prose: it can hold a
+		// second credential the head's decode swallowed
+		// into its own bytes (issue #267), and re-emitting
+		// it unjudged strands that credential behind the
+		// redaction's brackets. Each level strictly
+		// shortens the piece, so the recursion converges.
+		return "[REDACTED]" + judgeResiduePieces(piece[i:])
+	}
+	if start, end, ok := credentialSuffixBoundary(piece); ok {
+		// The head does not decode, but a credential starts
+		// behind it (issue #267): the head stays readable
+		// and only the credential goes. What is behind
+		// the credential is judged too — the password
+		// stops at the first byte that is not password
+		// material, and a second credential can start
+		// there — and each level strictly shortens the
+		// piece, so the recursion converges.
+		return piece[:start] + "[REDACTED]" + judgeResiduePieces(piece[end:])
 	}
 	return piece
 }
@@ -782,6 +825,112 @@ func credentialRunBoundary(run string) (int, bool) {
 	return best, best > 0
 }
 
+// credentialSuffixBoundary reports a decodable credential that starts
+// somewhere inside a run whose head decodes to nothing (issue #267): a
+// piece whose head does not decode — the head's decoded bytes put a
+// non-printable byte in what would be the user part — can still end in a
+// credential the piece's suffix decodes to, and redacting only a decodable
+// prefix leaves that credential in plaintext.
+//
+// The scan stays linear. A credential starting at character offset i
+// decodes as its own byte stream only from an alignment a = i mod 4, and
+// four alignments cover every start: from each a, one decode of the
+// clean head answers every start in that class, because base64 groups
+// are independent — the bytes ahead of a start sit in whole groups
+// before it. In the decoded stream a group-aligned start s (s mod 3 == 0)
+// with a colon at j and a printable user part decodes to a user:password
+// pair exactly as credentialRunBoundary tests one, with the password
+// running to the first byte below 0x20 or at 0x7f. Byte offsets map back
+// to characters by the same formula the boundary uses, so start and end
+// are the same kind of cut one level down. The earliest start wins, the
+// longest password breaks the tie, and the gate — not the shape of the
+// piece — still decides: a piece no alignment decodes to a credential
+// stays untouched.
+func credentialSuffixBoundary(piece string) (int, int, bool) {
+	bestStart, bestEnd := 0, 0
+	for _, alph := range credentialAlphabets {
+		for a := 0; a < 4 && a < len(piece); a++ {
+			t := len(piece)
+			for i := a; i < len(piece); i++ {
+				if strings.IndexByte(alph.chars, piece[i]) < 0 {
+					t = i
+					break
+				}
+			}
+			if (t-a)%4 == 1 {
+				// Same wasted-character rule as the boundary: a
+				// head whose length is 1 mod 4 ends on a
+				// character no decode can use.
+				t--
+			}
+			if t-a <= 0 {
+				continue
+			}
+			b, err := alph.decode.DecodeString(piece[a:t])
+			if err != nil {
+				continue
+			}
+			// nextBad[i] is the first password-invalid byte
+			// at or after i (or len(b)): the password of a
+			// credential whose colon sits at j runs to
+			// nextBad[j+1]. One reverse pass answers every
+			// colon, so the scan below is one forward pass
+			// over the colons instead of a rescan per group.
+			nextBad := make([]int, len(b)+1)
+			nextBad[len(b)] = len(b)
+			for i := len(b) - 1; i >= 0; i-- {
+				nextBad[i] = nextBad[i+1]
+				if b[i] < 0x20 || b[i] == 0x7f {
+					nextBad[i] = i
+				}
+			}
+			// For each colon in order, the credential it can
+			// head starts at the earliest group-aligned s
+			// whose user part b[s:j] is printable and whose
+			// first colon is j: s must sit past the last
+			// non-printable byte, past the previous colon,
+			// and below j. The first colon that admits
+			// such an s gives this alignment's earliest
+			// start, so the search stops there.
+			lastBad, prevColon := -1, -1
+			for j := 0; j < len(b); j++ {
+				if b[j] < 0x20 || b[j] > 0x7e {
+					lastBad = j
+				}
+				if b[j] != ':' {
+					continue
+				}
+				s := lastBad + 1
+				if prevColon+1 > s {
+					s = prevColon + 1
+				}
+				s = (s + 2) / 3 * 3
+				if s < j {
+					var end int
+					switch k := nextBad[j+1]; k % 3 {
+					case 0:
+						end = k / 3 * 4
+					case 1:
+						end = (k*4 + 2) / 3
+					case 2:
+						end = (k*4 + 1) / 3
+					}
+					start := a + s/3*4
+					end += a
+					if start < end && end <= len(piece) {
+						if bestEnd == 0 || start < bestStart || start == bestStart && end > bestEnd {
+							bestStart, bestEnd = start, end
+						}
+					}
+					break
+				}
+				prevColon = j
+			}
+		}
+	}
+	return bestStart, bestEnd, bestEnd > bestStart
+}
+
 // cutCredentialBeforeProse redacts the credential that sits in front of a
 // scheme word the prose continues. A scheme word glued inside a run is a
 // scheme word only when the prose does not follow it: "dXVpZDpwYXNzbasic"
@@ -815,6 +964,19 @@ func cutCredentialBeforeProse(seg string) (string, bool) {
 		rest := strings.TrimLeft(seg[m[1]:], schemeGlue)
 		if rest != "" && decodesToBasicCredential(rest) {
 			continue
+		}
+		if rest != "" {
+			// The residue behind the word is judged, not
+			// trusted to be prose: it can start with a
+			// credential the whole-run decode cannot see
+			// (issue #267), and re-emitting it unjudged
+			// strands that credential behind the
+			// redaction's brackets, where no later pass
+			// can read it back.
+			if cut, ok := cutCredentialBeforeResidue(rest); ok {
+				glue := seg[m[1] : len(seg)-len(rest)]
+				return "[REDACTED]" + seg[m[0]:m[1]] + glue + cut, true
+			}
 		}
 		return "[REDACTED]" + seg[m[0]:], true
 	}
@@ -877,8 +1039,21 @@ func judgeTail(tail string) string {
 			// credential the gate cannot separate from the prose behind
 			// it (#263) — the same shape one piece down. The head goes
 			// and the prose behind it stays, the same cut the segment
-			// judge answers for.
-			out.WriteString("[REDACTED]" + tail[i+n:end])
+			// judge answers for. What is behind the head is judged
+			// rather than trusted to be prose: it can hold a second
+			// credential the head's decode swallowed into its own
+			// bytes (issue #267), and re-emitting it unjudged strands
+			// that credential behind the redaction's brackets.
+			out.WriteString("[REDACTED]" + judgeResiduePieces(tail[i+n:end]))
+		} else if start, stop, ok := credentialSuffixBoundary(tail[i:end]); ok {
+			// The head does not decode, but a credential starts
+			// behind it (issue #267): the head stays readable
+			// and only the credential goes. What is behind
+			// the credential is judged too — the password
+			// stops at the first byte that is not password
+			// material, and a second credential can start
+			// there.
+			out.WriteString(tail[i:i+start] + "[REDACTED]" + judgeResiduePieces(tail[i+stop:end]))
 		} else {
 			out.WriteString(tail[i:end])
 		}
