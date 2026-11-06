@@ -91,9 +91,18 @@ func (k *kube) fluxKustomizationRelevance(ctx context.Context, gh *gitHubClient,
 		rel.Reason = kustomizationFailureReason(err)
 		return rel
 	}
-	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Group, kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil || srcURL == "" {
-		rel.Reason = "Flux GitRepository not readable: " + truncate(safeErr(err), 160)
+		// A successful read of an empty spec.url is its own finding: kinds
+		// such as HelmChart or Bucket address a chart or an object store, not
+		// a location, so the url is absent rather than the object missing.
+		// The reason must stay a complete sentence; safeErr(nil) alone would
+		// render a dangling "not readable: ".
+		reason := safeErr(err)
+		if reason == "" {
+			reason = "source spec carries no url"
+		}
+		rel.Reason = "Flux GitRepository not readable: " + truncate(reason, 160)
 		return rel
 	}
 	rel.RepoURL = srcURL
@@ -240,6 +249,7 @@ const argoInstanceRefusal = "argocd.argoproj.io/instance refused: value is not o
 const (
 	fluxSourceNamespaceRefusal = "flux Kustomization spec.sourceRef.namespace refused: value is not one path segment (value not shown)"
 	fluxSourceNameRefusal      = "flux Kustomization spec.sourceRef.name refused: value is not one path segment (value not shown)"
+	fluxSourceGroupRefusal     = "flux Kustomization spec.sourceRef.group refused: value is not one path segment (value not shown)"
 	fluxSourceKindRefusal      = "flux Kustomization spec.sourceRef.kind refused: value is not one path segment (value not shown)"
 )
 
@@ -256,6 +266,8 @@ func fluxSourceRefusal(err error) string {
 		return fluxSourceNamespaceRefusal
 	case errors.Is(err, errFluxSourceNameRefused):
 		return fluxSourceNameRefusal
+	case errors.Is(err, errFluxSourceGroupRefused):
+		return fluxSourceGroupRefusal
 	case errors.Is(err, errFluxSourceKindRefused):
 		return fluxSourceKindRefusal
 	}
@@ -266,7 +278,10 @@ func fluxSourceRefusal(err error) string {
 // the GitOps tool that owns it. Flux-managed pods carry
 // kustomize.toolkit.fluxcd.io/name+namespace pointing at a Kustomization;
 // its spec.sourceRef names a GitRepository with the repo URL, and its
-// spec.path gives the directory. Argo-managed pods carry
+// spec.path gives the directory. A Kustomization whose sourceRef names
+// another kind (OCIRepository, Bucket, HelmChart) yields no path: only a Git
+// source's spec.url is a Git location that spec.path can be joined to (issue
+// #307). Argo-managed pods carry
 // argocd.argoproj.io/instance naming an Application whose spec.source
 // carries repoURL and path directly. When neither annotation is present,
 // the call falls back to GITOPS_REPO + GITOPS_PATH from cfg. Results are
@@ -684,56 +699,105 @@ func fluxPathSegment(v string) bool {
 	return true
 }
 
-// errFluxSourceNamespaceRefused, errFluxSourceNameRefused and
-// errFluxSourceKindRefused are the refusals issued below. The messages are
-// fixed and never echo the offending value, which is author-controlled text
-// that must not reach the digest. They are sentinels so a caller can tell
-// "this value was refused" from "the object could not be read" with
-// errors.Is; only the refusals earn a digest marker (issue #318).
+// fluxSourceGroupDefault is the API group Flux assumes for a sourceRef that
+// names none: spec.sourceRef.group is optional in the Flux Kustomization API
+// and defaults to this group.
+const fluxSourceGroupDefault = "source.toolkit.fluxcd.io"
+
+// fluxSourceGroupVersion returns the API version to read a source group at.
+// source.toolkit.fluxcd.io serves every Kustomization source kind at v1.
+// helm.toolkit.fluxcd.io is the group a pre-move Flux Kustomization names for
+// a HelmChart, and that kind was only ever served there at v2beta1: the
+// group's v2 and v2beta2 carry HelmRelease alone, so the v2 this service
+// reads helmreleases at would ask for a HelmChart no cluster has. Any other
+// group keeps v1: no source kind is served elsewhere today, and a group or
+// version the cluster does not serve simply fails the read, which every
+// caller degrades to absence.
+func fluxSourceGroupVersion(group string) string {
+	if group == "helm.toolkit.fluxcd.io" {
+		return "v2beta1"
+	}
+	return "v1"
+}
+
+// fluxSourceIsGit reports whether a sourceRef names the one Flux source kind
+// whose spec.url is a Git location. An OCIRepository url addresses an OCI
+// artifact and a Bucket names an object store, and neither can be joined with
+// spec.path into a browsable repository path; HelmChart has no spec.url at
+// all. Only GitRepository counts, and only in the group that serves it —
+// reading a reference's object in a group other than the one it names is how
+// a same-named object the Kustomization does not use gets resolved (the #296
+// lesson, applied to the group axis). Both defaults follow Flux's own
+// sourceRef defaults.
+func fluxSourceIsGit(group, kind string) bool {
+	if group == "" {
+		group = fluxSourceGroupDefault
+	}
+	if kind == "" {
+		kind = "GitRepository"
+	}
+	return group == fluxSourceGroupDefault && kind == "GitRepository"
+}
+
+// errFluxSourceNamespaceRefused, errFluxSourceNameRefused,
+// errFluxSourceGroupRefused and errFluxSourceKindRefused are the refusals
+// issued below. The messages are fixed and never echo the offending value,
+// which is author-controlled text that must not reach the digest. They are
+// sentinels so a caller can tell "this value was refused" from "the object
+// could not be read" with errors.Is; only the refusals earn a digest marker
+// (issue #318).
 var (
 	errFluxSourceNamespaceRefused = errors.New("flux source namespace is not a valid path segment")
 	errFluxSourceNameRefused      = errors.New("flux source name is not a valid path segment")
+	errFluxSourceGroupRefused     = errors.New("flux source group is not a valid path segment")
 	errFluxSourceKindRefused      = errors.New("flux source kind is not a valid path segment")
 )
 
 // errFluxPathUnresolved marks a fluxPath lookup whose values were all
 // readable but whose repo+path pair is simply not there: an empty
-// spec.path or an empty source spec.url. It is not a refusal and never
-// yields a marker. A sourceRef that declares no source to read keeps the
-// plain error the segment checks returned before issue #318, so its
-// output stays the absence it always was.
+// spec.path, an empty source spec.url or a non-Git source kind. It is not
+// a refusal and never yields a marker. A sourceRef that declares no
+// source to read keeps the plain error the segment checks returned
+// before issue #318, so its output stays the absence it always was.
 var errFluxPathUnresolved = errors.New("flux kustomization does not resolve to a repo path")
 
 // fluxSourceURL reads the source object a Kustomization's sourceRef names and
-// returns its spec.url. An empty kind defaults to GitRepository, matching the
-// sourceRef default Flux applies. The empty-URL case is left to callers: for
-// relevance it degrades to "not readable", for repo+path lookups to no path.
+// returns its spec.url. An empty kind defaults to GitRepository and an empty
+// group to source.toolkit.fluxcd.io, matching the sourceRef defaults Flux
+// applies; a group the reference does name is honoured, because the object
+// exists only in the group it lives in — reading every source from the source
+// toolkit group asked helm.toolkit.fluxcd.io for a HelmChart that was never
+// there (issue #307). The empty-URL case is left to callers: for relevance it
+// degrades to "not readable", for repo+path lookups to no path.
 //
-// The namespace and the name are interpolated into an apiserver path, and
-// the namespace may now come from spec.sourceRef.namespace rather than only
-// from the Kustomization's own namespace, so both are validated as one path
-// segment before use: a value carrying a separator would address a different
-// object than the one declared. The kind reaches the same path through
-// pluralLower and is validated the same way — through its plural, since that
-// is the segment actually sent. A refused value fails the lookup outright —
-// there is no second namespace to fall back to, because falling back is how a
+// The namespace, the group, the kind and the name are interpolated into an
+// apiserver path, and the namespace may now come from
+// spec.sourceRef.namespace rather than only from the Kustomization's own
+// namespace, so all four are validated as one path segment before use: a
+// value carrying a separator would address a different object than the one
+// declared. The kind reaches the same path through pluralLower and is
+// validated the same way \u2014 through its plural, since that is the segment
+// actually sent. A refused value fails the lookup outright \u2014 there is no
+// second namespace to fall back to, because falling back is how a
 // same-named source the Kustomization does not use gets resolved. The
 // refusal errors are the sentinel vars above, so resolveRepoPaths can mark
-// the refused field without re-deriving why the lookup failed (issues #318,
-// #327).
+// the refused field without re-deriving why the lookup failed (issues
+// #307, #318, #327).
 //
 // An absent value is told apart from a refused one before any refusal
 // sentinel is assigned: a sourceRef that declares no name (or no namespace
 // to address) has no value to refuse, and reporting it as refused would
 // state a decision about a value the object never declared. Only a refusal
-// earns a marker. An absence is not a new classification either — it
+// earns a marker. An absence is not a new classification either \u2014 it
 // returns the exact errors the segment checks returned before issue #318,
 // so a Kustomization that simply declares no source keeps its previous
-// output: the same commit-relevance reason, no path and no marker.
-func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (string, error) {
-	// The kind is defaulted before the checks: an absent kind is not an
-	// absence failure but Flux's own default (GitRepository), and the
-	// segment check below must judge the value that would actually be sent.
+// output: the same commit-relevance reason, no path and no marker. An
+// absent group or kind is not an absence at all but Flux's own default,
+// applied before the checks, so the check judges the value actually sent.
+func (k *kube) fluxSourceURL(ctx context.Context, ns, group, srcKind, srcName string) (string, error) {
+	if group == "" {
+		group = fluxSourceGroupDefault
+	}
 	if srcKind == "" {
 		srcKind = "GitRepository"
 	}
@@ -742,6 +806,9 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 	// absent: an absence must not mask a refusal.
 	if ns != "" && !fluxPathSegment(ns) {
 		return "", errFluxSourceNamespaceRefused
+	}
+	if group != "" && !fluxPathSegment(group) {
+		return "", errFluxSourceGroupRefused
 	}
 	if srcName != "" && !fluxPathSegment(srcName) {
 		return "", errFluxSourceNameRefused
@@ -766,12 +833,13 @@ func (k *kube) fluxSourceURL(ctx context.Context, ns, srcKind, srcName string) (
 	if srcName == "" {
 		return "", errors.New("flux source name is not a valid path segment")
 	}
+	plural := pluralLower(srcKind)
 	var src struct {
 		Spec struct {
 			URL string `json:"url"`
 		} `json:"spec"`
 	}
-	p := "/apis/source.toolkit.fluxcd.io/v1/namespaces/" + ns + "/" + pluralLower(srcKind) + "/" + srcName
+	p := "/apis/" + group + "/" + fluxSourceGroupVersion(group) + "/namespaces/" + ns + "/" + plural + "/" + srcName
 	if err := k.get(ctx, p, &src); err != nil {
 		return "", err
 	}
@@ -799,7 +867,25 @@ func (k *kube) fluxPath(ctx context.Context, ns, name string) (string, string, e
 	if kuz.Path == "" {
 		return "", "", errFluxPathUnresolved
 	}
-	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Kind, kuz.SourceRef.Name)
+	// Only a Git source has a spec.url that is a Git location. Joining an
+	// OCI artifact reference with spec.path produced repo paths like
+	// oci://registry.example.com/base/apps/demo, which the digest then
+	// rendered as a browsable repository link leading nowhere. Report no
+	// path for the other kinds, and do not read their source objects at
+	// all: nothing the GitOps repo evidence says may come from them. A
+	// non-Git source is not a refusal of a declared value, so it stays
+	// errFluxPathUnresolved and earns no marker (issue #307).
+	// A refused kind must surface as a refusal, never as an unresolved
+	// non-Git source: let fluxSourceURL classify it (it refuses before it
+	// requests anything), so the marker attribution stays the refusal's.
+	if kind := kuz.SourceRef.Kind; kind != "" && !fluxPathSegment(pluralLower(kind)) {
+		_, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Group, kuz.SourceRef.Kind, kuz.SourceRef.Name)
+		return "", "", err
+	}
+	if !fluxSourceIsGit(kuz.SourceRef.Group, kuz.SourceRef.Kind) {
+		return "", "", errFluxPathUnresolved
+	}
+	srcURL, err := k.fluxSourceURL(ctx, fluxSourceNamespace(kuz, ns), kuz.SourceRef.Group, kuz.SourceRef.Kind, kuz.SourceRef.Name)
 	if err != nil {
 		if errors.Is(err, errFluxSourceNamespaceRefused) && kuz.SourceRef.Namespace == "" {
 			// The refused value is not a namespace the object declared but

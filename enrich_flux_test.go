@@ -244,6 +244,288 @@ func TestResolveRepoPathsFluxSourceRefNamespaceOmitted(t *testing.T) {
 	}
 }
 
+// TestFluxSourceURLGroup pins that the source object is read in the API
+// group spec.sourceRef.group names (issue #307): a HelmChart declared in the
+// helm toolkit group exists only there, and asking the source toolkit group
+// for it requests an object no cluster has. An absent group keeps the source
+// toolkit group, the default Flux itself applies.
+func TestFluxSourceURLGroup(t *testing.T) {
+	cases := []struct {
+		name  string
+		group string
+		kind  string
+		src   string
+		want  string
+	}{
+		{
+			name:  "absent group keeps the source toolkit default",
+			group: "",
+			kind:  "GitRepository",
+			src:   "config",
+			want:  "/apis/source.toolkit.fluxcd.io/v1/namespaces/sources/gitrepositories/config",
+		},
+		{
+			name:  "explicit source toolkit group reads identically",
+			group: "source.toolkit.fluxcd.io",
+			kind:  "GitRepository",
+			src:   "config",
+			want:  "/apis/source.toolkit.fluxcd.io/v1/namespaces/sources/gitrepositories/config",
+		},
+		{
+			name:  "helm group reads the version that served HelmChart",
+			group: "helm.toolkit.fluxcd.io",
+			kind:  "HelmChart",
+			src:   "podinfo",
+			want:  "/apis/helm.toolkit.fluxcd.io/v2beta1/namespaces/sources/helmcharts/podinfo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"spec":{"url":"https://github.com/example/right"}}`)
+			}))
+			defer srv.Close()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			gotURL, err := k.fluxSourceURL(context.Background(), "sources", tc.group, tc.kind, tc.src)
+			if err != nil {
+				t.Fatalf("fluxSourceURL: %v", err)
+			}
+			if gotURL != "https://github.com/example/right" {
+				t.Fatalf("unexpected url %q", gotURL)
+			}
+			if gotPath != tc.want {
+				t.Fatalf("source read addressed %s, want %s", gotPath, tc.want)
+			}
+		})
+	}
+}
+
+// TestFluxSourceURLGroupHostile pins the guards on the declared group and on
+// the plural of the declared kind: both are interpolated into an apiserver
+// path, so a value that is not one path segment must fail the lookup without
+// any request. The errors are fixed text and must not echo the hostile value
+// (issue #307).
+func TestFluxSourceURLGroupHostile(t *testing.T) {
+	cases := []struct {
+		name    string
+		group   string
+		kind    string
+		hostile string
+	}{
+		{
+			name:    "group",
+			group:   "source.toolkit.fluxcd.io/../../other",
+			kind:    "GitRepository",
+			hostile: "source.toolkit.fluxcd.io/../../other",
+		},
+		{
+			// The pluraliser lowercases and appends, so a traversal in the
+			// kind arrives in the resource segment with its ".." pair.
+			name:    "kind",
+			group:   "",
+			kind:    "GitRepository/../helmreleases",
+			hostile: "GitRepository/../helmreleases",
+		},
+	}
+	for _, tc := range cases {
+		t.Run("refuses hostile "+tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			_, err := k.fluxSourceURL(context.Background(), "sources", tc.group, tc.kind, "config")
+			if err == nil {
+				t.Fatal("a value that is not one path segment must fail the lookup")
+			}
+			if strings.Contains(err.Error(), tc.hostile) {
+				t.Fatalf("error must not echo the refused value: %v", err)
+			}
+			if hits.Load() != 0 {
+				t.Fatalf("a refused value must not be requested, got %d hits", hits.Load())
+			}
+		})
+	}
+}
+
+// TestResolveRepoPathsFluxNonGitSourceConfiguredFallback pins what an
+// OCI-sourced workload does when the operator configured a default: the Flux
+// lookup reports no path, and the existing fallback for unresolved pods
+// applies the configured GITOPS_REPO. This is the same degradation a failed
+// lookup already had. The alternative was an oci:// URL in the GitOps paths,
+// which is the wrong sentence this lookup must not say (issue #307).
+func TestResolveRepoPathsFluxNonGitSourceConfiguredFallback(t *testing.T) {
+	var srcHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/kustomizations/demo"):
+			_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{"kind":"OCIRepository","name":"demo-src"}}}`)
+		default:
+			srcHits.Add(1)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	k := &kube{hc: srv.Client(), base: srv.URL}
+	pods := []podRef{{
+		Name:      "p1",
+		Namespace: "ns-a",
+		Annotations: map[string]string{
+			"kustomize.toolkit.fluxcd.io/name":      "demo",
+			"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+		},
+	}}
+	cfg := &Config{GitOpsRepo: "https://github.com/example/configs", GitOpsPath: "clusters/staging"}
+	got, _ := k.resolveRepoPaths(context.Background(), pods, cfg)
+	if len(got) != 1 || got[0] != "https://github.com/example/configs/clusters/staging" {
+		t.Fatalf("expected only the configured fallback, got %#v", got)
+	}
+	if srcHits.Load() != 0 {
+		t.Fatalf("the non-Git source must not be read for a repo path, got %d hits", srcHits.Load())
+	}
+}
+
+// TestResolveRepoPathsFluxNonGitSource pins that only a Git source produces a
+// GitOps repo path (issue #307): an OCIRepository spec.url names an OCI
+// artifact, and joining it with spec.path put strings such as
+// oci://registry.example.com/base/apps/demo in the digest as if they were
+// browsable repository paths. Non-Git kinds produce no path, and their source
+// objects are not read at all for this lookup.
+func TestResolveRepoPathsFluxNonGitSource(t *testing.T) {
+	cases := []struct {
+		name  string
+		kind  string
+		group string
+	}{
+		{name: "OCIRepository", kind: "OCIRepository"},
+		{name: "Bucket", kind: "Bucket"},
+		{name: "HelmChart", kind: "HelmChart"},
+		{name: "GitRepository in a foreign group", kind: "GitRepository", group: "helm.toolkit.fluxcd.io"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var srcHits atomic.Int32
+			group := ""
+			if tc.group != "" {
+				group = `"group":"` + tc.group + `",`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/kustomizations/demo"):
+					_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":{`+group+`"kind":"`+tc.kind+`","name":"demo-src"}}}`)
+				default:
+					// Any source read — whichever group or plural it asks —
+					// is a hit this lookup must not make.
+					srcHits.Add(1)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			pods := []podRef{{
+				Name:      "p1",
+				Namespace: "ns-a",
+				Annotations: map[string]string{
+					"kustomize.toolkit.fluxcd.io/name":      "demo",
+					"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+				},
+			}}
+			got, refusals := k.resolveRepoPaths(context.Background(), pods, &Config{})
+			if got != nil {
+				t.Fatalf("a %s source must produce no GitOps path, got %#v", tc.kind, got)
+			}
+			if refusals != nil {
+				t.Fatalf("a non-Git owner is not a refusal, got %#v", refusals)
+			}
+			if srcHits.Load() != 0 {
+				t.Fatalf("the non-Git source must not be read for a repo path, got %d hits", srcHits.Load())
+			}
+		})
+	}
+}
+
+// TestResolveCommitRelevanceFluxSourceRefGroup pins the group fix on the path
+// that still dereferences non-Git sources: the commit question is only
+// answerable for GitHub, but the lookup must ask the group the reference
+// names (issue #307) and degrade to a complete one-line reason. A HelmChart
+// read in its own group succeeds with no spec.url — the reason must not end
+// in a dangling "not readable: " — and an OCIRepository is still read in the
+// source group and classified by host.
+func TestResolveCommitRelevanceFluxSourceRefGroup(t *testing.T) {
+	cases := []struct {
+		name       string
+		sourceRef  string
+		sourceBody string
+		wantPath   string
+		wantReason string
+	}{
+		{
+			name:       "HelmChart is read in the group the reference names",
+			sourceRef:  `{"kind":"HelmChart","group":"helm.toolkit.fluxcd.io","name":"podinfo"}`,
+			sourceBody: `{"spec":{"chart":"podinfo","sourceRef":{"kind":"HelmRepository","name":"podinfo"}}}`,
+			wantPath:   "/apis/helm.toolkit.fluxcd.io/v2beta1/namespaces/workloads/helmcharts/podinfo",
+			wantReason: "source spec carries no url",
+		},
+		{
+			name:       "OCIRepository is still read in the source group",
+			sourceRef:  `{"kind":"OCIRepository","name":"demo-src"}`,
+			sourceBody: `{"spec":{"url":"oci://registry.example.com/org/app"}}`,
+			wantPath:   "/apis/source.toolkit.fluxcd.io/v1/namespaces/workloads/ocirepositories/demo-src",
+			wantReason: "host is not github.com",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/workloads/kustomizations/demo":
+					_, _ = io.WriteString(w, `{"spec":{"path":"apps/demo","sourceRef":`+tc.sourceRef+`},"status":{"lastAppliedRevision":"main@sha1:0123456789abcdef0123456789abcdef01234567"}}`)
+				case r.URL.Path == tc.wantPath:
+					_, _ = io.WriteString(w, tc.sourceBody)
+				default:
+					// A read at any other address — including the old
+					// hardcoded source-group path for the same kind — is the
+					// bug this test pins.
+					t.Errorf("unexpected API hit for %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			k := &kube{hc: srv.Client(), base: srv.URL}
+			gh := &gitHubClient{token: "t", repo: "owner/repo", hc: &http.Client{}, apiURL: "http://unused.invalid"}
+			pods := []podRef{{
+				Name:      "p1",
+				Namespace: "ns-a",
+				Annotations: map[string]string{
+					"kustomize.toolkit.fluxcd.io/name":      "demo",
+					"kustomize.toolkit.fluxcd.io/namespace": "workloads",
+				},
+			}}
+			rel := k.resolveCommitRelevance(context.Background(), gh, pods)
+			if len(rel) != 1 {
+				t.Fatalf("expected 1 CommitRelevance, got %d", len(rel))
+			}
+			if rel[0].State != commitRelevanceUnknown {
+				t.Fatalf("state = %q, want %q", rel[0].State, commitRelevanceUnknown)
+			}
+			if !strings.Contains(rel[0].Reason, tc.wantReason) {
+				t.Fatalf("reason = %q, want it to contain %q", rel[0].Reason, tc.wantReason)
+			}
+			if strings.Contains(rel[0].Reason, "\n") || strings.HasSuffix(rel[0].Reason, ": ") {
+				t.Fatalf("reason must be one complete line: %q", rel[0].Reason)
+			}
+		})
+	}
+}
+
 // TestFluxSourceNamespaceHostile pins the guard on the declared source
 // namespace: it is interpolated into an apiserver path, so a value carrying
 // a separator must be refused outright rather than addressed as something
@@ -654,7 +936,7 @@ func TestFluxSourceURLClassifiesAbsenceAndRefusal(t *testing.T) {
 			defer srv.Close()
 
 			k := &kube{hc: srv.Client(), base: srv.URL}
-			_, err := k.fluxSourceURL(context.Background(), tc.ns, tc.srcKind, tc.srcName)
+			_, err := k.fluxSourceURL(context.Background(), tc.ns, "", tc.srcKind, tc.srcName)
 			if tc.want != nil {
 				if !errors.Is(err, tc.want) {
 					t.Fatalf("err = %v, want %v", err, tc.want)
@@ -710,7 +992,7 @@ func TestFluxSourceURLAbsentKindStillDefaults(t *testing.T) {
 			defer srv.Close()
 
 			k := &kube{hc: srv.Client(), base: srv.URL}
-			if _, err := k.fluxSourceURL(context.Background(), "workloads", tc.kind, "config"); err == nil {
+			if _, err := k.fluxSourceURL(context.Background(), "workloads", "", tc.kind, "config"); err == nil {
 				t.Fatalf("expected the 404 the fake apiserver returns, got nil")
 			}
 			if hits.Load() != 1 {

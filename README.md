@@ -177,7 +177,8 @@ should omit its rules and accept the corresponding gap in evidence.
 | `source.toolkit.fluxcd.io` | `gitrepositories` | `get` | Get, per named, in the namespace `sourceRef.namespace` names, else the Kustomization's own namespace | The Kustomization `sourceRef` is dereferenced to obtain the repository URL for commit classification; only the kinds a resolved Kustomization actually references are read. A `sourceRef` naming another namespace is read there, so a namespace-scoped Role on the source must cover that namespace. |
 | `source.toolkit.fluxcd.io` | `ocirepositories` | `get` | As above | As above, when `sourceRef.kind` is `OCIRepository`. |
 | `source.toolkit.fluxcd.io` | `buckets` | `get` | As above | As above, when `sourceRef.kind` is `Bucket`. |
-| `source.toolkit.fluxcd.io` | `helmcharts` | `get` | As above | As above, when `sourceRef.kind` is `HelmChart`. |
+| `source.toolkit.fluxcd.io` | `helmcharts` | `get` | As above | As above, when `sourceRef.kind` is `HelmChart` and the reference names no group or names `source.toolkit.fluxcd.io`. |
+| `helm.toolkit.fluxcd.io` | `helmcharts` | `get` | Get, per named, at `v2beta1`, in the namespace `sourceRef.namespace` names, else the Kustomization's own namespace | As above, when the reference names the `helm.toolkit.fluxcd.io` group: Flux kept `HelmChart` in that group until the kind moved to the source group, and it was served there only at `v2beta1` — the group's `v2` carries `HelmRelease` alone. |
 
 ### Argo CD (optional)
 
@@ -209,6 +210,9 @@ rules:
   - apiGroups: ["helm.toolkit.fluxcd.io"]
     resources: ["helmreleases"]
     verbs: ["get", "list"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmcharts"]
+    verbs: ["get"]
   - apiGroups: ["kustomize.toolkit.fluxcd.io"]
     resources: ["kustomizations"]
     verbs: ["get", "list"]
