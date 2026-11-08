@@ -719,24 +719,3 @@ func TestFetchBackendLogsNilReceiver(t *testing.T) {
 		t.Fatalf("nil receiver should return empty results, got %#v", res)
 	}
 }
-
-// TestFetchBackendLogsConvenienceWrapper verifies the wrapper logs the
-// error and returns whatever lines the result variant produced.
-func TestFetchBackendLogsConvenienceWrapper(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`not json`))
-	}))
-	t.Cleanup(srv.Close)
-	b := &logsBackend{
-		url:    srv.URL,
-		flavor: "loki",
-		limit:  50,
-		hc:     srv.Client(),
-	}
-	g := Group{Namespaces: []string{"ns"}}
-	lines := b.fetchBackendLogs(context.Background(), g, time.Minute)
-	if lines != nil {
-		t.Fatalf("expected nil lines on backend JSON error, got %v", lines)
-	}
-}

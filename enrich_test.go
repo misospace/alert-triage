@@ -237,13 +237,6 @@ func TestEnrichScopeCarriesNoAlertSuppliedValues(t *testing.T) {
 	}
 }
 
-func TestEnrichment_empty(t *testing.T) {
-	got := Enrichment{}.empty()
-	if !got {
-		t.Errorf("expected empty, got %v", got)
-	}
-}
-
 func TestEnrich_skipsSucceededPodsAndSortsByScore(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -789,18 +789,6 @@ func siblingClaimDetail(p *podItem, claim string) string {
 	return strings.Join(parts, "; ")
 }
 
-func (e Enrichment) empty() bool {
-	return len(e.Nodes) == 0 && len(e.UnhealthyPods) == 0 &&
-		len(e.PodID) == 0 && len(e.PVCSiblings) == 0 &&
-		len(e.PodLogs) == 0 && len(e.BackendLogs) == 0 &&
-		(e.BackendState == "" || e.BackendState == "off" || e.BackendState == "ambient") &&
-		len(e.Events) == 0 && len(e.FluxActivity) == 0 && len(e.Ambient) == 0 &&
-		len(e.InspectedJobs) == 0 && len(e.Ownership) == 0 &&
-		len(e.ContainerDiagnostics) == 0 &&
-		len(e.ContainerTerminationMessages) == 0 &&
-		len(e.KustomizationTopology) == 0
-}
-
 // namespaceLabels are the label keys that carry a namespace in practice.
 // Exporters and recording rules rarely use the canonical one.
 var namespaceLabels = []string{"namespace", "exported_namespace", "k8s_namespace", "target_namespace"}

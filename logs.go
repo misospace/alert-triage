@@ -95,19 +95,6 @@ func (b *logsBackend) endpoint() (string, error) {
 	}
 }
 
-// fetchBackendLogs keeps the original, convenient method for callers while
-// recording backend errors in the service log. It returns only the primary
-// (subject-scoped) lines; Enrich uses the result variant below so it can also
-// receive the ambient namespace-wide context and keep the two apart.
-func (b *logsBackend) fetchBackendLogs(ctx context.Context, g Group, window time.Duration) []string {
-	res, err := b.fetchBackendLogsResult(ctx, g, window, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		logf("enrich: backend logs: %v", err)
-		return res.Primary
-	}
-	return res.Primary
-}
-
 type backendLog struct {
 	stream  string
 	message string
@@ -138,9 +125,7 @@ type backendLogResult struct {
 const ambientLogMarker = "(ambient, namespace-wide) "
 
 // targetPodsFromAlerts builds the concrete-subject set from raw alert pod
-// labels, the same way Enrich does, so the convenience wrapper stays usable on
-// its own. Enrich passes its own set, which also includes Job-resolved pods
-// once subject resolution lands.
+// labels, the same shape Enrich passes for its resolved subjects.
 func targetPodsFromAlerts(alerts []Alert) map[string]bool {
 	out := make(map[string]bool)
 	for _, a := range alerts {

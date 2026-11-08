@@ -551,7 +551,7 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 	var rules map[string]string
 	var rulesErr error
 	if prom != nil && len(groups) > 0 {
-		rules, rulesErr = prom.FetchRules(ctx)
+		rules, rulesErr = prom.fetchRules(ctx)
 	}
 	reports := make([]Report, len(groups))
 	narrateIdx := make([]int, 0, len(groups))

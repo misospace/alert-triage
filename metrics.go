@@ -69,7 +69,10 @@ type queryResult struct {
 }
 
 // fetchRules retrieves alerting rules and returns a map of alert name to
-// PromQL expression. Only rules of type "alert" are included.
+// PromQL expression. Only rules of type "alert" are included. A flush that
+// enriches several groups should call this once and share the result via
+// EnrichMetricsWithRules, rather than re-downloading /api/v1/rules for every
+// group (issue #66).
 func (p *Prometheus) fetchRules(ctx context.Context) (map[string]string, error) {
 	data, err := p.get(ctx, "/api/v1/rules")
 	if err != nil {
@@ -207,14 +210,6 @@ func (s *metricSummary) render() string {
 	}
 
 	return fmt.Sprintf("min=%.2f max=%.2f last=%.2f %s%s", s.min, s.max, s.last, s.direction, labelCtx)
-}
-
-// FetchRules downloads the cluster's alerting rules once and returns the
-// alertname -> PromQL expression map. A flush that enriches several groups
-// should call this once and share the result via EnrichMetricsWithRules,
-// rather than re-downloading /api/v1/rules for every group (issue #66).
-func (p *Prometheus) FetchRules(ctx context.Context) (map[string]string, error) {
-	return p.fetchRules(ctx)
 }
 
 // MetricEvidence separates metric summaries by scope so the renderer can keep
