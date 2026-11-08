@@ -467,12 +467,12 @@ func renderEvidence(r Report) string {
 					}
 					b.WriteString(untrustedEnd + "\n")
 				}
-				writeCommitMessage(&b, rel.CommitMessage)
+				writeQuotedValue(&b, "message", rel.CommitMessage)
 			case commitRelevanceDoesNotTouch:
 				b.WriteString("- does NOT touch workload:\n")
 				writeQuotedValue(&b, "path", rel.WorkloadPath)
 				writeQuotedValue(&b, "revision", rel.Revision)
-				writeCommitMessage(&b, rel.CommitMessage)
+				writeQuotedValue(&b, "message", rel.CommitMessage)
 			default:
 				// Unknown: the lookup did not produce a yes/no answer. The
 				// model still needs to know we tried — silence would read
@@ -835,21 +835,6 @@ func writeQuotedValue(b *strings.Builder, label, value string) {
 	fmt.Fprintf(b, "  %s:\n", label)
 	b.WriteString(untrustedBegin + "\n")
 	fmt.Fprintf(b, "  %s\n", untrusted(value))
-	b.WriteString(untrustedEnd + "\n")
-}
-
-// writeCommitMessage quotes the reconciled commit's message. The message is
-// written by whoever pushed the commit, so it is external text and lands
-// inside the untrusted fence; the surrounding state is this service's own
-// reading and stays outside. untrusted() flattens line structure so the text
-// cannot forge a section or a closing marker.
-func writeCommitMessage(b *strings.Builder, message string) {
-	if message == "" {
-		return
-	}
-	b.WriteString("  message:\n")
-	b.WriteString(untrustedBegin + "\n")
-	fmt.Fprintf(b, "  %s\n", untrusted(message))
 	b.WriteString(untrustedEnd + "\n")
 }
 

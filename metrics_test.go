@@ -286,7 +286,7 @@ func TestEnrichMetricsWithRulesSharesRulesAcrossGroups(t *testing.T) {
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 
 	// Fetch rules once, as the flush loop does.
-	rules, err := p.FetchRules(context.Background())
+	rules, err := p.fetchRules(context.Background())
 	if err != nil {
 		t.Fatalf("FetchRules: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestEnrichMetricsWithRulesBackendError(t *testing.T) {
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
-	rules, err := p.FetchRules(context.Background())
+	rules, err := p.fetchRules(context.Background())
 	if err == nil {
 		t.Fatal("expected FetchRules to fail against a 500 backend")
 	}
