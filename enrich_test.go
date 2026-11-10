@@ -3385,6 +3385,48 @@ func TestEnrichUnresolvedNamespaceStatesGapNotEmpty(t *testing.T) {
 	}
 }
 
+// TestEnrichRefusedGapBeatsUnresolvedGap pins the precedence of the two
+// uninspected-scope markers when a group has both: the refused state wins,
+// so a reorder of the enrich switch that silently loses the refusal wording
+// fails here instead of passing the suite.
+func TestEnrichRefusedGapBeatsUnresolvedGap(t *testing.T) {
+	const hostile = "ns/../../other"
+	var mu sync.Mutex
+	var lokiQueries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(req.URL.Path, "/loki/") {
+			mu.Lock()
+			lokiQueries = append(lokiQueries, req.URL.Query().Get("query"))
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	}))
+	defer srv.Close()
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	g := Group{
+		Namespaces: []string{hostile, "ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": hostile}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lokiQueries) != 1 || lokiQueries[0] != `{namespace="ns-a",pod="p1"}` {
+		t.Errorf("only the resolved subject may be queried, got %v", lokiQueries)
+	}
+	if en.BackendState != "refused" {
+		t.Errorf("with both gaps and no lines back the refused wording must win, got %q", en.BackendState)
+	}
+}
+
 // A namespace that is one path segment but whose pod list read fails leaves
 // the namespace uninspected, so the scan is incomplete exactly as it is for a
 // refused namespace: the empty context sections must not read as a healthy

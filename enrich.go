@@ -1320,6 +1320,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.Ambient = append(e.Ambient, res.Ambient...)
 			switch {
 			case len(res.Primary) > 0:
+				// The unqueried and refused gap markers are deliberately
+				// consumed only when no lines came back: with primary
+				// evidence rendered, silence about a skipped scope cannot
+				// read as an empty negative, and #331 set exactly this
+				// precedence for a refused sibling (#339 follows it).
 				e.BackendState = "ok"
 			case len(res.Ambient) > 0:
 				// The backend did return lines — it is the no-subject
