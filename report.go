@@ -624,6 +624,24 @@ func renderEvidence(r Report) string {
 		// path segment, so naming the cause is true here. The wording must
 		// still not call the refused scope empty: it was never queried.
 		b.WriteString("\nSubject log source: configured, but the alert named a namespace that was refused as not one path segment, so its logs were not queried and no backend lines were returned in the window.\n")
+	case "partial":
+		// The group resolved a subject pod in one namespace but not in
+		// another, and a resolved-subject group queries only resolved pods,
+		// so the second namespace was never queried. The empty result says
+		// nothing about it - the rule #311/#331 hold for refused scopes, on
+		// the branch that fix did not cover (issue #339). The finding is
+		// this service's reading and stays outside the fence; the namespace
+		// names are alert-supplied and go inside it, as the identity header
+		// and RepoPaths do (#310/#320 reviews).
+		b.WriteString("\nSubject log source: configured, but the backend queries were bounded to resolved subject pods and never covered one of the group's namespaces: no subject pod resolved there, so it was never queried - uninspected, not empty. The queries that ran returned no lines in the window.\n")
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			b.WriteString("Unqueried namespace(s), as the alert named them (untrusted):\n")
+			b.WriteString(untrustedBegin + "\n")
+			for _, ns := range r.Enrichment.BackendUnqueried {
+				b.WriteString(untrusted(stripSecrets(ns)) + "\n")
+			}
+			b.WriteString(untrustedEnd + "\n")
+		}
 	case "ok":
 		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
 		b.WriteString(untrustedBegin + "\n")
@@ -1050,6 +1068,19 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
 	case "refused":
 		desc.WriteString("\n**Backend log source:** configured, but a namespace was refused as not one path segment, so its logs were not queried and no backend lines were returned in the window.")
+	case "partial":
+		// #339: a namespace of the group resolved no subject pod, so the
+		// pod-scoped queries never covered it. Name the gap as the refused
+		// line above does; the names are alert-supplied, so they carry the
+		// same redaction the alert bullets in this digest already apply.
+		gap := "one of the group's namespaces"
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			// Same inert rendering the topology records get on this path:
+			// the names are alert-supplied, and a newline in one could
+			// otherwise forge a section line in the digest.
+			gap = "namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendUnqueried, ", ")))
+		}
+		desc.WriteString("\n**Backend log source:** configured, but the backend queries were bounded to resolved subject pods and never covered " + gap + ": no subject pod resolved there, so it was never queried - uninspected, not empty. The queries that ran returned no lines in the window.")
 	case "ok":
 		desc.WriteString("\n**Backend logs (untrusted workload text)**\n")
 		for _, line := range r.Enrichment.BackendLogs {
