@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,10 +33,44 @@ func TestParseVictoriaLogsSuccess(t *testing.T) {
 
 func TestParseVictoriaLogsMalformed(t *testing.T) {
 	body := []byte("this is not json\nand neither is this")
-	if _, err := parseVictoriaLogs(body); err == nil {
+	_, err := parseVictoriaLogs(body)
+	if err == nil {
 		t.Fatalf("expected error for wholly unparseable JSONL")
-	} else if !strings.Contains(err.Error(), "2 malformed lines") {
+	}
+	if !strings.Contains(err.Error(), "2 malformed lines") {
 		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
+	}
+	// A wholly unparseable body is unreadable, not empty: it must not be
+	// reported as the empty reply, which the caller maps to an empty scope.
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("a wholly unparseable body must not be reported as an empty reply: %v", err)
+	}
+}
+
+// TestParseVictoriaLogsLogsSkippedLine pins that a skipped malformed line is
+// surfaced, not just tolerated (issue #342 criterion 1): the skip is logged
+// once, in aggregate, with the number of lines skipped and where the first
+// one was.
+func TestParseVictoriaLogsLogsSkippedLine(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	body := []byte("{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	if _, err := parseVictoriaLogs(body); err != nil {
+		t.Fatalf("parseVictoriaLogs: %v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "skipped 1 malformed VictoriaLogs line") {
+		t.Fatalf("expected the skipped line to be logged, got %q", out)
+	}
+	if strings.Count(out, "malformed VictoriaLogs line") != 1 {
+		t.Fatalf("expected one aggregated skip log entry, got %q", out)
+	}
+	if !strings.Contains(out, "first at line 2") {
+		t.Fatalf("expected the log to name the first skipped line, got %q", out)
 	}
 }
 
@@ -180,9 +216,18 @@ func TestParseLokiStatusError(t *testing.T) {
 }
 
 func TestParseLokiMalformed(t *testing.T) {
-	body := []byte(`not json at all`)
+	body := []byte(`not json all`)
 	if _, err := parseLoki(body); err == nil {
-		t.Fatalf("expected error for malformed JSON")
+		t.Fatalf("expected error malformed JSON")
+	}
+}
+
+// TestParseLokiEmptyBody pins that the Loki parser is left alone: its reply
+// is a single JSON document, so an empty body is unreadable and errors. The
+// VictoriaLogs parser may degrade a reply; Loki's has no line to degrade.
+func TestParseLokiEmptyBody(t *testing.T) {
+	if _, err := parseLoki([]byte("")); err == nil {
+		t.Fatalf("expected an error for an empty Loki body")
 	}
 }
 
@@ -423,6 +468,40 @@ func TestFetchBackendLogsEmptyReplyIsEmptyScope(t *testing.T) {
 	}
 	if res.SkippedRefused {
 		t.Fatalf("an empty reply is an empty scope, not a refused one")
+	}
+}
+
+// TestFetchBackendLogsDegradedReplyKeepsRecords pins the degrade-not-fail
+// stance end to end: a reply with one malformed line still yields the records
+// around it, as primary evidence for the group.
+func TestFetchBackendLogsDegradedReplyKeepsRecords(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a degraded reply must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 2 {
+		t.Fatalf("expected the 2 valid records as primary evidence, got %#v", res.Primary)
+	}
+	if !strings.Contains(res.Primary[0], "first line") || !strings.Contains(res.Primary[1], "second line") {
+		t.Fatalf("the records around the malformed line must survive: %#v", res.Primary)
 	}
 }
 

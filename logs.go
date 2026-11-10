@@ -409,7 +409,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 		return nil, errEmptyVictoriaLogsReply
 	}
 	if parsed == 0 {
-		return nil, fmt.Errorf("VictoriaLogs response had no parseable lines (%d malformed lines)", malformed)
+		return nil, fmt.Errorf("victorialogs response had no parseable lines (%d malformed lines)", malformed)
 	}
 	return out, nil
 }
