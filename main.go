@@ -563,8 +563,12 @@ func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *Hi
 			// Scope is per metric source: only the fixed context metrics can be
 			// pod-bounded, so only they may reach the direct tier. The alert-rule
 			// expression results stay context.
-			r.SubjectMetrics = metrics.Subject
-			r.ContextMetrics = metrics.Context
+			// The lists are capped here, not in the renderers: this is the only
+			// place the fields are written, so the prompt, /recent and any later
+			// consumer all see the same bounded view, with the dropped tail
+			// counted rather than missing (issue #341).
+			r.SubjectMetrics = capMetricSeries(metrics.Subject, maxSubjectMetricSeries)
+			r.ContextMetrics = capMetricSeries(metrics.Context, maxContextMetricSeries)
 		}
 		// Count prior sightings (for the "seen N time(s) recently" footer)
 		// but do NOT record this fire yet: history is only written after
