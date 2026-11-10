@@ -31,7 +31,40 @@ func TestParseVictoriaLogsSuccess(t *testing.T) {
 func TestParseVictoriaLogsMalformed(t *testing.T) {
 	body := []byte("this is not json\nand neither is this")
 	if _, err := parseVictoriaLogs(body); err == nil {
-		t.Fatalf("expected error for malformed JSONL")
+		t.Fatalf("expected error for wholly unparseable JSONL")
+	} else if !strings.Contains(err.Error(), "2 malformed lines") {
+		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
+	}
+}
+
+// TestParseVictoriaLogsMalformedMiddleLine pins the degrade-not-fail stance:
+// one malformed record between two valid ones must not discard the valid
+// lines around it — the malformed line is skipped and logged, and the parse
+// error must not escalate into BackendState="error" for the whole read.
+func TestParseVictoriaLogsMalformedMiddleLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("malformed middle line must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "first line" || records[1].message != "second line" {
+		t.Fatalf("valid records around the malformed line must survive: %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsMalformedTrailingLine pins that a malformed line after
+// the valid records (a truncated write mid-line) is skipped, not fatal.
+func TestParseVictoriaLogsMalformedTrailingLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\n{\"_msg\":\"second line\"}\n{\"_msg\":\"trunca")
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("malformed trailing line must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
 	}
 }
 
@@ -45,6 +78,34 @@ func TestParseVictoriaLogsEmpty(t *testing.T) {
 	}
 }
 
+// TestParseVictoriaLogsBlankOnlyBody pins the boundary of the
+// wholly-unparseable guard: a body of only blank lines is an empty answer,
+// not an error, so it must render as an explicit empty scope.
+func TestParseVictoriaLogsBlankOnlyBody(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("\n \n\n"))
+	if err != nil {
+		t.Fatalf("blank-only body must not error: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("blank-only body should produce no records, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsNonRecordJSON pins that valid JSON which is not a log
+// record (e.g. an error object with no _msg) parses to no records without
+// erroring — the empty scope is stated, not claimed as a query failure.
+func TestParseVictoriaLogsNonRecordJSON(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\n"))
+	if err != nil {
+		t.Fatalf("valid-JSON non-record must not error: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records from a non-record body, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsSkipsBlankMessages pins that blank _msg values are
+// dropped as noise while real messages survive.
 func TestParseVictoriaLogsSkipsBlankMessages(t *testing.T) {
 	body := []byte("{}\n{\"_msg\":\"   \"}\n{\"_msg\":\"real\"}\n")
 	records, err := parseVictoriaLogs(body)

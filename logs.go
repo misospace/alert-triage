@@ -334,7 +334,12 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	lineNo := 0
+	malformed := 0
+	var firstSkipLine int
+	var firstSkipErr error
 	for scanner.Scan() {
+		lineNo++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -342,8 +347,19 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 		var record struct {
 			Message string `json:"_msg"`
 		}
+		// One malformed record — a broken plugin output, a proxy-injected
+		// line, a truncated write — must not discard the valid lines around
+		// it. This is the same skip-and-log stance readHistoryLines takes for
+		// the history JSONL: a transient parse failure must not become data
+		// loss for the whole response. The skips are logged once, aggregated,
+		// because the body is untrusted input and a hostile or garbage reply
+		// must not be able to flood the log line by line.
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			return nil, err
+			malformed++
+			if firstSkipErr == nil {
+				firstSkipLine, firstSkipErr = lineNo, err
+			}
+			continue
 		}
 		if strings.TrimSpace(record.Message) != "" {
 			out = append(out, backendLog{message: record.Message})
@@ -351,6 +367,19 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
+	}
+	if malformed > 0 {
+		logf("enrich: skipped %d malformed VictoriaLogs line(s) (first at line %d: %v)", malformed, firstSkipLine, firstSkipErr)
+	}
+	// A body whose every non-blank line fails to parse is not an empty
+	// answer: the reply was not the NDJSON we asked for, and rendering it as
+	// "no logs" would read as an explicit negative. Only a wholly
+	// unparseable body errors; anything that parsed degrades to the records
+	// it did yield. A body of valid JSON that is not log records (e.g. an
+	// error object) still parses to no records without erroring here — the
+	// empty scope is then stated, not claimed as a query failure.
+	if len(out) == 0 && malformed > 0 {
+		return nil, fmt.Errorf("VictoriaLogs response had no parseable records (%d malformed lines)", malformed)
 	}
 	return out, nil
 }
