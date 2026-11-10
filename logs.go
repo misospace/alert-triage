@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -327,14 +328,35 @@ func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, e
 	if b.flavor == "loki" {
 		return parseLoki(body)
 	}
-	return parseVictoriaLogs(body)
+	records, err := parseVictoriaLogs(body)
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		// VictoriaLogs answers a query that matched nothing with an empty
+		// 200 body. The parser refuses an empty body (issue #342, criterion
+		// 2) because only the caller can tell an empty reply from a lost
+		// one, but this read did not fail: the backend answered, with no
+		// lines. Rendering it as a failed query would claim a failure that
+		// did not happen.
+		return nil, nil
+	}
+	return records, err
 }
+
+// errEmptyVictoriaLogsReply reports a VictoriaLogs reply that carried no
+// NDJSON line at all. The parser refuses it rather than reporting an empty
+// scope, because "the body was empty" and "the body held no log records" are
+// different facts and only the caller knows which one the backend meant:
+// VictoriaLogs answers a query that matched nothing with an empty 200 body.
+// b.query maps this error back to "no lines"; every other unreadable reply
+// stays a failed query (issue #342, criterion 2).
+var errEmptyVictoriaLogsReply = errors.New("victorialogs response was empty")
 
 func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	lineNo := 0
+	lines := 0
+	parsed := 0
 	malformed := 0
 	var firstSkipLine int
 	var firstSkipErr error
@@ -344,6 +366,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 		if line == "" {
 			continue
 		}
+		lines++
 		var record struct {
 			Message string `json:"_msg"`
 		}
@@ -361,6 +384,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 			}
 			continue
 		}
+		parsed++
 		if strings.TrimSpace(record.Message) != "" {
 			out = append(out, backendLog{message: record.Message})
 		}
@@ -371,15 +395,21 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	if malformed > 0 {
 		logf("enrich: skipped %d malformed VictoriaLogs line(s) (first at line %d: %v)", malformed, firstSkipLine, firstSkipErr)
 	}
-	// A body whose every non-blank line fails to parse is not an empty
-	// answer: the reply was not the NDJSON we asked for, and rendering it as
-	// "no logs" would read as an explicit negative. Only a wholly
-	// unparseable body errors; anything that parsed degrades to the records
-	// it did yield. A body of valid JSON that is not log records (e.g. an
-	// error object) still parses to no records without erroring here — the
-	// empty scope is then stated, not claimed as a query failure.
-	if len(out) == 0 && malformed > 0 {
-		return nil, fmt.Errorf("VictoriaLogs response had no parseable records (%d malformed lines)", malformed)
+	// The guard's boundary (issue #342, criterion 2). A reply whose every line
+	// failed to parse is not an empty answer: the reply was not the NDJSON we
+	// asked for, and rendering it as "no logs in the window" would be an
+	// explicit negative no read can support. A reply with no line in it is
+	// refused for the same reason, but b.query maps that one back to an empty
+	// scope, because VictoriaLogs answers a query that matched nothing with
+	// an empty 200 body. A body that holds at least one line which parsed is
+	// not wholly unparseable, so it degrades to the records it yielded — even
+	// when none of them carried a message, in which case the empty scope is
+	// stated rather than a query failure claimed.
+	if lines == 0 {
+		return nil, errEmptyVictoriaLogsReply
+	}
+	if parsed == 0 {
+		return nil, fmt.Errorf("VictoriaLogs response had no parseable lines (%d malformed lines)", malformed)
 	}
 	return out, nil
 }

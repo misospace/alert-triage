@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,26 +69,24 @@ func TestParseVictoriaLogsMalformedTrailingLine(t *testing.T) {
 	}
 }
 
+// TestParseVictoriaLogsEmpty pins the empty-body half of the guard's
+// boundary (issue #342, criterion 2): a reply with no line in it is not the
+// NDJSON the query asked for, so the parser refuses it. Only the caller can
+// tell an empty reply from a lost one — VictoriaLogs answers "nothing
+// matched" with an empty 200 body — so the refusal names the condition
+// instead of reporting a failed read.
 func TestParseVictoriaLogsEmpty(t *testing.T) {
-	records, err := parseVictoriaLogs([]byte(""))
-	if err != nil {
-		t.Fatalf("empty input should not error: %v", err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("empty input should produce no records, got %#v", records)
+	if _, err := parseVictoriaLogs([]byte("")); !errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("empty body must be refused by the parser, got %v", err)
 	}
 }
 
-// TestParseVictoriaLogsBlankOnlyBody pins the boundary of the
-// wholly-unparseable guard: a body of only blank lines is an empty answer,
-// not an error, so it must render as an explicit empty scope.
+// TestParseVictoriaLogsBlankOnlyBody pins the same boundary for a body that
+// holds only blank lines: there is no line in it to read, so it is refused
+// like an empty body rather than reported as an empty answer.
 func TestParseVictoriaLogsBlankOnlyBody(t *testing.T) {
-	records, err := parseVictoriaLogs([]byte("\n \n\n"))
-	if err != nil {
-		t.Fatalf("blank-only body must not error: %v", err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("blank-only body should produce no records, got %#v", records)
+	if _, err := parseVictoriaLogs([]byte("\n \n\n")); !errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("blank-only body must be refused by the parser, got %v", err)
 	}
 }
 
@@ -101,6 +100,43 @@ func TestParseVictoriaLogsNonRecordJSON(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("expected no records from a non-record body, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsNonRecordWithMalformedLine pins the other half of the
+// guard's boundary (issue #342, criterion 2): a body holding a line that
+// parsed is not wholly unparseable, even when the parsed line carried no log
+// record and another line was malformed. It degrades to no records instead of
+// failing the read.
+func TestParseVictoriaLogsNonRecordWithMalformedLine(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\nnot json at all\n"))
+	if err != nil {
+		t.Fatalf("a body with a parseable line must not fail the read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records from a non-record body, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsRealisticReplyShape exercises the field set a real
+// VictoriaLogs /select/logsql/query reply carries — _time, _stream, _msg and
+// the kubernetes.* labels — with a malformed line between two records. The
+// records around the malformed line must survive with their messages intact,
+// and the extra fields must not affect the parse.
+func TestParseVictoriaLogsRealisticReplyShape(t *testing.T) {
+	body := []byte(`{"_msg":"failed to pull image","_time":"2026-11-10T10:00:00Z","_stream":"stdout","kubernetes_namespace":"ns-a","kubernetes_pod_name":"p1"}
+{"_msg":"trunca
+{"_msg":"container restarted","_time":"2026-11-10T10:00:05Z","_stream":"stdout","kubernetes_namespace":"ns-a","kubernetes_pod_name":"p1"}
+`)
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("a malformed line in a realistic reply must not fail the read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "failed to pull image" || records[1].message != "container restarted" {
+		t.Fatalf("records around the malformed line must survive: %#v", records)
 	}
 }
 
@@ -327,6 +363,66 @@ func TestQueryVictoriaLogsOverHTTP(t *testing.T) {
 	}
 	if records[0].message != "hello" || records[1].message != "world" {
 		t.Fatalf("unexpected messages: %#v", records)
+	}
+}
+
+// TestQueryVictoriaLogsEmptyReplyIsEmptyScope pins the boundary between an
+// empty reply and a failed read: VictoriaLogs answers a query that matched
+// nothing with an empty 200 body, so the read succeeds with no lines and the
+// digest can state an empty scope. Reporting it as a failed query would
+// claim a failure the backend never reported.
+func TestQueryVictoriaLogsEmptyReplyIsEmptyScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	records, err := b.query(context.Background(), "ns-a", "pod-1", time.Now().Add(-time.Minute), time.Now())
+	if err != nil {
+		t.Fatalf("an empty reply must not fail the read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records from an empty reply, got %#v", records)
+	}
+}
+
+// TestFetchBackendLogsEmptyReplyIsEmptyScope pins that a namespace whose
+// reply is empty does not abort the read for the whole group: the group ends
+// with no lines and no error, which is what lets the digest state an empty
+// scope instead of a failed query.
+func TestFetchBackendLogsEmptyReplyIsEmptyScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("an empty reply must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
+		t.Fatalf("expected no lines from an empty reply, got %#v", res)
+	}
+	if res.SkippedRefused {
+		t.Fatalf("an empty reply is an empty scope, not a refused one")
 	}
 }
 
