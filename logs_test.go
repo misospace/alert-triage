@@ -37,7 +37,7 @@ func TestParseVictoriaLogsMalformed(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for wholly unparseable JSONL")
 	}
-	if !strings.Contains(err.Error(), "2 malformed lines") {
+	if !strings.Contains(err.Error(), "2 unreadable lines") {
 		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
 	}
 	// A wholly unparseable body is unreadable, not empty: it must not be
@@ -63,14 +63,86 @@ func TestParseVictoriaLogsLogsSkippedLine(t *testing.T) {
 	}
 
 	out := logBuf.String()
-	if !strings.Contains(out, "skipped 1 malformed VictoriaLogs line") {
+	if !strings.Contains(out, "skipped 1 unreadable VictoriaLogs line") {
 		t.Fatalf("expected the skipped line to be logged, got %q", out)
 	}
-	if strings.Count(out, "malformed VictoriaLogs line") != 1 {
+	if strings.Count(out, "unreadable VictoriaLogs line") != 1 {
 		t.Fatalf("expected one aggregated skip log entry, got %q", out)
 	}
 	if !strings.Contains(out, "first at line 2") {
 		t.Fatalf("expected the log to name the first skipped line, got %q", out)
+	}
+}
+
+// TestParseVictoriaLogsOversizedMiddleLine pins the #347 case: a record over
+// the size cap must not end the read. The old bufio.Scanner failed the whole
+// reply with bufio.ErrTooLong at such a line; now it is skipped like a
+// malformed one and the records on both sides survive. The oversized record
+// here is valid JSON, so this pins the size skip itself and not a parse
+// failure: a record that big is never handed to json.Unmarshal.
+func TestParseVictoriaLogsOversizedMiddleLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\n" +
+		"{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}\n" +
+		"{\"_msg\":\"second line\"}\n")
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("oversized middle record must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected the 2 records around the oversized one, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "first line" || records[1].message != "second line" {
+		t.Fatalf("records around the oversized line must survive: %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsOversizedOnlyLine pins the other side of the #347
+// case against criterion 2: a body holding nothing but an oversized record is
+// wholly unparseable, not an empty reply. It must not be mapped back to "no
+// lines in the window" — the reply carried a line, we just refuse to buffer
+// a record that large.
+func TestParseVictoriaLogsOversizedOnlyLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}")
+	_, err := parseVictoriaLogs(body)
+	if err == nil {
+		t.Fatalf("an oversized-only body must be refused")
+	}
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("an oversized-only body is unreadable, not empty: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 unreadable lines") {
+		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
+	}
+}
+
+// TestParseVictoriaLogsLogsOversizedLine pins that a skipped oversized
+// record is surfaced in the same aggregated skip log, with the size gap as
+// its reason.
+func TestParseVictoriaLogsLogsOversizedLine(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	body := []byte("{\"_msg\":\"first line\"}\n" +
+		"{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}\n" +
+		"{\"_msg\":\"second line\"}\n")
+	if _, err := parseVictoriaLogs(body); err != nil {
+		t.Fatalf("parseVictoriaLogs: %v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "skipped 1 unreadable VictoriaLogs line") {
+		t.Fatalf("expected the oversized line to be logged, got %q", out)
+	}
+	if strings.Count(out, "unreadable VictoriaLogs line") != 1 {
+		t.Fatalf("expected one aggregated skip log entry, got %q", out)
+	}
+	if !strings.Contains(out, "first at line 2") {
+		t.Fatalf("expected the log to name the first skipped line, got %q", out)
+	}
+	if !strings.Contains(out, "oversized record,") || !strings.Contains(out, "bytes over the") {
+		t.Fatalf("expected the log to give the size gap as the reason, got %q", out)
 	}
 }
 
@@ -216,9 +288,9 @@ func TestParseLokiStatusError(t *testing.T) {
 }
 
 func TestParseLokiMalformed(t *testing.T) {
-	body := []byte(`not json all`)
+	body := []byte(`not json at all`)
 	if _, err := parseLoki(body); err == nil {
-		t.Fatalf("expected error malformed JSON")
+		t.Fatalf("expected error for malformed JSON")
 	}
 }
 

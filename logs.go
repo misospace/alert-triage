@@ -352,48 +352,72 @@ var errEmptyVictoriaLogsReply = errors.New("victorialogs response was empty")
 
 func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
-	scanner := bufio.NewScanner(bytes.NewReader(body))
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	// The line reader is readHistoryLines' (issue #162), reused for the
+	// oversized-record case (issue #347): a record over oversizedLineCap is
+	// skipped with only a tail sample retained, and the read continues on the
+	// following line. A bufio.Scanner cannot hold this stance — it returns
+	// bufio.ErrTooLong at its 1 MiB token cap, and the whole read failed
+	// there, which issue #342 criterion 2 reserves for an empty or wholly
+	// unparseable body.
+	r := bufio.NewReaderSize(bytes.NewReader(body), 64*1024)
 	lineNo := 0
 	lines := 0
 	parsed := 0
-	malformed := 0
+	unreadable := 0
 	var firstSkipLine int
 	var firstSkipErr error
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	for {
+		// readHistoryLine returns the whole record when it fits the cap and
+		// only a tail sample when it does not, along with the bytes consumed
+		// from the stream. io.EOF means the line ended the body, with or
+		// without a trailing newline; an in-memory reader fails no other way,
+		// so the loop breaks after processing the reported line.
+		line, _, consumed, err := readHistoryLine(r, 0)
+		if len(line) > 0 {
+			lineNo++
 		}
-		lines++
-		var record struct {
-			Message string `json:"_msg"`
-		}
-		// One malformed record — a broken plugin output, a proxy-injected
-		// line, a truncated write — must not discard the valid lines around
-		// it. This is the same skip-and-log stance readHistoryLines takes for
-		// the history JSONL: a transient parse failure must not become data
-		// loss for the whole response. The skips are logged once, aggregated,
-		// because the body is untrusted input and a hostile or garbage reply
-		// must not be able to flood the log line by line.
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			malformed++
+		if int64(consumed) > oversizedLineCap {
+			// The line is there; this reader just refuses to buffer a record
+			// that large, so it counts as a line seen and not read, and it
+			// never reaches json.Unmarshal. It is not blank, so it keeps the
+			// body out of the empty-reply case below.
+			lines++
+			unreadable++
 			if firstSkipErr == nil {
-				firstSkipLine, firstSkipErr = lineNo, err
+				firstSkipLine, firstSkipErr = lineNo, fmt.Errorf(
+					"oversized record, %d bytes over the %d cap",
+					consumed-oversizedLineCap, oversizedLineCap)
 			}
-			continue
+		} else if text := strings.TrimSpace(string(line)); text != "" {
+			lines++
+			var record struct {
+				Message string `json:"_msg"`
+			}
+			// One malformed record — a broken plugin output, a proxy-injected
+			// line, a truncated write — must not discard the valid lines around
+			// it. This is the same skip-and-log stance readHistoryLines takes for
+			// the history JSONL: a transient parse failure must not become data
+			// loss for the whole response. The skips are logged once, aggregated,
+			// because the body is untrusted input and a hostile or garbage reply
+			// must not be able to flood the log line by line.
+			if err := json.Unmarshal([]byte(text), &record); err != nil {
+				unreadable++
+				if firstSkipErr == nil {
+					firstSkipLine, firstSkipErr = lineNo, err
+				}
+			} else {
+				parsed++
+				if strings.TrimSpace(record.Message) != "" {
+					out = append(out, backendLog{message: record.Message})
+				}
+			}
 		}
-		parsed++
-		if strings.TrimSpace(record.Message) != "" {
-			out = append(out, backendLog{message: record.Message})
+		if err != nil {
+			break
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if malformed > 0 {
-		logf("enrich: skipped %d malformed VictoriaLogs line(s) (first at line %d: %v)", malformed, firstSkipLine, firstSkipErr)
+	if unreadable > 0 {
+		logf("enrich: skipped %d unreadable VictoriaLogs line(s) (first at line %d: %v)", unreadable, firstSkipLine, firstSkipErr)
 	}
 	// The guard's boundary (issue #342, criterion 2). A reply whose every line
 	// failed to parse is not an empty answer: the reply was not the NDJSON we
@@ -404,12 +428,14 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	// an empty 200 body. A body that holds at least one line which parsed is
 	// not wholly unparseable, so it degrades to the records it yielded — even
 	// when none of them carried a message, in which case the empty scope is
-	// stated rather than a query failure claimed.
+	// stated rather than a query failure claimed. An oversized line is a line
+	// seen and not read: it neither fails the read (issue #347) nor lets a
+	// body holding only oversized records slip into the empty-reply case.
 	if lines == 0 {
 		return nil, errEmptyVictoriaLogsReply
 	}
 	if parsed == 0 {
-		return nil, fmt.Errorf("victorialogs response had no parseable lines (%d malformed lines)", malformed)
+		return nil, fmt.Errorf("victorialogs response had no parseable lines (%d unreadable lines)", unreadable)
 	}
 	return out, nil
 }
