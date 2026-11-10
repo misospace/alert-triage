@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -535,5 +536,126 @@ func TestShutdownDrainFlushesBuffer(t *testing.T) {
 
 	if drained != 2 {
 		t.Errorf("drained %d alerts, want 2", drained)
+	}
+}
+
+// Metric queries are namespace-scoped at best: the fixed context metrics
+// filter only on namespace and an alert-rule expression is replayed exactly
+// as written, so a busy namespace returns one line per container per query.
+// process must cap both lists where they enter the Report, so every render
+// path — the model prompt and the /recent evidence — shows exactly cap lines
+// plus a counted summary of what was dropped (issue #341).
+func TestProcessCapsMetricSeriesLines(t *testing.T) {
+	const flood = 40
+	results := make([]queryResult, flood)
+	for i := range results {
+		results[i] = queryResult{
+			Metric: map[string]string{"namespace": "busy", "pod": fmt.Sprintf("app-%d", i), "container": "main"},
+			Values: [][]interface{}{{float64(1000), "1"}},
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/rules" {
+			json.NewEncoder(w).Encode(rulesResponse{
+				Status: "success",
+				Data: rulesData{Groups: []ruleGroup{{Rules: []ruleEntry{
+					{Name: "HighMemory", Type: "alert", Query: `container_memory_working_set_bytes{namespace="busy"}`},
+				}}}},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(queryRangeResponse{
+			Status: "success",
+			Data:   queryRangeData{ResultType: "matrix", Result: results},
+		})
+	}))
+	defer srv.Close()
+
+	// blockLines returns the "- " lines inside the fenced METRICS block whose
+	// header contains marker, or nil when no such block rendered.
+	blockLines := func(evidence, marker string) []string {
+		i := strings.Index(evidence, marker)
+		if i < 0 {
+			return nil
+		}
+		end := strings.Index(evidence[i:], untrustedEnd)
+		if end < 0 {
+			return nil
+		}
+		var lines []string
+		for _, l := range strings.Split(evidence[i:i+end], "\n") {
+			if strings.HasPrefix(l, "- ") {
+				lines = append(lines, l)
+			}
+		}
+		return lines
+	}
+
+	cases := []struct {
+		name   string
+		labels map[string]string
+		// wantSubject/wantContext are the rendered series counts before the
+		// summary line; 0 means the block must not render.
+		wantSubject int
+		subjectMore string
+		wantContext int
+		contextMore string
+	}{
+		{
+			// No pod label: the rule expression (1 query) and the three fixed
+			// context metrics all land in context, 4 × flood lines total.
+			name:        "namespace-wide flood caps context",
+			labels:      map[string]string{"alertname": "HighMemory", "namespace": "busy"},
+			wantSubject: 0,
+			wantContext: maxContextMetricSeries,
+			contextMore: fmt.Sprintf("- ...and %d more series", 4*flood-maxContextMetricSeries),
+		},
+		{
+			// Pod label present: the three fixed context metrics are
+			// subject-bounded and land in subject (3 × flood); the rule
+			// expression result stays context (1 × flood).
+			name:        "pod-scoped flood caps both tiers",
+			labels:      map[string]string{"alertname": "HighMemory", "namespace": "busy", "pod": "app-0"},
+			wantSubject: maxSubjectMetricSeries,
+			subjectMore: fmt.Sprintf("- ...and %d more series", 3*flood-maxSubjectMetricSeries),
+			wantContext: maxContextMetricSeries,
+			contextMore: fmt.Sprintf("- ...and %d more series", flood-maxContextMetricSeries),
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			hist, err := NewHistory(t.TempDir()+"/history.json", time.Hour)
+			if err != nil {
+				t.Fatalf("NewHistory: %v", err)
+			}
+			var cfg Config
+			seen := recent{max: 20}
+			prom := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+			process(context.Background(), &cfg, []Alert{{Fingerprint: "flood", Labels: tt.labels}}, nil, hist, &seen, prom)
+
+			recs := seen.snapshot()
+			if len(recs) != 1 {
+				t.Fatalf("digests recorded = %d, want 1", len(recs))
+			}
+			ev := recs[0].Evidence
+
+			check := func(marker string, want int, wantMore string) {
+				lines := blockLines(ev, marker)
+				if want == 0 {
+					if lines != nil {
+						t.Errorf("metrics block %q rendered %d lines, want none:\n%s", marker, len(lines), strings.Join(lines, "\n"))
+					}
+					return
+				}
+				if len(lines) != want+1 {
+					t.Fatalf("metrics block %q rendered %d lines, want %d series plus the summary:\n%s", marker, len(lines), want, strings.Join(lines, "\n"))
+				}
+				if got := lines[len(lines)-1]; got != wantMore {
+					t.Errorf("summary line = %q, want %q", got, wantMore)
+				}
+			}
+			check("METRICS (queried from metrics backend for the resolved subject", tt.wantSubject, tt.subjectMore)
+			check("METRICS (queried from metrics backend for the namespace", tt.wantContext, tt.contextMore)
+		})
 	}
 }

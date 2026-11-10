@@ -30,8 +30,34 @@ type Report struct {
 	// ContextMetrics are metric summaries that may span the namespace or
 	// cluster: alert-rule expression results and fixed context metrics without
 	// a pod label. They render in CONTEXT / BACKGROUND, never as subject
-	// evidence.
+	// evidence. Every other evidence list is capped where enrichment fills
+	// it; these are capped where they enter the Report (see process), so no
+	// renderer ever sees an uncapped list.
 	ContextMetrics []string
+}
+
+// maxSubjectMetricSeries and maxContextMetricSeries bound the metric lines a
+// group may render. The fixed context queries filter only on namespace and an
+// alert-rule expression is replayed exactly as written, so a busy namespace
+// returns one line per container per query — hundreds of series — and they
+// used to reach the prompt and /recent unbounded, inflating per-digest model
+// spend and drowning the signal (issue #341). The caps sit above a normal
+// workload's line count; past the cap the loss is rendered as a count rather
+// than dropped silently, the way capList handles every other list.
+const (
+	maxSubjectMetricSeries = 12
+	maxContextMetricSeries = 30
+)
+
+// capMetricSeries trims a metric summary list to n and replaces the dropped
+// tail with a count line. It is capList worded for series, so the reader
+// knows what the missing lines were; capList's own "more" suffix would not
+// say what was omitted.
+func capMetricSeries(in []string, n int) []string {
+	if len(in) <= n {
+		return in
+	}
+	return append(in[:n:n], fmt.Sprintf("...and %d more series", len(in)-n))
 }
 
 // Triage is the model's judgement about where a fix would have to be made. It
