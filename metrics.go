@@ -263,10 +263,18 @@ type metricSeriesSource struct {
 // reported as series and vice versa.
 func budgetMetricLines(notes []string, sources []metricSeriesSource, max int) []string {
 	if len(notes) > max-1 {
-		out := append([]string{}, notes[:max-1]...)
-		out = append(out, fmt.Sprintf("...and %d more notes", len(notes)-(max-1)))
-		if n := countUnshownSeries(sources, []int{}); n > 0 {
-			out = append(out, fmt.Sprintf("...and %d more series", n))
+		unshownSeries := countUnshownSeries(sources, nil)
+		// Both count lines must fit inside max, so the notes keep one slot
+		// each: a dropped series tail is never allowed to push the list past
+		// the cap the writer-side guard was sized against.
+		keep := max - 1
+		if unshownSeries > 0 {
+			keep = max - 2
+		}
+		out := append([]string{}, notes[:keep]...)
+		out = append(out, fmt.Sprintf("...and %d more notes", len(notes)-keep))
+		if unshownSeries > 0 {
+			out = append(out, fmt.Sprintf("...and %d more series", unshownSeries))
 		}
 		return out
 	}

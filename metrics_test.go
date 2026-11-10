@@ -1035,9 +1035,9 @@ func TestEnrichMemoryRatioMismatchedContainers(t *testing.T) {
 	}
 }
 
-// matrixMatrix builds a matrix response of n single-point series labeled
+// floodMatrix builds a matrix response of n single-point series labeled
 // pod=pod-<i>, to simulate one query source flooding with many series.
-func floodMatrix(name string, n int) queryRangeResponse {
+func floodMatrix(n int) queryRangeResponse {
 	results := make([]queryResult, 0, n)
 	for i := 0; i < n; i++ {
 		results = append(results, queryResult{
@@ -1048,18 +1048,14 @@ func floodMatrix(name string, n int) queryRangeResponse {
 	return queryRangeResponse{Status: "success", Data: queryRangeData{ResultType: "matrix", Result: results}}
 }
 
-func smallMatrix(n int) queryRangeResponse {
-	return floodMatrix("", n)
-}
-
 func TestEnrichMetricFloodKeepsFixedContextAndNotes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("query")
 		switch {
 		case strings.Contains(query, "fake_flood_metric_total"):
-			json.NewEncoder(w).Encode(floodMatrix("flood", 40))
+			json.NewEncoder(w).Encode(floodMatrix(40))
 		default:
-			json.NewEncoder(w).Encode(smallMatrix(2))
+			json.NewEncoder(w).Encode(floodMatrix(2))
 		}
 	}))
 	defer srv.Close()
@@ -1111,7 +1107,7 @@ func TestEnrichMetricFloodKeepsFixedContextAndNotes(t *testing.T) {
 
 func TestEnrichMetricFairShareAcrossFloodingSources(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(floodMatrix("flood", 40))
+		json.NewEncoder(w).Encode(floodMatrix(40))
 	}))
 	defer srv.Close()
 
@@ -1147,13 +1143,13 @@ func TestEnrichMetricFairShareAcrossFloodingSources(t *testing.T) {
 
 func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("no query should run when no alert has a rule expression")
+		json.NewEncoder(w).Encode(floodMatrix(3))
 	}))
 	defer srv.Close()
 
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 	var alerts []Alert
-	rules := map[string]string{}
+	rules := map[string]string{"Alert00": "fake_flood_metric_total > 1"}
 	for i := 0; i < maxContextMetricLines+6; i++ {
 		name := fmt.Sprintf("Alert%02d", i)
 		alerts = append(alerts, Alert{Labels: map[string]string{"alertname": name}})
@@ -1161,26 +1157,43 @@ func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
 	g := Group{Alerts: alerts}
 	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
 
+	// 29 missing-rule notes overflow the cap next to one real series source:
+	// both dropped kinds get their own accurate count and the total still
+	// respects the cap (the writer-side guard was sized against it).
 	if len(ev.Context) != maxContextMetricLines {
 		t.Fatalf("expected exactly the cap, got %d: %v", len(ev.Context), ev.Context)
 	}
-	last := ev.Context[len(ev.Context)-1]
-	want := fmt.Sprintf("...and %d more notes", maxContextMetricLines+6-(maxContextMetricLines-1))
-	if last != want {
-		t.Errorf("dropped notes must be counted as notes, got %q in %v", last, ev.Context)
-	}
+	droppedNotes := maxContextMetricLines + 5 - (maxContextMetricLines - 2)
+	var sawNoteTail, sawSeriesTail bool
 	for _, line := range ev.Context {
-		if strings.Contains(line, "more series") {
-			t.Errorf("series count line when no series existed: %q", line)
+		switch line {
+		case fmt.Sprintf("...and %d more notes", droppedNotes):
+			sawNoteTail = true
+		case "...and 3 more series":
+			sawSeriesTail = true
 		}
+		if strings.HasPrefix(line, "Alert00 ") {
+			t.Errorf("series rendered with no budget left for it: %q", line)
+		}
+	}
+	if !sawNoteTail || !sawSeriesTail {
+		t.Errorf("dropped notes and series must be counted separately, got %v", ev.Context)
 	}
 }
 
 func TestEnrichMetricHeadIsDeterministic(t *testing.T) {
-	resp := floodMatrix("flood", 10)
-	// Simulate the backend returning series in an arbitrary order.
-	resp.Data.Result[0], resp.Data.Result[7] = resp.Data.Result[7], resp.Data.Result[0]
+	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := floodMatrix(10)
+		if calls%2 == 1 {
+			// The backend gives no order guarantee: serve the same series in
+			// reverse so order-independence of the kept head is actually
+			// exercised, not just sort stability against one identical reply.
+			for i, j := 0, len(resp.Data.Result)-1; i < j; i, j = i+1, j-1 {
+				resp.Data.Result[i], resp.Data.Result[j] = resp.Data.Result[j], resp.Data.Result[i]
+			}
+		}
+		calls++
 		json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
@@ -1201,7 +1214,7 @@ func TestEnrichMetricHeadIsDeterministic(t *testing.T) {
 
 func TestEnrichMetricSubjectBudgetUnderFlood(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(floodMatrix("flood", 30))
+		json.NewEncoder(w).Encode(floodMatrix(30))
 	}))
 	defer srv.Close()
 
