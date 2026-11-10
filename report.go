@@ -44,6 +44,10 @@ type Report struct {
 // spend and drowning the signal (issue #341). The caps sit above a normal
 // workload's line count; past the cap the loss is rendered as a count rather
 // than dropped silently, the way capList handles every other list.
+//
+// The enrichment budget in metrics.go uses these same bounds per source
+// (issue #344), so this writer-side cap stays an outer backstop and in the
+// normal pipeline trims nothing.
 const (
 	maxSubjectMetricSeries = 12
 	maxContextMetricSeries = 30

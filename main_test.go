@@ -542,11 +542,18 @@ func TestShutdownDrainFlushesBuffer(t *testing.T) {
 // Metric queries are namespace-scoped at best: the fixed context metrics
 // filter only on namespace and an alert-rule expression is replayed exactly
 // as written, so a busy namespace returns one line per container per query.
-// process must cap both lists where they enter the Report, so every render
-// path — the model prompt and the /recent evidence — shows exactly cap lines
-// plus a counted summary of what was dropped (issue #341).
+// The enrichment budget in metrics.go splits its per-group bounds per source
+// and counts what it drops; the writer-side capMetricSeries in report.go is
+// the outer backstop, so a flood can only ever render a bounded head plus
+// counted summaries, never an unbounded list (issues #341, #344).
 func TestProcessCapsMetricSeriesLines(t *testing.T) {
 	const flood = 40
+	// The per-source tail path is only exercised while a source returns more
+	// series than maxMetricSeriesPerSource; a fixture below that share would
+	// let the expectations adapt symbolically and go vacuously green.
+	if flood <= maxMetricSeriesPerSource {
+		t.Fatalf("flood fixture %d must exceed the per-source share %d", flood, maxMetricSeriesPerSource)
+	}
 	results := make([]queryResult, flood)
 	for i := range results {
 		results[i] = queryResult{
@@ -594,32 +601,47 @@ func TestProcessCapsMetricSeriesLines(t *testing.T) {
 	cases := []struct {
 		name   string
 		labels map[string]string
-		// wantSubject/wantContext are the rendered series counts before the
-		// summary line; 0 means the block must not render.
-		wantSubject int
-		subjectMore string
-		wantContext int
-		contextMore string
+		// wantSubjectSeries/wantContextSeries pin the composed render: the
+		// number of series lines the enrichment budget keeps, followed by the
+		// exact counted summary lines in *Tails. 0 series means the block
+		// must not render. The total must stay within the writer-side cap.
+		wantSubjectSeries int
+		subjectTails      []string
+		wantContextSeries int
+		contextTails      []string
 	}{
 		{
 			// No pod label: the rule expression (1 query) and the three fixed
-			// context metrics all land in context, 4 × flood lines total.
-			name:        "namespace-wide flood caps context",
-			labels:      map[string]string{"alertname": "HighMemory", "namespace": "busy"},
-			wantSubject: 0,
-			wantContext: maxContextMetricSeries,
-			contextMore: fmt.Sprintf("- ...and %d more series", 4*flood-maxContextMetricSeries),
+			// context metrics all land in context, 4 sources × 40 series each.
+			// Round-robin gives each source its per-source share, and each
+			// flooded source keeps one counted tail line in source order.
+			name:              "namespace-wide flood caps context",
+			labels:            map[string]string{"alertname": "HighMemory", "namespace": "busy"},
+			wantSubjectSeries: 0,
+			wantContextSeries: 4 * maxMetricSeriesPerSource,
+			contextTails: []string{
+				fmt.Sprintf("- ...and %d more series for HighMemory", flood-maxMetricSeriesPerSource),
+				fmt.Sprintf("- ...and %d more series for container_restarts", flood-maxMetricSeriesPerSource),
+				fmt.Sprintf("- ...and %d more series for memory_working_set", flood-maxMetricSeriesPerSource),
+				fmt.Sprintf("- ...and %d more series for cpu_throttle_ratio", flood-maxMetricSeriesPerSource),
+			},
 		},
 		{
 			// Pod label present: the three fixed context metrics are
 			// subject-bounded and land in subject (3 × flood); the rule
-			// expression result stays context (1 × flood).
-			name:        "pod-scoped flood caps both tiers",
-			labels:      map[string]string{"alertname": "HighMemory", "namespace": "busy", "pod": "app-0"},
-			wantSubject: maxSubjectMetricSeries,
-			subjectMore: fmt.Sprintf("- ...and %d more series", 3*flood-maxSubjectMetricSeries),
-			wantContext: maxContextMetricSeries,
-			contextMore: fmt.Sprintf("- ...and %d more series", flood-maxContextMetricSeries),
+			// expression result stays context (1 × flood). The subject list
+			// cap binds before the per-source share does: it reserves one
+			// slot for its trailing count and keeps the rest round-robin.
+			name:              "pod-scoped flood caps both tiers",
+			labels:            map[string]string{"alertname": "HighMemory", "namespace": "busy", "pod": "app-0"},
+			wantSubjectSeries: maxSubjectMetricSeries - 1,
+			subjectTails: []string{
+				fmt.Sprintf("- ...and %d more series", 3*flood-(maxSubjectMetricSeries-1)),
+			},
+			wantContextSeries: maxMetricSeriesPerSource,
+			contextTails: []string{
+				fmt.Sprintf("- ...and %d more series for HighMemory", flood-maxMetricSeriesPerSource),
+			},
 		},
 	}
 	for _, tt := range cases {
@@ -639,7 +661,7 @@ func TestProcessCapsMetricSeriesLines(t *testing.T) {
 			}
 			ev := recs[0].Evidence
 
-			check := func(marker string, want int, wantMore string) {
+			check := func(marker string, want int, tails []string, limit int) {
 				lines := blockLines(ev, marker)
 				if want == 0 {
 					if lines != nil {
@@ -647,15 +669,20 @@ func TestProcessCapsMetricSeriesLines(t *testing.T) {
 					}
 					return
 				}
-				if len(lines) != want+1 {
-					t.Fatalf("metrics block %q rendered %d lines, want %d series plus the summary:\n%s", marker, len(lines), want, strings.Join(lines, "\n"))
+				if len(lines) > limit {
+					t.Errorf("metrics block %q rendered %d lines, over the writer-side cap %d:\n%s", marker, len(lines), limit, strings.Join(lines, "\n"))
 				}
-				if got := lines[len(lines)-1]; got != wantMore {
-					t.Errorf("summary line = %q, want %q", got, wantMore)
+				if len(lines) != want+len(tails) {
+					t.Fatalf("metrics block %q rendered %d lines, want %d series plus %d counted summaries:\n%s", marker, len(lines), want, len(tails), strings.Join(lines, "\n"))
+				}
+				for i, wantTail := range tails {
+					if got := lines[want+i]; got != wantTail {
+						t.Errorf("summary line %d = %q, want %q", i, got, wantTail)
+					}
 				}
 			}
-			check("METRICS (queried from metrics backend for the resolved subject", tt.wantSubject, tt.subjectMore)
-			check("METRICS (queried from metrics backend for the namespace", tt.wantContext, tt.contextMore)
+			check("METRICS (queried from metrics backend for the resolved subject", tt.wantSubjectSeries, tt.subjectTails, maxSubjectMetricSeries)
+			check("METRICS (queried from metrics backend for the namespace", tt.wantContextSeries, tt.contextTails, maxContextMetricSeries)
 		})
 	}
 }

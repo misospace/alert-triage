@@ -1037,6 +1037,8 @@ func TestEnrichMemoryRatioMismatchedContainers(t *testing.T) {
 
 // floodMatrix builds a matrix response of n single-point series labeled
 // pod=pod-<i>, to simulate one query source flooding with many series.
+// floodMatrix serves n series in one source. Callers rely on n exceeding
+// maxMetricSeriesPerSource so the per-source counted-tail path is exercised.
 func floodMatrix(n int) queryRangeResponse {
 	results := make([]queryResult, 0, n)
 	for i := 0; i < n; i++ {
@@ -1100,7 +1102,7 @@ func TestEnrichMetricFloodKeepsFixedContextAndNotes(t *testing.T) {
 	if !sawTail {
 		t.Errorf("expected a per-source counted tail line, got %v", ev.Context)
 	}
-	if len(ev.Context) > maxContextMetricLines {
+	if len(ev.Context) > maxContextMetricSeries {
 		t.Errorf("context exceeded the per-group cap: %d lines", len(ev.Context))
 	}
 }
@@ -1150,7 +1152,7 @@ func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
 	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
 	var alerts []Alert
 	rules := map[string]string{"Alert00": "fake_flood_metric_total > 1"}
-	for i := 0; i < maxContextMetricLines+6; i++ {
+	for i := 0; i < maxContextMetricSeries+6; i++ {
 		name := fmt.Sprintf("Alert%02d", i)
 		alerts = append(alerts, Alert{Labels: map[string]string{"alertname": name}})
 	}
@@ -1160,10 +1162,10 @@ func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
 	// 29 missing-rule notes overflow the cap next to one real series source:
 	// both dropped kinds get their own accurate count and the total still
 	// respects the cap (the writer-side guard was sized against it).
-	if len(ev.Context) != maxContextMetricLines {
+	if len(ev.Context) != maxContextMetricSeries {
 		t.Fatalf("expected exactly the cap, got %d: %v", len(ev.Context), ev.Context)
 	}
-	droppedNotes := maxContextMetricLines + 5 - (maxContextMetricLines - 2)
+	droppedNotes := maxContextMetricSeries + 5 - (maxContextMetricSeries - 2)
 	var sawNoteTail, sawSeriesTail bool
 	for _, line := range ev.Context {
 		switch line {
@@ -1224,7 +1226,7 @@ func TestEnrichMetricSubjectBudgetUnderFlood(t *testing.T) {
 	}}}}
 	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, nil, nil)
 
-	if len(ev.Subject) > maxSubjectMetricLines {
+	if len(ev.Subject) > maxSubjectMetricSeries {
 		t.Fatalf("subject exceeded its cap: %d lines", len(ev.Subject))
 	}
 	seen := map[string]bool{}

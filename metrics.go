@@ -235,11 +235,11 @@ type MetricEvidence struct {
 // per source where the sources are still known: every source gets a bounded
 // share, diagnostics are kept unless diagnostics alone exceed the cap, and
 // each dropped tail is counted with the kind of line it is (series vs notes).
-const (
-	maxSubjectMetricLines    = 12
-	maxContextMetricLines    = 24
-	maxMetricSeriesPerSource = 6
-)
+// The budget itself uses the same bounds as the writer-side guard
+// (maxSubjectMetricSeries and maxContextMetricSeries in report.go), so the
+// enrichment output already respects the cap and the guard stays an outer
+// backstop for any future path that assembles metric lists elsewhere.
+const maxMetricSeriesPerSource = 6
 
 // metricSeriesSource is the series one metric source (one alert-rule
 // expression, or one fixed context query) contributes before budgeting.
@@ -270,6 +270,11 @@ func budgetMetricLines(notes []string, sources []metricSeriesSource, max int) []
 		keep := max - 1
 		if unshownSeries > 0 {
 			keep = max - 2
+		}
+		// Tests call this with arbitrary caps; a cap below 2 would otherwise
+		// slice notes negative. The count lines then carry everything.
+		if keep < 0 {
+			keep = 0
 		}
 		out := append([]string{}, notes[:keep]...)
 		out = append(out, fmt.Sprintf("...and %d more notes", len(notes)-keep))
@@ -372,7 +377,7 @@ func sortMetricSummaries(summaries []metricSummary) {
 // distinguishes an unreachable backend from "not configured". A non-nil
 // rulesErr (from a failed FetchRules) yields the single "metrics backend error"
 // line. Each source's contribution is budgeted per group (issue #344, see
-// maxContextMetricLines) so a flooding rule-expression result cannot evict
+// maxContextMetricSeries) so a flooding rule-expression result cannot evict
 // the fixed context queries or the per-alert diagnostics.
 func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) MetricEvidence {
 	var out MetricEvidence
@@ -441,13 +446,13 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	if ns != "" {
 		fixedNotes, fixedSources := p.queryContextMetrics(ctx, ns, pod, start, now, step)
 		if pod != "" {
-			out.Subject = budgetMetricLines(fixedNotes, fixedSources, maxSubjectMetricLines)
+			out.Subject = budgetMetricLines(fixedNotes, fixedSources, maxSubjectMetricSeries)
 		} else {
 			notes = append(notes, fixedNotes...)
 			sources = append(sources, fixedSources...)
 		}
 	}
-	out.Context = budgetMetricLines(notes, sources, maxContextMetricLines)
+	out.Context = budgetMetricLines(notes, sources, maxContextMetricSeries)
 
 	return out
 }
