@@ -116,6 +116,17 @@ type backendLogResult struct {
 	// namespace": a refused scope is uninspected, not empty (issue #311
 	// review, #331).
 	SkippedRefused bool
+	// SkippedUnresolved lists the valid namespaces (one path segment) that
+	// received no query at all: the group resolved a subject pod in another
+	// namespace, and a resolved-subject group queries only those pods, so a
+	// namespace without one is silently uninspected. An uninspected scope
+	// must not render as "returned no lines" any more than a refused one may
+	// (#311 review, #331), so it is surfaced here instead — but the cause is
+	// different (no subject, not a refused name), so it keeps its own marker
+	// (issue #339). The names are alert-supplied: callers that render them
+	// must apply the same redaction and untrusted treatment they apply to
+	// every other namespace render.
+	SkippedUnresolved []string
 }
 
 // ambientLogMarker prefixes namespace-wide backend-log lines returned when no
@@ -187,6 +198,9 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	// irrelevant text. It is issued only when no subject could be resolved.
 	byNS := targetPodsByNamespace(targetPods)
 	skippedRefused := false
+	// Set, not slice: a hand-built Group can repeat a namespace, and the
+	// gap must be named once. Sorted at return for a stable render.
+	skippedUnresolved := map[string]bool{}
 
 	for _, namespace := range g.Namespaces {
 		// The namespace is alert-supplied text. The query quotes it, so the
@@ -204,7 +218,15 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		}
 		var pods []string
 		if len(byNS) > 0 {
+			// With a resolved subject anywhere in the group only resolved
+			// pods are queried, so a valid namespace with none of them sends
+			// no request, not even the namespace-wide fallback. Name the gap
+			// instead of leaving it to render as an empty scope (#339).
 			pods = byNS[namespace]
+			if len(pods) == 0 {
+				skippedUnresolved[namespace] = true
+				continue
+			}
 		} else {
 			pods = []string{""}
 		}
@@ -240,14 +262,20 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	collapsed := collapseAndCap(seen, order, b.limit)
 	if len(byNS) == 0 {
 		// No concrete subject: everything returned is namespace-wide, so mark it
-		// ambient and keep it out of the primary evidence.
+		// ambient and keep it out of the primary evidence. The fallback ran for
+		// every valid namespace here, so skippedUnresolved is necessarily empty.
 		marked := make([]string, len(collapsed))
 		for i, line := range collapsed {
 			marked[i] = ambientLogMarker + line
 		}
 		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused}, nil
 	}
-	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused}, nil
+	var unresolved []string
+	for ns := range skippedUnresolved {
+		unresolved = append(unresolved, ns)
+	}
+	sort.Strings(unresolved)
+	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved}, nil
 }
 
 // quoteLogValue renders a label value as a double-quoted literal with `"` and

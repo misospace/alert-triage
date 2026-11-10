@@ -543,6 +543,101 @@ func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
 	}
 }
 
+// TestFetchBackendLogsUnresolvedNamespaceSurfaced pins #339, the branch of
+// the #331 rule that fix did not cover: once the group resolved any subject,
+// only resolved pods are queried, so a valid second namespace with no
+// resolved pod sends no request at all. The gap must reach the caller as
+// SkippedUnresolved — whether or not the queried scope returned lines — so
+// an uninspected namespace can never render as "the backend has no lines for
+// it". The no-subject fallback queries every valid namespace, so it must
+// claim no such gap.
+func TestFetchBackendLogsUnresolvedNamespaceSurfaced(t *testing.T) {
+	cases := []struct {
+		name           string
+		targetPods     map[string]bool
+		withLines      bool
+		wantQueries    []string
+		wantUnresolved []string
+	}{
+		{
+			name:           "subject-scoped query skips the subject-less namespace",
+			targetPods:     map[string]bool{"ns-a/p1": true},
+			wantQueries:    []string{`{namespace="ns-a",pod="p1"}`},
+			wantUnresolved: []string{"ns-b"},
+		},
+		{
+			// The gap is a fact about the queries sent, not about the
+			// result size: it must survive alongside real lines.
+			name:           "gap surfaced even when the queried namespace returns lines",
+			targetPods:     map[string]bool{"ns-a/p1": true},
+			withLines:      true,
+			wantQueries:    []string{`{namespace="ns-a",pod="p1"}`},
+			wantUnresolved: []string{"ns-b"},
+		},
+		{
+			name:        "no-subject fallback queries every namespace and claims no gap",
+			targetPods:  map[string]bool{},
+			wantQueries: []string{`{namespace="ns-a"}`, `{namespace="ns-b"}`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query().Get("query")
+				queries = append(queries, q)
+				w.Header().Set("Content-Type", "application/json")
+				if tc.withLines && q == `{namespace="ns-a",pod="p1"}` {
+					_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns-a"},"values":[["1","subject line"]]}]}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			}))
+			t.Cleanup(srv.Close)
+
+			b := &logsBackend{
+				url:    srv.URL,
+				flavor: "loki",
+				limit:  50,
+				hc:     srv.Client(),
+			}
+			g := Group{
+				Namespaces: []string{"ns-a", "ns-b"},
+				Alerts: []Alert{
+					{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+					{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b"}},
+				},
+			}
+			res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
+			if err != nil {
+				t.Fatalf("fetchBackendLogsResult: %v", err)
+			}
+			if len(queries) != len(tc.wantQueries) {
+				t.Fatalf("queries = %v, want %v", queries, tc.wantQueries)
+			}
+			for i, q := range queries {
+				if q != tc.wantQueries[i] {
+					t.Errorf("query %d = %q, want %q", i, q, tc.wantQueries[i])
+				}
+			}
+			if tc.withLines && len(res.Primary) == 0 {
+				t.Errorf("the queried namespace's lines must still come back as primary")
+			}
+			if len(res.SkippedUnresolved) != len(tc.wantUnresolved) {
+				t.Fatalf("SkippedUnresolved = %#v, want %#v", res.SkippedUnresolved, tc.wantUnresolved)
+			}
+			for i, ns := range res.SkippedUnresolved {
+				if ns != tc.wantUnresolved[i] {
+					t.Errorf("SkippedUnresolved[%d] = %q, want %q", i, ns, tc.wantUnresolved[i])
+				}
+			}
+			if res.SkippedRefused {
+				t.Errorf("a valid subject-less namespace is a distinct gap from a refused one")
+			}
+		})
+	}
+}
+
 // TestFetchBackendLogsNoSubjectIsAmbient verifies the fallback: with no
 // concrete subject the namespace-wide lookup still runs, but its result is
 // explicitly marked ambient and never placed in the primary evidence.
