@@ -165,6 +165,10 @@ func TestPrometheusFetchRules(t *testing.T) {
 					{Name: "HighMemory", Type: "alert", Query: "container_memory_working_set_bytes / container_memory_limit_bytes > 0.9"},
 					{Name: "NodeDown", Type: "alert", Query: "up == 0"},
 					{Name: "recorded_metric", Type: "recording", Query: "sum(rate(...))"},
+					// promxy behind Prometheus types the same rules "alerting"
+					// (issue #353); a recording rule there is still "recording".
+					{Name: "KubePodCrashLooping", Type: "alerting", Query: "increase(kube_pod_container_status_restarts_total[10m]) > 3"},
+					{Name: "recorded_metric_alerting_shape", Type: "recording", Query: "avg(rate(y_total[5m]))"},
 				},
 			}},
 		},
@@ -190,8 +194,14 @@ func TestPrometheusFetchRules(t *testing.T) {
 	if _, ok := rules["NodeDown"]; !ok {
 		t.Error("missing NodeDown rule")
 	}
+	if got := rules["KubePodCrashLooping"]; got != "increase(kube_pod_container_status_restarts_total[10m]) > 3" {
+		t.Errorf("KubePodCrashLooping = %q, want expression; rules typed \"alerting\" must resolve (issue #353)", got)
+	}
 	if _, ok := rules["recorded_metric"]; ok {
 		t.Error("recording rule should not be included")
+	}
+	if _, ok := rules["recorded_metric_alerting_shape"]; ok {
+		t.Error("recording rule should not be included on an \"alerting\"-typed backend")
 	}
 }
 
@@ -310,6 +320,63 @@ func TestEnrichMetricsWithRulesSharesRulesAcrossGroups(t *testing.T) {
 	}
 	if len(ev1.Context) == 0 || len(ev2.Context) == 0 {
 		t.Errorf("expected rule metric lines for both groups, got %v / %v", ev1, ev2)
+	}
+}
+
+// TestEnrichMetricsAlertingRuleTypeYieldsSeriesEvidence pins issue #353: a
+// backend that types rules "alerting" (promxy in front of Prometheus) must
+// produce rule-expression series evidence, not the missing-rule note, for
+// every alert in the group.
+func TestEnrichMetricsAlertingRuleTypeYieldsSeriesEvidence(t *testing.T) {
+	rulesResp := rulesResponse{
+		Status: "success",
+		Data: rulesData{
+			Groups: []ruleGroup{{
+				Rules: []ruleEntry{
+					{Name: "HighMemory", Type: "alerting", Query: "container_memory_working_set_bytes > 1000"},
+				},
+			}},
+		},
+	}
+	queryResp := queryRangeResponse{
+		Status: "success",
+		Data: queryRangeData{
+			ResultType: "matrix",
+			Result: []queryResult{{
+				Metric: map[string]string{"namespace": "default", "pod": "web-1"},
+				Values: [][]interface{}{{float64(1000), "1200"}},
+			}},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/rules":
+			json.NewEncoder(w).Encode(rulesResp)
+		case "/api/v1/query_range":
+			json.NewEncoder(w).Encode(queryResp)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	rules, err := p.fetchRules(context.Background())
+	if err != nil {
+		t.Fatalf("fetchRules: %v", err)
+	}
+
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}}}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	for _, line := range ev.Context {
+		if strings.Contains(line, "no rule expression found") {
+			t.Errorf("alerting-typed rule fell through to the missing-rule note: %q", line)
+		}
+	}
+	if len(ev.Context) == 0 || !strings.HasPrefix(ev.Context[0], "HighMemory min=") {
+		t.Errorf("expected series evidence for HighMemory, got %v", ev.Context)
 	}
 }
 
