@@ -536,11 +536,12 @@ type Enrichment struct {
 	// than trusting them as a service reading.
 	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
-	// "off", "empty", "ambient", or "error" so missing configuration is not
-	// confused with a successful query that returned no lines. "empty" means
-	// the queries issued returned no lines; "ambient" means no concrete subject
-	// could be resolved, the namespace-wide fallback did return lines, and those
-	// lines were routed to Ambient — the source is configured and answered.
+	// "off", "ok", "empty", "ambient", "refused", "partial", "unavailable",
+	// or "error" so missing configuration is not confused with a successful
+	// query that returned no lines. "empty" means the queries issued returned
+	// no lines; "ambient" means no concrete subject could be resolved, the
+	// namespace-wide fallback did return lines, and those lines were routed to
+	// Ambient — the source is configured and answered.
 	BackendLogs  []string
 	BackendState string
 	// BackendScoped records whether the backend-log query was bounded to a
@@ -548,6 +549,14 @@ type Enrichment struct {
 	// the "empty" state honest: only a subject-scoped query may claim it
 	// returned no lines for the subject (issue #136 review).
 	BackendScoped bool
+	// BackendUnqueried names the namespaces the "partial" state refers to:
+	// valid namespaces the group named that received no backend-log query
+	// because the group's resolved subjects lived in other namespaces and the
+	// query was pod-scoped. The renderer must surface them as uninspected,
+	// never as an empty scope — the rule #311/#331 hold for refused
+	// namespaces, on the branch that fix did not cover (issue #339).
+	// Alert-supplied: render like any other namespace value.
+	BackendUnqueried []string
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -1311,6 +1320,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			e.Ambient = append(e.Ambient, res.Ambient...)
 			switch {
 			case len(res.Primary) > 0:
+				// The unqueried and refused gap markers are deliberately
+				// consumed only when no lines came back: with primary
+				// evidence rendered, silence about a skipped scope cannot
+				// read as an empty negative, and #331 set exactly this
+				// precedence for a refused sibling (#339 follows it).
 				e.BackendState = "ok"
 			case len(res.Ambient) > 0:
 				// The backend did return lines — it is the no-subject
@@ -1324,6 +1338,15 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				// lines for it" negative. The gap gets its own state, exactly
 				// as the pod scan does (issue #311 review, #331).
 				e.BackendState = "refused"
+			case len(res.SkippedUnresolved) > 0:
+				// A namespace with no resolved subject sent no request under
+				// the pod-scoped query either, so "empty" would be the same
+				// false negative with a different cause (issue #339). When a
+				// group has both gaps the refused state wins: it is the rarer
+				// and more alarming cause, and its wording states a gap that
+				// is always true here.
+				e.BackendUnqueried = res.SkippedUnresolved
+				e.BackendState = "partial"
 			default:
 				e.BackendState = "empty"
 			}

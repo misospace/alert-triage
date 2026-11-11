@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,21 +33,223 @@ func TestParseVictoriaLogsSuccess(t *testing.T) {
 
 func TestParseVictoriaLogsMalformed(t *testing.T) {
 	body := []byte("this is not json\nand neither is this")
-	if _, err := parseVictoriaLogs(body); err == nil {
-		t.Fatalf("expected error for malformed JSONL")
+	_, err := parseVictoriaLogs(body)
+	if err == nil {
+		t.Fatalf("expected error for wholly unparseable JSONL")
+	}
+	if !strings.Contains(err.Error(), "2 unreadable lines") {
+		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
+	}
+	// A wholly unparseable body is unreadable, not empty: it must not be
+	// reported as the empty reply, which the caller maps to an empty scope.
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("a wholly unparseable body must not be reported as an empty reply: %v", err)
 	}
 }
 
-func TestParseVictoriaLogsEmpty(t *testing.T) {
-	records, err := parseVictoriaLogs([]byte(""))
+// TestParseVictoriaLogsLogsSkippedLine pins that a skipped malformed line is
+// surfaced, not just tolerated (issue #342 criterion 1): the skip is logged
+// once, in aggregate, with the number of lines skipped and where the first
+// one was.
+func TestParseVictoriaLogsLogsSkippedLine(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	body := []byte("{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	if _, err := parseVictoriaLogs(body); err != nil {
+		t.Fatalf("parseVictoriaLogs: %v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "skipped 1 unreadable VictoriaLogs line") {
+		t.Fatalf("expected the skipped line to be logged, got %q", out)
+	}
+	if strings.Count(out, "unreadable VictoriaLogs line") != 1 {
+		t.Fatalf("expected one aggregated skip log entry, got %q", out)
+	}
+	if !strings.Contains(out, "first at line 2") {
+		t.Fatalf("expected the log to name the first skipped line, got %q", out)
+	}
+}
+
+// TestParseVictoriaLogsOversizedMiddleLine pins the #347 case: a record over
+// the size cap must not end the read. The old bufio.Scanner failed the whole
+// reply with bufio.ErrTooLong at such a line; now it is skipped like a
+// malformed one and the records on both sides survive. The oversized record
+// here is valid JSON, so this pins the size skip itself and not a parse
+// failure: a record that big is never handed to json.Unmarshal.
+func TestParseVictoriaLogsOversizedMiddleLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\n" +
+		"{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}\n" +
+		"{\"_msg\":\"second line\"}\n")
+	records, err := parseVictoriaLogs(body)
 	if err != nil {
-		t.Fatalf("empty input should not error: %v", err)
+		t.Fatalf("oversized middle record must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected the 2 records around the oversized one, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "first line" || records[1].message != "second line" {
+		t.Fatalf("records around the oversized line must survive: %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsOversizedOnlyLine pins the other side of the #347
+// case against criterion 2: a body holding nothing but an oversized record is
+// wholly unparseable, not an empty reply. It must not be mapped back to "no
+// lines in the window" — the reply carried a line, we just refuse to buffer
+// a record that large.
+func TestParseVictoriaLogsOversizedOnlyLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}")
+	_, err := parseVictoriaLogs(body)
+	if err == nil {
+		t.Fatalf("an oversized-only body must be refused")
+	}
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("an oversized-only body is unreadable, not empty: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 unreadable lines") {
+		t.Fatalf("error should report the skipped-line count, got %q", err.Error())
+	}
+}
+
+// TestParseVictoriaLogsLogsOversizedLine pins that a skipped oversized
+// record is surfaced in the same aggregated skip log, with the size gap as
+// its reason.
+func TestParseVictoriaLogsLogsOversizedLine(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	body := []byte("{\"_msg\":\"first line\"}\n" +
+		"{\"_msg\":\"" + strings.Repeat("y", oversizedLineCap+1) + "\"}\n" +
+		"{\"_msg\":\"second line\"}\n")
+	if _, err := parseVictoriaLogs(body); err != nil {
+		t.Fatalf("parseVictoriaLogs: %v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "skipped 1 unreadable VictoriaLogs line") {
+		t.Fatalf("expected the oversized line to be logged, got %q", out)
+	}
+	if strings.Count(out, "unreadable VictoriaLogs line") != 1 {
+		t.Fatalf("expected one aggregated skip log entry, got %q", out)
+	}
+	if !strings.Contains(out, "first at line 2") {
+		t.Fatalf("expected the log to name the first skipped line, got %q", out)
+	}
+	if !strings.Contains(out, "oversized record,") || !strings.Contains(out, "bytes over the") {
+		t.Fatalf("expected the log to give the size gap as the reason, got %q", out)
+	}
+}
+
+// TestParseVictoriaLogsMalformedMiddleLine pins the degrade-not-fail stance:
+// one malformed record between two valid ones must not discard the valid
+// lines around it — the malformed line is skipped and logged, and the parse
+// error must not escalate into BackendState="error" for the whole read.
+func TestParseVictoriaLogsMalformedMiddleLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("malformed middle line must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "first line" || records[1].message != "second line" {
+		t.Fatalf("valid records around the malformed line must survive: %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsMalformedTrailingLine pins that a malformed line after
+// the valid records (a truncated write mid-line) is skipped, not fatal.
+func TestParseVictoriaLogsMalformedTrailingLine(t *testing.T) {
+	body := []byte("{\"_msg\":\"first line\"}\n{\"_msg\":\"second line\"}\n{\"_msg\":\"trunca")
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("malformed trailing line must not fail the whole read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
+	}
+}
+
+// TestParseVictoriaLogsEmpty pins the empty-body half of the guard's
+// boundary (issue #342, criterion 2): a reply with no line in it is not the
+// NDJSON the query asked for, so the parser refuses it. Only the caller can
+// tell an empty reply from a lost one — VictoriaLogs answers "nothing
+// matched" with an empty 200 body — so the refusal names the condition
+// instead of reporting a failed read.
+func TestParseVictoriaLogsEmpty(t *testing.T) {
+	if _, err := parseVictoriaLogs([]byte("")); !errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("empty body must be refused by the parser, got %v", err)
+	}
+}
+
+// TestParseVictoriaLogsBlankOnlyBody pins the same boundary for a body that
+// holds only blank lines: there is no line in it to read, so it is refused
+// like an empty body rather than reported as an empty answer.
+func TestParseVictoriaLogsBlankOnlyBody(t *testing.T) {
+	if _, err := parseVictoriaLogs([]byte("\n \n\n")); !errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("blank-only body must be refused by the parser, got %v", err)
+	}
+}
+
+// TestParseVictoriaLogsNonRecordJSON pins that valid JSON which is not a log
+// record (e.g. an error object with no _msg) parses to no records without
+// erroring — the empty scope is stated, not claimed as a query failure.
+func TestParseVictoriaLogsNonRecordJSON(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\n"))
+	if err != nil {
+		t.Fatalf("valid-JSON non-record must not error: %v", err)
 	}
 	if len(records) != 0 {
-		t.Fatalf("empty input should produce no records, got %#v", records)
+		t.Fatalf("expected no records from a non-record body, got %#v", records)
 	}
 }
 
+// TestParseVictoriaLogsNonRecordWithMalformedLine pins the other half of the
+// guard's boundary (issue #342, criterion 2): a body holding a line that
+// parsed is not wholly unparseable, even when the parsed line carried no log
+// record and another line was malformed. It degrades to no records instead of
+// failing the read.
+func TestParseVictoriaLogsNonRecordWithMalformedLine(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\nnot json at all\n"))
+	if err != nil {
+		t.Fatalf("a body with a parseable line must not fail the read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records from a non-record body, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsRealisticReplyShape exercises the field set a real
+// VictoriaLogs /select/logsql/query reply carries — _time, _stream, _msg and
+// the kubernetes.* labels — with a malformed line between two records. The
+// records around the malformed line must survive with their messages intact,
+// and the extra fields must not affect the parse.
+func TestParseVictoriaLogsRealisticReplyShape(t *testing.T) {
+	body := []byte(`{"_msg":"failed to pull image","_time":"2026-11-10T10:00:00Z","_stream":"stdout","kubernetes_namespace":"ns-a","kubernetes_pod_name":"p1"}
+{"_msg":"trunca
+{"_msg":"container restarted","_time":"2026-11-10T10:00:05Z","_stream":"stdout","kubernetes_namespace":"ns-a","kubernetes_pod_name":"p1"}
+`)
+	records, err := parseVictoriaLogs(body)
+	if err != nil {
+		t.Fatalf("a malformed line in a realistic reply must not fail the read: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 valid records, got %d: %#v", len(records), records)
+	}
+	if records[0].message != "failed to pull image" || records[1].message != "container restarted" {
+		t.Fatalf("records around the malformed line must survive: %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsSkipsBlankMessages pins that blank _msg values are
+// dropped as noise while real messages survive.
 func TestParseVictoriaLogsSkipsBlankMessages(t *testing.T) {
 	body := []byte("{}\n{\"_msg\":\"   \"}\n{\"_msg\":\"real\"}\n")
 	records, err := parseVictoriaLogs(body)
@@ -86,6 +291,15 @@ func TestParseLokiMalformed(t *testing.T) {
 	body := []byte(`not json at all`)
 	if _, err := parseLoki(body); err == nil {
 		t.Fatalf("expected error for malformed JSON")
+	}
+}
+
+// TestParseLokiEmptyBody pins that the Loki parser is left alone: its reply
+// is a single JSON document, so an empty body is unreadable and errors. The
+// VictoriaLogs parser may degrade a reply; Loki's has no line to degrade.
+func TestParseLokiEmptyBody(t *testing.T) {
+	if _, err := parseLoki([]byte("")); err == nil {
+		t.Fatalf("expected an error for an empty Loki body")
 	}
 }
 
@@ -266,6 +480,100 @@ func TestQueryVictoriaLogsOverHTTP(t *testing.T) {
 	}
 	if records[0].message != "hello" || records[1].message != "world" {
 		t.Fatalf("unexpected messages: %#v", records)
+	}
+}
+
+// TestQueryVictoriaLogsEmptyReplyIsEmptyScope pins the boundary between an
+// empty reply and a failed read: VictoriaLogs answers a query that matched
+// nothing with an empty 200 body, so the read succeeds with no lines and the
+// digest can state an empty scope. Reporting it as a failed query would
+// claim a failure the backend never reported.
+func TestQueryVictoriaLogsEmptyReplyIsEmptyScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	records, err := b.query(context.Background(), "ns-a", "pod-1", time.Now().Add(-time.Minute), time.Now())
+	if err != nil {
+		t.Fatalf("an empty reply must not fail the read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records from an empty reply, got %#v", records)
+	}
+}
+
+// TestFetchBackendLogsEmptyReplyIsEmptyScope pins that a namespace whose
+// reply is empty does not abort the read for the whole group: the group ends
+// with no lines and no error, which is what lets the digest state an empty
+// scope instead of a failed query.
+func TestFetchBackendLogsEmptyReplyIsEmptyScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("an empty reply must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
+		t.Fatalf("expected no lines from an empty reply, got %#v", res)
+	}
+	if res.SkippedRefused {
+		t.Fatalf("an empty reply is an empty scope, not a refused one")
+	}
+}
+
+// TestFetchBackendLogsDegradedReplyKeepsRecords pins the degrade-not-fail
+// stance end to end: a reply with one malformed line still yields the records
+// around it, as primary evidence for the group.
+func TestFetchBackendLogsDegradedReplyKeepsRecords(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"_msg\":\"first line\"}\nnot json at all\n{\"_msg\":\"second line\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a degraded reply must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 2 {
+		t.Fatalf("expected the 2 valid records as primary evidence, got %#v", res.Primary)
+	}
+	if !strings.Contains(res.Primary[0], "first line") || !strings.Contains(res.Primary[1], "second line") {
+		t.Fatalf("the records around the malformed line must survive: %#v", res.Primary)
 	}
 }
 
@@ -538,6 +846,101 @@ func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
 			}
 			if !res.SkippedRefused {
 				t.Errorf("SkippedRefused must be set when a namespace was refused")
+			}
+		})
+	}
+}
+
+// TestFetchBackendLogsUnresolvedNamespaceSurfaced pins #339, the branch of
+// the #331 rule that fix did not cover: once the group resolved any subject,
+// only resolved pods are queried, so a valid second namespace with no
+// resolved pod sends no request at all. The gap must reach the caller as
+// SkippedUnresolved — whether or not the queried scope returned lines — so
+// an uninspected namespace can never render as "the backend has no lines for
+// it". The no-subject fallback queries every valid namespace, so it must
+// claim no such gap.
+func TestFetchBackendLogsUnresolvedNamespaceSurfaced(t *testing.T) {
+	cases := []struct {
+		name           string
+		targetPods     map[string]bool
+		withLines      bool
+		wantQueries    []string
+		wantUnresolved []string
+	}{
+		{
+			name:           "subject-scoped query skips the subject-less namespace",
+			targetPods:     map[string]bool{"ns-a/p1": true},
+			wantQueries:    []string{`{namespace="ns-a",pod="p1"}`},
+			wantUnresolved: []string{"ns-b"},
+		},
+		{
+			// The gap is a fact about the queries sent, not about the
+			// result size: it must survive alongside real lines.
+			name:           "gap surfaced even when the queried namespace returns lines",
+			targetPods:     map[string]bool{"ns-a/p1": true},
+			withLines:      true,
+			wantQueries:    []string{`{namespace="ns-a",pod="p1"}`},
+			wantUnresolved: []string{"ns-b"},
+		},
+		{
+			name:        "no-subject fallback queries every namespace and claims no gap",
+			targetPods:  map[string]bool{},
+			wantQueries: []string{`{namespace="ns-a"}`, `{namespace="ns-b"}`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query().Get("query")
+				queries = append(queries, q)
+				w.Header().Set("Content-Type", "application/json")
+				if tc.withLines && q == `{namespace="ns-a",pod="p1"}` {
+					_, _ = io.WriteString(w, `{"status":"success","data":{"result":[{"stream":{"pod":"p1","namespace":"ns-a"},"values":[["1","subject line"]]}]}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"status":"success","data":{"result":[]}}`)
+			}))
+			t.Cleanup(srv.Close)
+
+			b := &logsBackend{
+				url:    srv.URL,
+				flavor: "loki",
+				limit:  50,
+				hc:     srv.Client(),
+			}
+			g := Group{
+				Namespaces: []string{"ns-a", "ns-b"},
+				Alerts: []Alert{
+					{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+					{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b"}},
+				},
+			}
+			res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
+			if err != nil {
+				t.Fatalf("fetchBackendLogsResult: %v", err)
+			}
+			if len(queries) != len(tc.wantQueries) {
+				t.Fatalf("queries = %v, want %v", queries, tc.wantQueries)
+			}
+			for i, q := range queries {
+				if q != tc.wantQueries[i] {
+					t.Errorf("query %d = %q, want %q", i, q, tc.wantQueries[i])
+				}
+			}
+			if tc.withLines && len(res.Primary) == 0 {
+				t.Errorf("the queried namespace's lines must still come back as primary")
+			}
+			if len(res.SkippedUnresolved) != len(tc.wantUnresolved) {
+				t.Fatalf("SkippedUnresolved = %#v, want %#v", res.SkippedUnresolved, tc.wantUnresolved)
+			}
+			for i, ns := range res.SkippedUnresolved {
+				if ns != tc.wantUnresolved[i] {
+					t.Errorf("SkippedUnresolved[%d] = %q, want %q", i, ns, tc.wantUnresolved[i])
+				}
+			}
+			if res.SkippedRefused {
+				t.Errorf("a valid subject-less namespace is a distinct gap from a refused one")
 			}
 		})
 	}
