@@ -225,6 +225,150 @@ type MetricEvidence struct {
 	Context []string
 }
 
+// Per-group line budgets for metric evidence (issue #344). The fixed context
+// queries filter on namespace at best and an alert-rule expression is replayed
+// exactly as written, so one source can return hundreds of series. A single
+// head-keep on the assembled list puts that flood in front — rule series are
+// appended first and the fixed context queries last — so the flooding source
+// keeps the whole head and the operational lines and the per-alert
+// diagnostics appended between simply vanish. The budget is therefore split
+// per source where the sources are still known: every source gets a bounded
+// share, diagnostics are kept unless diagnostics alone exceed the cap, and
+// each dropped tail is counted with the kind of line it is (series vs notes).
+// The budget itself uses the same bounds as the writer-side guard
+// (maxSubjectMetricSeries and maxContextMetricSeries in report.go), so the
+// enrichment output already respects the cap and the guard stays an outer
+// backstop for any future path that assembles metric lists elsewhere.
+const maxMetricSeriesPerSource = 6
+
+// metricSeriesSource is the series one metric source (one alert-rule
+// expression, or one fixed context query) contributes before budgeting.
+// lines are rendered and self-labeled, so the budgeter may interleave
+// sources without losing which query a line came from.
+type metricSeriesSource struct {
+	name  string
+	lines []string
+}
+
+// budgetMetricLines assembles one evidence list under a hard cap from the
+// sources' diagnostics (notes) and their series lines. Notes are paid first
+// and kept in source order: each is a single line explaining why a source is
+// silent, and a flood in another source must not squeeze it out. The rest of
+// the budget is dealt to the sources round-robin, one line at a time, so no
+// source is represented twice before every other source is represented once,
+// and no source exceeds maxMetricSeriesPerSource. A truncated source keeps
+// one counted tail line in place of its dropped series; series left over
+// when even that line no longer fits are folded into one trailing count.
+// Every count line names what it counted: a dropped tail of notes is never
+// reported as series and vice versa.
+func budgetMetricLines(notes []string, sources []metricSeriesSource, max int) []string {
+	if len(notes) > max-1 {
+		unshownSeries := countUnshownSeries(sources, nil)
+		// Both count lines must fit inside max, so the notes keep one slot
+		// each: a dropped series tail is never allowed to push the list past
+		// the cap the writer-side guard was sized against.
+		keep := max - 1
+		if unshownSeries > 0 {
+			keep = max - 2
+		}
+		// Tests call this with arbitrary caps; a cap below 2 would otherwise
+		// slice notes negative. The count lines then carry everything.
+		if keep < 0 {
+			keep = 0
+		}
+		out := append([]string{}, notes[:keep]...)
+		out = append(out, fmt.Sprintf("...and %d more notes", len(notes)-keep))
+		if unshownSeries > 0 {
+			out = append(out, fmt.Sprintf("...and %d more series", unshownSeries))
+		}
+		return out
+	}
+
+	out := append([]string{}, notes...)
+	// One slot stays reserved so the trailing count line below always fits;
+	// without it the list could exceed max.
+	budget := max - len(notes) - 1
+	taken := make([]int, len(sources))
+	for budget > 0 {
+		progressed := false
+		for i := range sources {
+			if budget == 0 {
+				break
+			}
+			stream := seriesStreamLen(sources[i])
+			if taken[i] >= stream {
+				continue
+			}
+			budget--
+			progressed = true
+			// Items are the capped series lines in order, then, for a source
+			// whose series exceeded the cap, one tail line as the last item.
+			if cap := min(len(sources[i].lines), maxMetricSeriesPerSource); taken[i] >= cap {
+				out = append(out, fmt.Sprintf("...and %d more series for %s",
+					len(sources[i].lines)-cap, sources[i].name))
+			} else {
+				out = append(out, sources[i].lines[taken[i]])
+			}
+			taken[i]++
+		}
+		if !progressed {
+			break
+		}
+	}
+	if n := countUnshownSeries(sources, taken); n > 0 {
+		out = append(out, fmt.Sprintf("...and %d more series", n))
+	}
+	return out
+}
+
+// seriesStreamLen is how many budget slots a source can consume: its capped
+// series lines plus one tail line when its series exceeded the cap.
+func seriesStreamLen(s metricSeriesSource) int {
+	n := min(len(s.lines), maxMetricSeriesPerSource)
+	if len(s.lines) > maxMetricSeriesPerSource {
+		n++
+	}
+	return n
+}
+
+// countUnshownSeries counts series lines a source holds that are neither in
+// the output nor covered by that source's own tail line. A source whose tail
+// line was spent has its whole dropped remainder reported there, so it
+// contributes nothing here; a source that never got its tail line contributes
+// everything not taken. taken[i] > maxMetricSeriesPerSource is the signal
+// that the tail line was spent (series slots are exhausted first).
+func countUnshownSeries(sources []metricSeriesSource, taken []int) int {
+	n := 0
+	for i, s := range sources {
+		t := 0
+		if i < len(taken) {
+			t = taken[i]
+		}
+		shown := min(t, maxMetricSeriesPerSource)
+		if t > maxMetricSeriesPerSource {
+			continue
+		}
+		n += len(s.lines) - shown
+	}
+	return n
+}
+
+// sortMetricSummaries puts one source's series in a deterministic order.
+// The budget keeps a bounded head and the backend returns series in an
+// arbitrary order, so without a sort the surviving lines — and therefore
+// what /recent shows for the same fire — change between runs (issue #344).
+func sortMetricSummaries(summaries []metricSummary) {
+	sort.Slice(summaries, func(i, j int) bool {
+		li, lj := summaries[i].labels, summaries[j].labels
+		for _, k := range []string{"namespace", "pod", "container"} {
+			if li[k] != lj[k] {
+				return li[k] < lj[k]
+			}
+		}
+		return summaries[i].render() < summaries[j].render()
+	})
+}
+
 // EnrichMetricsWithRules queries the Prometheus backend for evidence about the
 // group's alerts using a caller-supplied rules map, so a flush that enriches
 // several groups fetches /api/v1/rules once and reuses it. Returns compact
@@ -232,7 +376,9 @@ type MetricEvidence struct {
 // returned when no metrics backend is configured; a non-nil Context line
 // distinguishes an unreachable backend from "not configured". A non-nil
 // rulesErr (from a failed FetchRules) yields the single "metrics backend error"
-// line.
+// line. Each source's contribution is budgeted per group (issue #344, see
+// maxContextMetricSeries) so a flooding rule-expression result cannot evict
+// the fixed context queries or the per-alert diagnostics.
 func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window time.Duration, rules map[string]string, rulesErr error) MetricEvidence {
 	var out MetricEvidence
 	if !p.isConfigured() {
@@ -265,29 +411,30 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	// Query the expression for each alert name we found in rules. The
 	// expression is replayed as written, so its result may span more than the
 	// resolved subject; it stays context rather than being promoted to DIRECT.
+	// Series and diagnostics are kept apart because the budget protects the
+	// diagnostics from another source's flood (issue #344).
 	sortedNames := sortedKeys(alertNames)
+	var notes []string
+	var sources []metricSeriesSource
 
 	for _, name := range sortedNames {
 		expr, ok := rules[name]
 		if !ok {
-			out.Context = append(out.Context, fmt.Sprintf("no rule expression found for alert %s", name))
+			notes = append(notes, fmt.Sprintf("no rule expression found for alert %s", name))
 			continue
 		}
 
 		summaries, err := p.queryRange(ctx, expr, start, now, step)
 		if err != nil {
-			out.Context = append(out.Context, fmt.Sprintf("query error for %s: %v", name, err))
+			notes = append(notes, fmt.Sprintf("query error for %s: %v", name, err))
 			continue
 		}
 		if len(summaries) == 0 {
-			out.Context = append(out.Context, fmt.Sprintf("%s: no data in range", name))
+			notes = append(notes, fmt.Sprintf("%s: no data in range", name))
 			continue
 		}
 
-		for _, s := range summaries {
-			line := fmt.Sprintf("%s %s", name, s.render())
-			out.Context = append(out.Context, line)
-		}
+		sources = append(sources, metricSeriesSource{name: name, lines: renderSummaries(name, summaries)})
 	}
 
 	// Query fixed context metrics if a namespace label exists on any alert.
@@ -297,39 +444,52 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	ns := g.Label("namespace")
 	pod := g.Label("pod")
 	if ns != "" {
-		contextMetrics := p.queryContextMetrics(ctx, ns, pod, start, now, step)
+		fixedNotes, fixedSources := p.queryContextMetrics(ctx, ns, pod, start, now, step)
 		if pod != "" {
-			out.Subject = append(out.Subject, contextMetrics...)
+			out.Subject = budgetMetricLines(fixedNotes, fixedSources, maxSubjectMetricSeries)
 		} else {
-			out.Context = append(out.Context, contextMetrics...)
+			notes = append(notes, fixedNotes...)
+			sources = append(sources, fixedSources...)
 		}
 	}
+	out.Context = budgetMetricLines(notes, sources, maxContextMetricSeries)
 
 	return out
 }
 
+// renderSummaries formats one source's series as self-labeled lines, sorted
+// so the bounded head is the same head every run sees.
+func renderSummaries(name string, summaries []metricSummary) []string {
+	sortMetricSummaries(summaries)
+	lines := make([]string, 0, len(summaries))
+	for _, s := range summaries {
+		lines = append(lines, fmt.Sprintf("%s %s", name, s.render()))
+	}
+	return lines
+}
+
 // queryContextMetrics queries a fixed set of operational metrics for the given
 // namespace and optional pod: container restarts, memory working set vs limit,
-// CPU throttling ratio.
-func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, start, end time.Time, step time.Duration) []string {
-	var lines []string
+// CPU throttling ratio. Like the per-rule loop, it keeps diagnostics apart from
+// series so the per-source budget can protect them (issue #344).
+func (p *Prometheus) queryContextMetrics(ctx context.Context, ns, pod string, start, end time.Time, step time.Duration) ([]string, []metricSeriesSource) {
+	var notes []string
+	var sources []metricSeriesSource
 
 	for _, q := range contextMetricQueries(ns, pod) {
 		summaries, err := p.queryRange(ctx, q.expr, start, end, step)
 		if err != nil {
-			lines = append(lines, fmt.Sprintf("%s: query error: %v", q.name, err))
+			notes = append(notes, fmt.Sprintf("%s: query error: %v", q.name, err))
 			continue
 		}
 		if len(summaries) == 0 {
-			lines = append(lines, fmt.Sprintf("%s: no data", q.name))
+			notes = append(notes, fmt.Sprintf("%s: no data", q.name))
 			continue
 		}
-		for _, s := range summaries {
-			lines = append(lines, fmt.Sprintf("%s %s", q.name, s.render()))
-		}
+		sources = append(sources, metricSeriesSource{name: q.name, lines: renderSummaries(q.name, summaries)})
 	}
 
-	return lines
+	return notes, sources
 }
 
 // contextMetricQueries builds the fixed context-metric expressions for the

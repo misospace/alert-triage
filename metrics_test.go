@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1031,5 +1033,339 @@ func TestEnrichMemoryRatioMismatchedContainers(t *testing.T) {
 	}
 	if !sawNoData {
 		t.Errorf("expected a memory_working_set 'no data' line; got subject=%v context=%v", ev.Subject, ev.Context)
+	}
+}
+
+// floodMatrix builds a matrix response of n single-point series labeled
+// pod=pod-<i>, to simulate one query source flooding with many series.
+// floodMatrix serves n series in one source. Callers rely on n exceeding
+// maxMetricSeriesPerSource so the per-source counted-tail path is exercised.
+func floodMatrix(n int) queryRangeResponse {
+	results := make([]queryResult, 0, n)
+	for i := 0; i < n; i++ {
+		results = append(results, queryResult{
+			Metric: map[string]string{"namespace": "shop", "pod": fmt.Sprintf("pod-%02d", i)},
+			Values: [][]interface{}{{float64(1000), fmt.Sprintf("%d", i)}},
+		})
+	}
+	return queryRangeResponse{Status: "success", Data: queryRangeData{ResultType: "matrix", Result: results}}
+}
+
+func TestEnrichMetricFloodKeepsFixedContextAndNotes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		switch {
+		case strings.Contains(query, "fake_flood_metric_total"):
+			json.NewEncoder(w).Encode(floodMatrix(40))
+		default:
+			json.NewEncoder(w).Encode(floodMatrix(2))
+		}
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "HighMemory", "namespace": "shop"}},
+		{Labels: map[string]string{"alertname": "Stray", "namespace": "shop"}},
+	}}
+	rules := map[string]string{"HighMemory": "fake_flood_metric_total > 1"}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	var ruleLines, noteLines int
+	fixedSeen := map[string]bool{}
+	for _, line := range ev.Context {
+		switch {
+		case strings.HasPrefix(line, "HighMemory "):
+			ruleLines++
+		case strings.HasPrefix(line, "no rule expression found for alert Stray"):
+			noteLines++
+		case strings.HasPrefix(line, "container_restarts"),
+			strings.HasPrefix(line, "memory_working_set"),
+			strings.HasPrefix(line, "cpu_throttle_ratio"):
+			fixedSeen[strings.Fields(line)[0]] = true
+		}
+	}
+	if noteLines != 1 {
+		t.Errorf("diagnostic note evicted by the flooding rule expression: %v", ev.Context)
+	}
+	if len(fixedSeen) != 3 {
+		t.Errorf("fixed context queries evicted by the flood, saw %v in %v", fixedSeen, ev.Context)
+	}
+	if ruleLines == 0 || ruleLines > maxMetricSeriesPerSource {
+		t.Errorf("expected 1..%d rule series lines, got %d in %v", maxMetricSeriesPerSource, ruleLines, ev.Context)
+	}
+	var sawTail bool
+	for _, line := range ev.Context {
+		if line == "...and 34 more series for HighMemory" {
+			sawTail = true
+		}
+	}
+	if !sawTail {
+		t.Errorf("expected a per-source counted tail line, got %v", ev.Context)
+	}
+	if len(ev.Context) > maxContextMetricSeries {
+		t.Errorf("context exceeded the per-group cap: %d lines", len(ev.Context))
+	}
+}
+
+func TestEnrichMetricFairShareAcrossFloodingSources(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(floodMatrix(40))
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "AlertA"}},
+		{Labels: map[string]string{"alertname": "AlertB"}},
+	}}
+	rules := map[string]string{
+		"AlertA": "fake_flood_metric_total > 1",
+		"AlertB": "fake_other_flood_metric_total > 1",
+	}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	a, b := 0, 0
+	for _, line := range ev.Context {
+		switch {
+		case strings.HasPrefix(line, "AlertA "):
+			a++
+		case strings.HasPrefix(line, "AlertB "):
+			b++
+		}
+	}
+	// Neither flood may crowd the other out of the head: each source is
+	// represented before either repeats itself, so both keep the same share.
+	if a == 0 || b == 0 || a != b {
+		t.Errorf("expected equal nonzero shares, got A=%d B=%d in %v", a, b, ev.Context)
+	}
+	if a > maxMetricSeriesPerSource {
+		t.Errorf("one source exceeded its per-source share: %d lines", a)
+	}
+}
+
+// TestEnrichMetricManyFloodingRulesLeaveFixedContextRepresented pins the
+// representation guarantee the round-robin exists for: a wall of flooding
+// alert-rule expressions must not exhaust the context budget before the fixed
+// context queries (restarts, memory working set, CPU throttle) get their first
+// line. The fixed sources are appended after the rule sources, so an allocator
+// that drained one source at a time in list order would fail here while a
+// per-source share would not.
+func TestEnrichMetricManyFloodingRulesLeaveFixedContextRepresented(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(floodMatrix(40))
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	var alerts []Alert
+	rules := map[string]string{}
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("Flood%02d", i)
+		alerts = append(alerts, Alert{Labels: map[string]string{"alertname": name, "namespace": "shop"}})
+		rules[name] = "fake_flood_metric_total > 1"
+	}
+	g := Group{Alerts: alerts}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	if len(ev.Context) > maxContextMetricSeries {
+		t.Fatalf("context exceeded the cap: %d lines: %v", len(ev.Context), ev.Context)
+	}
+
+	sources := []string{"Flood00", "Flood01", "Flood02", "Flood03", "Flood04",
+		"container_restarts", "memory_working_set", "cpu_throttle_ratio"}
+	shown := map[string]int{}
+	var counted int
+	for _, line := range ev.Context {
+		if n, ok := strings.CutPrefix(line, "...and "); ok {
+			n = strings.TrimSuffix(n, " more series")
+			v, err := strconv.Atoi(n)
+			if err != nil {
+				t.Fatalf("unreadable count line %q", line)
+			}
+			counted += v
+			continue
+		}
+		for _, src := range sources {
+			if strings.HasPrefix(line, src+" ") {
+				shown[src]++
+			}
+		}
+	}
+
+	// Every source keeps a share, none exceeds its per-source bound, and no
+	// source is more than one line ahead of another: that is what round-robin
+	// dealing means, and it is why the fixed queries survive five floods.
+	lo, hi := 1<<30, 0
+	for _, src := range sources {
+		n := shown[src]
+		if n == 0 {
+			t.Errorf("source %s evicted by the other floods: %v", src, ev.Context)
+		}
+		if n > maxMetricSeriesPerSource {
+			t.Errorf("source %s exceeded its per-source share: %d lines", src, n)
+		}
+		if n < lo {
+			lo = n
+		}
+		if n > hi {
+			hi = n
+		}
+	}
+	if hi-lo > 1 {
+		t.Errorf("shares are not fair (max-min = %d): %v", hi-lo, shown)
+	}
+
+	// Nothing is dropped silently: the trailing count covers exactly the
+	// series that did not fit, across all eight sources.
+	total := 40 * len(sources)
+	if shownTotal := sumShown(shown); shownTotal+counted != total {
+		t.Errorf("shown %d + counted %d must equal the %d series the backend returned: %v",
+			shownTotal, counted, total, ev.Context)
+	}
+}
+
+func sumShown(counts map[string]int) int {
+	n := 0
+	for _, v := range counts {
+		n += v
+	}
+	return n
+}
+
+func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(floodMatrix(3))
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	var alerts []Alert
+	rules := map[string]string{"Alert00": "fake_flood_metric_total > 1"}
+	for i := 0; i < maxContextMetricSeries+6; i++ {
+		name := fmt.Sprintf("Alert%02d", i)
+		alerts = append(alerts, Alert{Labels: map[string]string{"alertname": name}})
+	}
+	g := Group{Alerts: alerts}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	// 29 missing-rule notes overflow the cap next to one real series source:
+	// both dropped kinds get their own accurate count and the total still
+	// respects the cap (the writer-side guard was sized against it).
+	if len(ev.Context) != maxContextMetricSeries {
+		t.Fatalf("expected exactly the cap, got %d: %v", len(ev.Context), ev.Context)
+	}
+	droppedNotes := maxContextMetricSeries + 5 - (maxContextMetricSeries - 2)
+	var sawNoteTail, sawSeriesTail bool
+	for _, line := range ev.Context {
+		switch line {
+		case fmt.Sprintf("...and %d more notes", droppedNotes):
+			sawNoteTail = true
+		case "...and 3 more series":
+			sawSeriesTail = true
+		}
+		if strings.HasPrefix(line, "Alert00 ") {
+			t.Errorf("series rendered with no budget left for it: %q", line)
+		}
+	}
+	if !sawNoteTail || !sawSeriesTail {
+		t.Errorf("dropped notes and series must be counted separately, got %v", ev.Context)
+	}
+}
+
+func TestEnrichMetricHeadIsDeterministic(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := floodMatrix(10)
+		if calls%2 == 1 {
+			// The backend gives no order guarantee: serve the same series in
+			// reverse so order-independence of the kept head is actually
+			// exercised, not just sort stability against one identical reply.
+			for i, j := 0, len(resp.Data.Result)-1; i < j; i, j = i+1, j-1 {
+				resp.Data.Result[i], resp.Data.Result[j] = resp.Data.Result[j], resp.Data.Result[i]
+			}
+		}
+		calls++
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "Flood"}}}}
+	rules := map[string]string{"Flood": "fake_flood_metric_total > 1"}
+	ev1 := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+	ev2 := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	if !reflect.DeepEqual(ev1.Context, ev2.Context) {
+		t.Errorf("surviving head differs between identical fires:\n%v\n%v", ev1.Context, ev2.Context)
+	}
+	if !strings.Contains(ev1.Context[0], "pod=pod-00") {
+		t.Errorf("expected sorted deterministic head, got %q", ev1.Context[0])
+	}
+}
+
+func TestEnrichMetricSubjectBudgetUnderFlood(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(floodMatrix(30))
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	g := Group{Alerts: []Alert{{Labels: map[string]string{
+		"alertname": "Stray", "namespace": "shop", "pod": "web-1",
+	}}}}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, nil, nil)
+
+	if len(ev.Subject) > maxSubjectMetricSeries {
+		t.Fatalf("subject exceeded its cap: %d lines", len(ev.Subject))
+	}
+	seen := map[string]bool{}
+	for _, line := range ev.Subject {
+		if strings.HasPrefix(line, "...and ") {
+			continue
+		}
+		seen[strings.Fields(line)[0]] = true
+	}
+	for _, name := range []string{"container_restarts", "memory_working_set", "cpu_throttle_ratio"} {
+		if !seen[name] {
+			t.Errorf("fixed query %s lost its share of the subject budget: %v", name, ev.Subject)
+		}
+	}
+	if len(ev.Context) != 1 || !strings.Contains(ev.Context[0], "no rule expression found for alert Stray") {
+		t.Errorf("expected the rule note to survive, got %v", ev.Context)
+	}
+}
+
+func TestBudgetMetricLinesSeparatesNotesAndSeries(t *testing.T) {
+	src := func(name string, n int) metricSeriesSource {
+		s := metricSeriesSource{name: name}
+		for i := 0; i < n; i++ {
+			s.lines = append(s.lines, fmt.Sprintf("%s line-%d", name, i))
+		}
+		return s
+	}
+	got := budgetMetricLines([]string{"note one"},
+		[]metricSeriesSource{src("Full", 3), src("Trunc", 10)}, 8)
+
+	want := []string{
+		"note one",
+		"Full line-0", "Trunc line-0",
+		"Full line-1", "Trunc line-1",
+		"Full line-2", "Trunc line-2",
+		"...and 7 more series",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("budget merge wrong:\ngot  %v\nwant %v", got, want)
+	}
+
+	// A source over the per-source cap keeps its own counted tail line when
+	// the budget affords it, and those series are not then double-counted.
+	got = budgetMetricLines(nil, []metricSeriesSource{src("Big", 10)}, 20)
+	want = []string{
+		"Big line-0", "Big line-1", "Big line-2", "Big line-3", "Big line-4", "Big line-5",
+		"...and 4 more series for Big",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("per-source tail wrong:\ngot  %v\nwant %v", got, want)
 	}
 }
