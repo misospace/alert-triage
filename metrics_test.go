@@ -367,16 +367,30 @@ func TestEnrichMetricsAlertingRuleTypeYieldsSeriesEvidence(t *testing.T) {
 		t.Fatalf("fetchRules: %v", err)
 	}
 
-	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "HighMemory"}}}}
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "HighMemory"}},
+		{Labels: map[string]string{"alertname": "UnmatchedAlert"}},
+	}}
 	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
 
 	for _, line := range ev.Context {
-		if strings.Contains(line, "no rule expression found") {
+		if strings.Contains(line, "no rule expression found") && !strings.Contains(line, "UnmatchedAlert") {
 			t.Errorf("alerting-typed rule fell through to the missing-rule note: %q", line)
 		}
 	}
 	if len(ev.Context) == 0 || !strings.HasPrefix(ev.Context[0], "HighMemory min=") {
 		t.Errorf("expected series evidence for HighMemory, got %v", ev.Context)
+	}
+	// Absence stays a finding: an alert with no rule in either spelling is
+	// still reported, so a widened filter cannot hide missing evidence.
+	found := false
+	for _, line := range ev.Context {
+		if line == "no rule expression found for alert UnmatchedAlert" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected missing-rule note for UnmatchedAlert, got %v", ev.Context)
 	}
 }
 
