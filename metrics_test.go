@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1141,6 +1142,95 @@ func TestEnrichMetricFairShareAcrossFloodingSources(t *testing.T) {
 	if a > maxMetricSeriesPerSource {
 		t.Errorf("one source exceeded its per-source share: %d lines", a)
 	}
+}
+
+// TestEnrichMetricManyFloodingRulesLeaveFixedContextRepresented pins the
+// representation guarantee the round-robin exists for: a wall of flooding
+// alert-rule expressions must not exhaust the context budget before the fixed
+// context queries (restarts, memory working set, CPU throttle) get their first
+// line. The fixed sources are appended after the rule sources, so an allocator
+// that drained one source at a time in list order would fail here while a
+// per-source share would not.
+func TestEnrichMetricManyFloodingRulesLeaveFixedContextRepresented(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(floodMatrix(40))
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	var alerts []Alert
+	rules := map[string]string{}
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("Flood%02d", i)
+		alerts = append(alerts, Alert{Labels: map[string]string{"alertname": name, "namespace": "shop"}})
+		rules[name] = "fake_flood_metric_total > 1"
+	}
+	g := Group{Alerts: alerts}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, rules, nil)
+
+	if len(ev.Context) > maxContextMetricSeries {
+		t.Fatalf("context exceeded the cap: %d lines: %v", len(ev.Context), ev.Context)
+	}
+
+	sources := []string{"Flood00", "Flood01", "Flood02", "Flood03", "Flood04",
+		"container_restarts", "memory_working_set", "cpu_throttle_ratio"}
+	shown := map[string]int{}
+	var counted int
+	for _, line := range ev.Context {
+		if n, ok := strings.CutPrefix(line, "...and "); ok {
+			n = strings.TrimSuffix(n, " more series")
+			v, err := strconv.Atoi(n)
+			if err != nil {
+				t.Fatalf("unreadable count line %q", line)
+			}
+			counted += v
+			continue
+		}
+		for _, src := range sources {
+			if strings.HasPrefix(line, src+" ") {
+				shown[src]++
+			}
+		}
+	}
+
+	// Every source keeps a share, none exceeds its per-source bound, and no
+	// source is more than one line ahead of another: that is what round-robin
+	// dealing means, and it is why the fixed queries survive five floods.
+	lo, hi := 1<<30, 0
+	for _, src := range sources {
+		n := shown[src]
+		if n == 0 {
+			t.Errorf("source %s evicted by the other floods: %v", src, ev.Context)
+		}
+		if n > maxMetricSeriesPerSource {
+			t.Errorf("source %s exceeded its per-source share: %d lines", src, n)
+		}
+		if n < lo {
+			lo = n
+		}
+		if n > hi {
+			hi = n
+		}
+	}
+	if hi-lo > 1 {
+		t.Errorf("shares are not fair (max-min = %d): %v", hi-lo, shown)
+	}
+
+	// Nothing is dropped silently: the trailing count covers exactly the
+	// series that did not fit, across all eight sources.
+	total := 40 * len(sources)
+	if shownTotal := sumShown(shown); shownTotal+counted != total {
+		t.Errorf("shown %d + counted %d must equal the %d series the backend returned: %v",
+			shownTotal, counted, total, ev.Context)
+	}
+}
+
+func sumShown(counts map[string]int) int {
+	n := 0
+	for _, v := range counts {
+		n += v
+	}
+	return n
 }
 
 func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
