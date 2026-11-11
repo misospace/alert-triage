@@ -69,8 +69,11 @@ type queryResult struct {
 }
 
 // fetchRules retrieves alerting rules and returns a map of alert name to
-// PromQL expression. Only rules of type "alert" are included. A flush that
-// enriches several groups should call this once and share the result via
+// PromQL expression. Only alerting rules are included: Prometheus types them
+// "alert", promxy in front of Prometheus answers "alerting", and a filter
+// matching one spelling alone silently empties the map on the other (issue
+// #353). Recording rules stay excluded either way. A flush that enriches
+// several groups should call this once and share the result via
 // EnrichMetricsWithRules, rather than re-downloading /api/v1/rules for every
 // group (issue #66).
 func (p *Prometheus) fetchRules(ctx context.Context) (map[string]string, error) {
@@ -91,7 +94,7 @@ func (p *Prometheus) fetchRules(ctx context.Context) (map[string]string, error) 
 	rules := make(map[string]string)
 	for _, group := range resp.Data.Groups {
 		for _, rule := range group.Rules {
-			if rule.Type == "alert" {
+			if rule.Type == "alert" || rule.Type == "alerting" {
 				rules[rule.Name] = rule.Query
 			}
 		}
