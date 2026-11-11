@@ -417,27 +417,27 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	// Series and diagnostics are kept apart because the budget protects the
 	// diagnostics from another source's flood (issue #344).
 	sortedNames := sortedKeys(alertNames)
-	var notes []string
-	var sources []metricSeriesSource
+	var ruleNotes []string
+	var ruleSources []metricSeriesSource
 
 	for _, name := range sortedNames {
 		expr, ok := rules[name]
 		if !ok {
-			notes = append(notes, fmt.Sprintf("no rule expression found for alert %s", name))
+			ruleNotes = append(ruleNotes, fmt.Sprintf("no rule expression found for alert %s", name))
 			continue
 		}
 
 		summaries, err := p.queryRange(ctx, expr, start, now, step)
 		if err != nil {
-			notes = append(notes, fmt.Sprintf("query error for %s: %v", name, err))
+			ruleNotes = append(ruleNotes, fmt.Sprintf("query error for %s: %v", name, err))
 			continue
 		}
 		if len(summaries) == 0 {
-			notes = append(notes, fmt.Sprintf("%s: no data in range", name))
+			ruleNotes = append(ruleNotes, fmt.Sprintf("%s: no data in range", name))
 			continue
 		}
 
-		sources = append(sources, metricSeriesSource{name: name, lines: renderSummaries(name, summaries)})
+		ruleSources = append(ruleSources, metricSeriesSource{name: name, lines: renderSummaries(name, summaries)})
 	}
 
 	// Query fixed context metrics if a namespace label exists on any alert.
@@ -446,16 +446,25 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 	// namespace-wide and belong in context.
 	ns := g.Label("namespace")
 	pod := g.Label("pod")
+	var notes []string
 	if ns != "" {
 		fixedNotes, fixedSources := p.queryContextMetrics(ctx, ns, pod, start, now, step)
 		if pod != "" {
 			out.Subject = budgetMetricLines(fixedNotes, fixedSources, maxSubjectMetricSeries)
 		} else {
-			notes = append(notes, fixedNotes...)
-			sources = append(sources, fixedSources...)
+			// The fixed-query negatives lead the notes: the overflow branch
+			// of budgetMetricLines keeps the head of the list in list order,
+			// so a wall of generic per-alert rule notes must not push the
+			// explicit negatives out with it (issue #354). Series sources
+			// keep the rule-sources-first order below: round-robin already
+			// protects them, and reordering them would change the surviving
+			// head in every budgeted digest.
+			notes = fixedNotes
+			ruleSources = append(ruleSources, fixedSources...)
 		}
 	}
-	out.Context = budgetMetricLines(notes, sources, maxContextMetricSeries)
+	notes = append(notes, ruleNotes...)
+	out.Context = budgetMetricLines(notes, ruleSources, maxContextMetricSeries)
 
 	return out
 }

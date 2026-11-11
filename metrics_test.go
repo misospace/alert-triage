@@ -380,7 +380,16 @@ func TestEnrichMetricsAlertingRuleTypeYieldsSeriesEvidence(t *testing.T) {
 			t.Errorf("alerting-typed rule fell through to the missing-rule note: %q", line)
 		}
 	}
-	if len(ev.Context) == 0 || !strings.HasPrefix(ev.Context[0], "HighMemory min=") {
+	// Notes lead the budgeted block (and any missing-rule note would be a
+	// regression of issue #353), so series evidence is asserted by presence,
+	// not by position.
+	var series bool
+	for _, line := range ev.Context {
+		if strings.HasPrefix(line, "HighMemory min=") {
+			series = true
+		}
+	}
+	if !series {
 		t.Errorf("expected series evidence for HighMemory, got %v", ev.Context)
 	}
 	// Absence stays a finding: an alert with no rule in either spelling is
@@ -1351,6 +1360,69 @@ func TestEnrichMetricNotesCountedAsNotes(t *testing.T) {
 	}
 	if !sawNoteTail || !sawSeriesTail {
 		t.Errorf("dropped notes and series must be counted separately, got %v", ev.Context)
+	}
+}
+
+// TestEnrichMetricNotesOverflowKeepsFixedNegatives pins the issue #354
+// ordering: when per-alert rule notes alone overflow the context budget, the
+// fixed context-query negatives — explicit absences, i.e. findings — survive
+// ahead of the generic notes, and the dropped rule notes keep their accurate
+// count. The wording of every surviving note is unchanged.
+func TestEnrichMetricNotesOverflowKeepsFixedNegatives(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every query returns nothing, so the fixed context queries surface
+		// as explicit "no data" negatives and no series exist at all.
+		json.NewEncoder(w).Encode(queryRangeResponse{
+			Status: "success",
+			Data:   queryRangeData{ResultType: "matrix", Result: []queryResult{}},
+		})
+	}))
+	defer srv.Close()
+
+	p := &Prometheus{url: srv.URL, hc: http.DefaultClient}
+	var alerts []Alert
+	for i := 0; i < 30; i++ {
+		alerts = append(alerts, Alert{Labels: map[string]string{
+			"alertname": fmt.Sprintf("NoRule%02d", i), "namespace": "shop",
+		}})
+	}
+	g := Group{Alerts: alerts}
+	ev := p.EnrichMetricsWithRules(context.Background(), g, 1*time.Hour, nil, nil)
+
+	// 3 fixed negatives + 30 missing-rule notes overflow the cap: keep is
+	// max-1, so 3 negatives + (max-4) rule notes survive plus one count line.
+	keptRule := maxContextMetricSeries - 4
+	dropped := 30 - keptRule
+	if len(ev.Context) != maxContextMetricSeries {
+		t.Fatalf("expected exactly the cap, got %d: %v", len(ev.Context), ev.Context)
+	}
+	fixedSeen := map[string]bool{}
+	var ruleNotes int
+	var sawTail bool
+	for _, line := range ev.Context {
+		switch line {
+		case "container_restarts: no data",
+			"memory_working_set: no data",
+			"cpu_throttle_ratio: no data":
+			fixedSeen[line] = true
+		case fmt.Sprintf("...and %d more notes", dropped):
+			sawTail = true
+		default:
+			if strings.HasPrefix(line, "no rule expression found for alert NoRule") {
+				ruleNotes++
+			} else {
+				t.Errorf("unexpected context line %q", line)
+			}
+		}
+	}
+	if len(fixedSeen) != 3 {
+		t.Errorf("fixed context negatives dropped by the notes overflow: %v", ev.Context)
+	}
+	if ruleNotes != keptRule {
+		t.Errorf("expected %d kept rule notes, got %d: %v", keptRule, ruleNotes, ev.Context)
+	}
+	if !sawTail {
+		t.Errorf("expected %q, got %v", fmt.Sprintf("...and %d more notes", dropped), ev.Context)
 	}
 }
 
