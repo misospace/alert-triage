@@ -233,7 +233,7 @@ func tailKeep(prev, frag []byte, keep int) []byte {
 // within the retention window. Unlike Record it does not mutate state or
 // append to the on-disk log, so callers can inspect history before deciding
 // whether to record.
-func (h *History) PriorSeen(sig, title string) int {
+func (h *History) PriorSeen(sig string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 

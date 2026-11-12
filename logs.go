@@ -260,7 +260,7 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		}
 	}
 
-	collapsed := collapseAndCap(seen, order, b.limit)
+	collapsed := collapseAndCap(order, b.limit)
 	if len(byNS) == 0 {
 		// No concrete subject: everything returned is namespace-wide, so mark it
 		// ambient and keep it out of the primary evidence. The fallback ran for
@@ -509,7 +509,7 @@ func streamLabels(s map[string]string) []string {
 	return out
 }
 
-func collapseAndCap(seen map[string]*backendLog, order []*backendLog, cap int) []string {
+func collapseAndCap(order []*backendLog, cap int) []string {
 	if cap <= 0 {
 		cap = defaultLogLimit
 	}

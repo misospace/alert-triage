@@ -112,10 +112,10 @@ func TestHistoryLoadValidFinalLineWithoutNewline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.PriorSeen("first_sig", "first_title"); got != 1 {
+	if got := h.PriorSeen("first_sig"); got != 1 {
 		t.Errorf("PriorSeen(first_sig) = %d, want 1", got)
 	}
-	if got := h.PriorSeen("second_sig", "second_title"); got != 1 {
+	if got := h.PriorSeen("second_sig"); got != 1 {
 		t.Errorf("PriorSeen(second_sig) = %d, want 1 (valid final line without trailing newline must load)", got)
 	}
 	if got := len(h.entries); got != 2 {
@@ -225,13 +225,13 @@ func TestHistoryPriorSeenCountsOnlyMatchingSigs(t *testing.T) {
 		sighting{Signature: "beta", Title: "beta-title", At: now.Add(-30 * time.Minute)},
 	)
 
-	if got := h.PriorSeen("alpha", "alpha-title"); got != 2 {
+	if got := h.PriorSeen("alpha"); got != 2 {
 		t.Errorf("PriorSeen(alpha) = %d, want 2", got)
 	}
-	if got := h.PriorSeen("beta", "beta-title"); got != 1 {
+	if got := h.PriorSeen("beta"); got != 1 {
 		t.Errorf("PriorSeen(beta) = %d, want 1", got)
 	}
-	if got := h.PriorSeen("missing", "missing-title"); got != 0 {
+	if got := h.PriorSeen("missing"); got != 0 {
 		t.Errorf("PriorSeen(missing) = %d, want 0", got)
 	}
 
@@ -257,10 +257,10 @@ func TestHistoryPriorSeenExcludesExpired(t *testing.T) {
 		sighting{Signature: "fresh", Title: "fresh", At: now.Add(-10 * time.Minute)},
 	)
 
-	if got := h.PriorSeen("old", "old"); got != 0 {
+	if got := h.PriorSeen("old"); got != 0 {
 		t.Errorf("PriorSeen should drop expired entry, got %d", got)
 	}
-	if got := h.PriorSeen("fresh", "fresh"); got != 1 {
+	if got := h.PriorSeen("fresh"); got != 1 {
 		t.Errorf("PriorSeen should keep in-window entry, got %d", got)
 	}
 }
@@ -304,7 +304,7 @@ func TestHistoryPriorSeenDoesNotRecord(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		if got := h.PriorSeen("sig_a", "title_a"); got != 0 {
+		if got := h.PriorSeen("sig_a"); got != 0 {
 			t.Errorf("PriorSeen iter %d = %d, want 0 (must not mutate state)", i, got)
 		}
 	}
@@ -350,7 +350,7 @@ func TestProcessHistoryRollbackOnDeliveryFailure(t *testing.T) {
 		deliver = func() bool { return ok }
 
 		// Pass 1: count only, do not record.
-		prior := h.PriorSeen(sig, title)
+		prior := h.PriorSeen(sig)
 		if prior != wantPrior {
 			t.Errorf("%s: prior before record = %d, want %d", label, prior, wantPrior)
 		}
@@ -382,7 +382,7 @@ func TestProcessHistoryRollbackOnDeliveryFailure(t *testing.T) {
 	if got := len(reloaded.entries); got != 1 {
 		t.Fatalf("after fail/succeed/fail sequence, history.jsonl should hold 1 sighting, got %d", got)
 	}
-	if got := reloaded.PriorSeen(sig, title); got != 1 {
+	if got := reloaded.PriorSeen(sig); got != 1 {
 		t.Errorf("after the three fires, PriorSeen = %d, want 1 (only the successful fire counts)", got)
 	}
 }
@@ -405,7 +405,7 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 	const title = "disk-pressure"
 
 	// Fire 1: Deliver fails.
-	if got := h.PriorSeen(sig, title); got != 0 {
+	if got := h.PriorSeen(sig); got != 0 {
 		t.Fatalf("fire 1 prior = %d, want 0", got)
 	}
 	// Deliver fails -> no Record call.
@@ -420,7 +420,7 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 	}
 
 	// Fire 2: Deliver succeeds.
-	if got := h.PriorSeen(sig, title); got != 0 {
+	if got := h.PriorSeen(sig); got != 0 {
 		t.Fatalf("fire 2 prior = %d, want 0 (failed fire 1 must not count)", got)
 	}
 	h.Record(sig, title, time.Now())
@@ -430,7 +430,7 @@ func TestProcessHistoryNoLeakOnFirstFire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reloaded.PriorSeen(sig, title); got != 1 {
+	if got := reloaded.PriorSeen(sig); got != 1 {
 		t.Errorf("after 1 fail + 1 success, PriorSeen = %d, want 1", got)
 	}
 }
@@ -468,10 +468,10 @@ func TestHistoryLoadSurvivesOversizedLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+	if got := h.PriorSeen("before_sig"); got != 1 {
 		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
 	}
-	if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+	if got := h.PriorSeen("after_sig"); got != 1 {
 		t.Errorf("PriorSeen(after_sig) = %d, want 1 (record after the oversized line must not be dropped)", got)
 	}
 	if got := len(h.entries); got != 2 {
@@ -533,7 +533,7 @@ func TestHistoryLoadOversizedLineIsLogged(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := h.PriorSeen("after_sig", "after_title"); got != 1 {
+		if got := h.PriorSeen("after_sig"); got != 1 {
 			t.Errorf("read stopped at the oversized line: PriorSeen(after_sig) = %d, want 1", got)
 		}
 	}()
@@ -581,7 +581,7 @@ func TestHistoryLoadOversizedFinalLineWithoutNewline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.PriorSeen("before_sig", "before_title"); got != 1 {
+	if got := h.PriorSeen("before_sig"); got != 1 {
 		t.Errorf("PriorSeen(before_sig) = %d, want 1 (record before the oversized line)", got)
 	}
 	if got := len(h.entries); got != 1 {
@@ -746,7 +746,7 @@ func TestHistoryCompactDoesNotBlockPriorSeenDuringRewrite(t *testing.T) {
 	}
 
 	start := time.Now()
-	got := h.PriorSeen("sig_a", "title_a")
+	got := h.PriorSeen("sig_a")
 	elapsed := time.Since(start)
 
 	if got != 1 {

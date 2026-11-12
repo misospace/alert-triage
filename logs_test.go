@@ -371,7 +371,7 @@ func TestCollapseAndCapDistinct(t *testing.T) {
 		{message: "beta", count: 1},
 		{message: "gamma", count: 1},
 	}
-	got := collapseAndCap(nil, order, 5)
+	got := collapseAndCap(order, 5)
 	if len(got) != 3 {
 		t.Fatalf("expected 3 lines, got %d: %#v", len(got), got)
 	}
@@ -385,7 +385,7 @@ func TestCollapseAndCapRepeats(t *testing.T) {
 		{message: "foo", count: 3},
 		{message: "bar", count: 1},
 	}
-	got := collapseAndCap(nil, order, 10)
+	got := collapseAndCap(order, 10)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 collapsed entries, got %d: %#v", len(got), got)
 	}
@@ -402,7 +402,7 @@ func TestCollapseAndCapStreamPrefix(t *testing.T) {
 		{stream: "ns-a pod-p", message: "boom", count: 2},
 		{stream: "ns-a pod-p", message: "restart", count: 1},
 	}
-	got := collapseAndCap(nil, order, 10)
+	got := collapseAndCap(order, 10)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 lines, got %d: %#v", len(got), got)
 	}
@@ -420,7 +420,7 @@ func TestCollapseAndCapOverflow(t *testing.T) {
 		{message: "d", count: 1}, {message: "e", count: 1}, {message: "f", count: 1},
 		{message: "g", count: 1},
 	}
-	got := collapseAndCap(nil, order, 5)
+	got := collapseAndCap(order, 5)
 	if len(got) != 6 {
 		t.Fatalf("expected 6 entries (5 + overflow), got %d: %#v", len(got), got)
 	}
@@ -440,7 +440,7 @@ func TestCollapseAndCapZeroFallback(t *testing.T) {
 		{message: "beta", count: 1},
 		{message: "gamma", count: 1},
 	}
-	got := collapseAndCap(nil, order, 0)
+	got := collapseAndCap(order, 0)
 	if len(got) != 3 {
 		t.Fatalf("cap=0 should fall back to default limit, got %d: %#v", len(got), got)
 	}
