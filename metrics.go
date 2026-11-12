@@ -388,17 +388,17 @@ func (p *Prometheus) EnrichMetricsWithRules(ctx context.Context, g Group, window
 		return out
 	}
 
+	if rulesErr != nil {
+		out.Context = append(out.Context, fmt.Sprintf("metrics backend error: %v", rulesErr))
+		return out
+	}
+
 	// Collect unique alert names from the group.
 	alertNames := make(map[string]bool)
 	for _, a := range g.Alerts {
 		if name := a.Labels["alertname"]; name != "" {
 			alertNames[name] = true
 		}
-	}
-
-	if rulesErr != nil {
-		out.Context = append(out.Context, fmt.Sprintf("metrics backend error: %v", rulesErr))
-		return out
 	}
 
 	now := time.Now()
