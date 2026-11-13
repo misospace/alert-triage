@@ -199,12 +199,18 @@ func TestParseVictoriaLogsBlankOnlyBody(t *testing.T) {
 }
 
 // TestParseVictoriaLogsNonRecordJSON pins that valid JSON which is not a log
-// record (e.g. an error object with no _msg) parses to no records without
-// erroring — the empty scope is stated, not claimed as a query failure.
+// record (e.g. an error object with no _msg) is named as what it is: the
+// reply parsed and carried no log record, so the read cannot state that the
+// scope had no lines. It is not the empty reply either — that one means
+// "nothing matched" — and it is not a failed read, which is pinned at the
+// fetch level.
 func TestParseVictoriaLogsNonRecordJSON(t *testing.T) {
 	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\n"))
-	if err != nil {
-		t.Fatalf("valid-JSON non-record must not error: %v", err)
+	if !errors.Is(err, errNoLogRecords) {
+		t.Fatalf("a non-record body must be named as carrying no log record, got %v", err)
+	}
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("a non-record body is not an empty reply: %v", err)
 	}
 	if len(records) != 0 {
 		t.Fatalf("expected no records from a non-record body, got %#v", records)
@@ -214,15 +220,54 @@ func TestParseVictoriaLogsNonRecordJSON(t *testing.T) {
 // TestParseVictoriaLogsNonRecordWithMalformedLine pins the other half of the
 // guard's boundary (issue #342, criterion 2): a body holding a line that
 // parsed is not wholly unparseable, even when the parsed line carried no log
-// record and another line was malformed. It degrades to no records instead of
-// failing the read.
+// record and another line was malformed. It names the no-record condition
+// instead of failing the read.
 func TestParseVictoriaLogsNonRecordWithMalformedLine(t *testing.T) {
 	records, err := parseVictoriaLogs([]byte("{\"error\":\"unauthorized\"}\nnot json at all\n"))
-	if err != nil {
-		t.Fatalf("a body with a parseable line must not fail the read: %v", err)
+	if !errors.Is(err, errNoLogRecords) {
+		t.Fatalf("a body with a parseable line but no log record must be named as such, got %v", err)
+	}
+	if errors.Is(err, errEmptyVictoriaLogsReply) {
+		t.Fatalf("a body with a parseable line is not an empty reply: %v", err)
 	}
 	if len(records) != 0 {
 		t.Fatalf("expected no records from a non-record body, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsBlankMessageIsARecord pins the other side of #349's
+// record test: a record whose message is blank is still a record, so the
+// reply is a set of log lines that happened to be empty of content — the
+// empty scope it earned — and not the no-record gap. Only a reply whose
+// lines carried no _msg field at all is the gap.
+func TestParseVictoriaLogsBlankMessageIsARecord(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"_msg\":\"\"}\n"))
+	if err != nil {
+		t.Fatalf("a blank message is noise, not a failed read: %v", err)
+	}
+	if errors.Is(err, errNoLogRecords) {
+		t.Fatalf("a blank message is still a record, so the empty scope stands: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected the blank message to be dropped, got %#v", records)
+	}
+}
+
+// TestParseVictoriaLogsNullMessageIsARecord pins the same boundary for a null
+// message: the field was there, so the line is a log record with no text in
+// it. Only a line that carries no _msg field at all is the no-record gap, so
+// a null message keeps the empty scope the reply earned instead of turning
+// into a stated gap.
+func TestParseVictoriaLogsNullMessageIsARecord(t *testing.T) {
+	records, err := parseVictoriaLogs([]byte("{\"_msg\":null}\n"))
+	if err != nil {
+		t.Fatalf("a null message is noise, not a failed read: %v", err)
+	}
+	if errors.Is(err, errNoLogRecords) {
+		t.Fatalf("a null message is still a record, so the empty scope stands: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected the null message to be dropped, got %#v", records)
 	}
 }
 
@@ -574,6 +619,342 @@ func TestFetchBackendLogsDegradedReplyKeepsRecords(t *testing.T) {
 	}
 	if !strings.Contains(res.Primary[0], "first line") || !strings.Contains(res.Primary[1], "second line") {
 		t.Fatalf("the records around the malformed line must survive: %#v", res.Primary)
+	}
+}
+
+// TestFetchBackendLogsNoRecordReplyIsStatedGap pins the fetch-level half of
+// #349: a reply that parses but carries no log record is a fact about the
+// reply, not a failed read. The group read ends without an error and without
+// lines, and the fact travels with the result so the caller can state the
+// gap instead of claiming the scope had no lines.
+func TestFetchBackendLogsNoRecordReplyIsStatedGap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a reply carrying no log record must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
+		t.Fatalf("expected no lines from a reply carrying no log record, got %#v", res)
+	}
+	if !res.NoRecords {
+		t.Fatalf("a reply carrying no log record must be reported as such")
+	}
+	if res.SkippedRefused {
+		t.Fatalf("a reply carrying no log record is not a refused scope")
+	}
+}
+
+// TestFetchBackendLogsNoRecordReplyKeepsOtherScope pins that a no-record
+// reply does not abort the read and does not hide the other scope's records:
+// one namespace answers with something that is not a log record, the other
+// answers with a record, and the group read ends with that record as primary
+// evidence plus the no-record fact.
+func TestFetchBackendLogsNoRecordReplyKeepsOtherScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.Contains(r.URL.Query().Get("query"), `"ns-a"`) {
+			_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, "{\"_msg\":\"second scope line\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+			{Labels: map[string]string{"pod": "p2", "namespace": "ns-b", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a no-record reply must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "second scope line") {
+		t.Fatalf("expected the other scope's record as primary evidence, got %#v", res.Primary)
+	}
+	if !res.NoRecords {
+		t.Fatalf("the no-record reply must be reported as such")
+	}
+}
+
+// TestFetchBackendLogsRecordReplyUnaffected pins the other half of #349: a
+// reply that carries real records is unchanged by the no-record condition.
+func TestFetchBackendLogsRecordReplyUnaffected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"_msg\":\"real line\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a reply carrying records must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "real line") {
+		t.Fatalf("expected the record as primary evidence, got %#v", res.Primary)
+	}
+	if res.NoRecords {
+		t.Fatalf("a reply carrying records must not be reported as carrying none")
+	}
+}
+
+// TestFetchBackendLogsNullMessageIsEmptyScope pins the fetch-level half of
+// the null-message rule: a reply whose only record carried a null message
+// is an empty scope, not the no-record gap. The reply did carry a log
+// record, so the read knows the backend answered with lines and the scope
+// is empty rather than unknown.
+func TestFetchBackendLogsNullMessageIsEmptyScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"_msg\":null}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if err != nil {
+		t.Fatalf("a null message must not fail the group read: %v", err)
+	}
+	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
+		t.Fatalf("expected no lines from a null message, got %#v", res)
+	}
+	if res.NoRecords {
+		t.Fatalf("a reply that carried a record with a null message is not the no-record gap")
+	}
+}
+
+// TestNoRecordsBackendStateRendersAsGap pins the render-level half of #349:
+// a reply that carried no log record must read as a gap, not as the explicit
+// negative that there were no lines. Both surfaces say what is known, and
+// neither reuses the empty wording. A reply that carried real records is
+// unaffected: the line still renders and the gap wording stays away.
+func TestNoRecordsBackendStateRendersAsGap(t *testing.T) {
+	g := Group{
+		Key:        "sig-norecords",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{BackendState: "norecords", BackendScoped: true}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must state that the reply carried no log record:\n%s", model)
+	}
+	if strings.Contains(model, "returned no lines") {
+		t.Errorf("model prompt must not claim the scope had no lines:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "carried no log records") {
+		t.Errorf("discord must state that the reply carried no log record:\n%s", discord)
+	}
+	if strings.Contains(discord, "returned no lines") {
+		t.Errorf("discord must not claim the scope had no lines:\n%s", discord)
+	}
+
+	// A reply that carried real records renders as before.
+	ok := Enrichment{BackendState: "ok", BackendLogs: []string{"subject backend log line"}}
+	model = renderEvidence(Report{Group: g, Enrichment: ok})
+	if !strings.Contains(model, "subject backend log line") {
+		t.Errorf("model prompt must still render the backend log line:\n%s", model)
+	}
+	if strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must not state the no-record gap when lines came back:\n%s", model)
+	}
+
+	discord = discordDescription(&Config{}, Report{Group: g, Enrichment: ok})
+	if !strings.Contains(discord, "subject backend log line") {
+		t.Errorf("discord must still render the backend log line:\n%s", discord)
+	}
+	if strings.Contains(discord, "carried no log records") {
+		t.Errorf("discord must not state the no-record gap when lines came back:\n%s", discord)
+	}
+}
+
+// TestNoRecordGapKeepsRefusedScopeNaming pins that the no-record gap does
+// not swallow the refused scope beside it. A namespace the alert named that
+// is not one path segment was never queried, so it stays named as
+// uninspected even when another scope's reply carried no log record (#331,
+// #349). Both surfaces must say so.
+func TestNoRecordGapKeepsRefusedScopeNaming(t *testing.T) {
+	g := Group{
+		Key:        "sig-norecords-refused",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{BackendState: "norecords", BackendScoped: true, BackendRefused: true}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must state the no-record gap:\n%s", model)
+	}
+	if !strings.Contains(model, "refused as not one path segment") {
+		t.Errorf("model prompt must name the refused scope as uninspected:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "carried no log records") {
+		t.Errorf("discord must state the no-record gap:\n%s", discord)
+	}
+	if !strings.Contains(discord, "refused as not one path segment") {
+		t.Errorf("discord must name the refused scope as uninspected:\n%s", discord)
+	}
+}
+
+// TestNoRecordScopeStaysVisibleBesideLines pins that a scope whose reply
+// carried no log record stays named when another scope's lines are rendered:
+// those lines do not cover the whole subject, so the digest must not read as
+// a complete answer (#349). Both surfaces must say so.
+func TestNoRecordScopeStaysVisibleBesideLines(t *testing.T) {
+	g := Group{
+		Key:        "sig-norecords-beside-lines",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{
+		BackendState:     "ok",
+		BackendScoped:    true,
+		BackendLogs:      []string{"subject backend log line"},
+		BackendNoRecords: true,
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "subject backend log line") {
+		t.Errorf("model prompt must still render the backend log line:\n%s", model)
+	}
+	if !strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must state that the other scope's logs are unknown:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "subject backend log line") {
+		t.Errorf("discord must still render the backend log line:\n%s", discord)
+	}
+	if !strings.Contains(discord, "carried no log records") {
+		t.Errorf("discord must state that the other scope's logs are unknown:\n%s", discord)
+	}
+}
+
+// TestAmbientStateDoesNotClaimWindowCoverageBesideNoRecordScope pins that
+// the ambient rendering does not claim the window's completeness when a
+// scope's reply carried no log record: the lines under CONTEXT are what the
+// read returned, not what the window held (#349). Without the scope gap the
+// claim stays as it was.
+func TestAmbientStateDoesNotClaimWindowCoverageBesideNoRecordScope(t *testing.T) {
+	g := Group{
+		Key:        "sig-ambient-norecords",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1"}}},
+	}
+	en := Enrichment{
+		BackendState:     "ambient",
+		Ambient:          []string{"(ambient, namespace-wide) namespace chatter line"},
+		BackendNoRecords: true,
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "backend logs in the window") {
+		t.Errorf("model prompt must not claim the lines cover the window:\n%s", model)
+	}
+	if !strings.Contains(model, "backend logs the read returned") {
+		t.Errorf("model prompt must narrow the claim to what the read returned:\n%s", model)
+	}
+	if !strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must state that the other scope's logs are unknown:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "backend logs in the window") {
+		t.Errorf("discord must not claim the lines cover the window:\n%s", discord)
+	}
+	if !strings.Contains(discord, "backend logs the read returned") {
+		t.Errorf("discord must narrow the claim to what the read returned:\n%s", discord)
+	}
+
+	// Without the scope gap the window claim stands as it always did.
+	plain := Enrichment{
+		BackendState: "ambient",
+		Ambient:      []string{"(ambient, namespace-wide) namespace chatter line"},
+	}
+	if got := renderEvidence(Report{Group: g, Enrichment: plain}); !strings.Contains(got, "backend logs in the window") {
+		t.Errorf("an ambient read with no scope gap must keep the window claim:\n%s", got)
+	}
+}
+
+// TestNoRecordGapIsStatedPerScope pins that the no-record wording names
+// the scope it is about instead of claiming every reply in the read carried
+// no record: another scope may have answered with a record that held no
+// text, which is a scope the read did cover (#349).
+func TestNoRecordGapIsStatedPerScope(t *testing.T) {
+	g := Group{
+		Key:        "sig-norecords-per-scope",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{BackendState: "norecords", BackendScoped: true}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "every backend reply") {
+		t.Errorf("model prompt must not claim every reply carried no record:\n%s", model)
+	}
+	if !strings.Contains(model, "at least one backend reply carried no log records") {
+		t.Errorf("model prompt must state the gap as it was found:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "every backend reply") {
+		t.Errorf("discord must not claim every reply carried no record:\n%s", discord)
+	}
+	if !strings.Contains(discord, "at least one backend reply carried no log records") {
+		t.Errorf("discord must state the gap as it was found:\n%s", discord)
 	}
 }
 

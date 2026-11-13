@@ -117,6 +117,11 @@ type backendLogResult struct {
 	// namespace": a refused scope is uninspected, not empty (issue #311
 	// review, #331).
 	SkippedRefused bool
+	// NoRecords records that at least one queried scope's reply carried no
+	// log record at all: the backend answered with something that was not a
+	// set of log lines. Nothing is known about the window in that case, so
+	// no "there were no lines" claim is supported for the read.
+	NoRecords bool
 	// SkippedUnresolved lists the valid namespaces (one path segment) that
 	// received no query at all: the group resolved a subject pod in another
 	// namespace, and a resolved-subject group queries only those pods, so a
@@ -202,6 +207,10 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	// Set, not slice: a hand-built Group can repeat a namespace, and the
 	// gap must be named once. Sorted at return for a stable render.
 	skippedUnresolved := map[string]bool{}
+	// A reply that carried no log record is a fact about the reply, not a
+	// failed read: the group read continues and the fact travels with the
+	// result so the renderer can state the gap instead of a negative.
+	noRecords := false
 
 	for _, namespace := range g.Namespaces {
 		// The namespace is alert-supplied text. The query quotes it, so the
@@ -239,6 +248,13 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 			seenQueries[queryKey] = struct{}{}
 			records, err := b.query(ctx, namespace, pod, start, now)
 			if err != nil {
+				if errors.Is(err, errNoLogRecords) {
+					// The reply parsed and carried no log record, so the
+					// scope is unknown rather than empty. The read does not
+					// fail and the next scope is still queried.
+					noRecords = true
+					continue
+				}
 				return backendLogResult{}, err
 			}
 			for _, record := range records {
@@ -260,6 +276,13 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		}
 	}
 
+	if noRecords {
+		// One line per read, not per scope: the condition is about the
+		// reply, and neither the reply body nor the alert-supplied scope
+		// names belong in the log.
+		logf("enrich: backend logs: a backend reply carried no log record, so the scope is unknown rather than empty")
+	}
+
 	collapsed := collapseAndCap(order, b.limit)
 	if len(byNS) == 0 {
 		// No concrete subject: everything returned is namespace-wide, so mark it
@@ -269,14 +292,14 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		for i, line := range collapsed {
 			marked[i] = ambientLogMarker + line
 		}
-		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused}, nil
+		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused, NoRecords: noRecords}, nil
 	}
 	var unresolved []string
 	for ns := range skippedUnresolved {
 		unresolved = append(unresolved, ns)
 	}
 	sort.Strings(unresolved)
-	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved}, nil
+	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved, NoRecords: noRecords}, nil
 }
 
 // quoteLogValue renders a label value as a double-quoted literal with `"` and
@@ -316,6 +339,11 @@ func (b *logsBackend) buildQuery(namespace, pod string) string {
 	}
 }
 
+// query reads the backend for one scope. The error it returns is either a
+// failed read or the errNoLogRecords condition: the reply parsed and carried
+// no log record, so the scope is unknown rather than empty. An empty
+// VictoriaLogs reply is not an error here — it is the backend's own "no
+// lines" answer.
 func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, end time.Time) ([]backendLog, error) {
 	endpoint, err := b.endpoint()
 	if err != nil {
@@ -374,9 +402,43 @@ func (b *logsBackend) query(ctx context.Context, namespace, pod string, start, e
 // scope, because "the body was empty" and "the body held no log records" are
 // different facts and only the caller knows which one the backend meant:
 // VictoriaLogs answers a query that matched nothing with an empty 200 body.
-// b.query maps this error back to "no lines"; every other unreadable reply
-// stays a failed query (issue #342, criterion 2).
+// b.query maps this error back to "no lines"; a reply that held no log
+// record is named separately (errNoLogRecords), and every other unreadable
+// reply stays a failed query (issue #342, criterion 2).
 var errEmptyVictoriaLogsReply = errors.New("victorialogs response was empty")
+
+// errNoLogRecords reports a reply that parsed but carried no log record at
+// all — a 200 body holding {"error":"unauthorized"}, for instance. The reply
+// is not a set of log lines, so the read cannot say the scope had no lines;
+// it established only that it could not find any, and not why. It is not a
+// failed read either: the backend answered. Only the VictoriaLogs parser
+// raises it — a Loki reply with an empty result set is Loki's own "no lines"
+// answer and stays an empty scope.
+var errNoLogRecords = errors.New("victorialogs reply carried no log record")
+
+// logMessage is the _msg field of a log record. It remembers whether the
+// field was there at all, because "the record carried a blank message" and
+// "the line carried no message field" are different facts: the first is a
+// log record with nothing to show, the second is not a log record at all
+// (#349). A plain string field cannot tell them apart — an absent field and
+// a null field both decode to the empty string — so the presence is
+// recorded here.
+type logMessage struct {
+	present bool
+	text    string
+}
+
+// UnmarshalJSON records that the field was present and reads the text. A
+// null message is a record with no text, not a missing record. A non-string
+// message is not a message: the line stays unreadable, as it was before this
+// type existed, rather than becoming a record with no text.
+func (m *logMessage) UnmarshalJSON(data []byte) error {
+	m.present = true
+	if string(data) == "null" {
+		return nil
+	}
+	return json.Unmarshal(data, &m.text)
+}
 
 func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
@@ -391,6 +453,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	lineNo := 0
 	lines := 0
 	parsed := 0
+	records := 0
 	unreadable := 0
 	var firstSkipLine int
 	var firstSkipErr error
@@ -419,7 +482,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 		} else if text := strings.TrimSpace(string(line)); text != "" {
 			lines++
 			var record struct {
-				Message string `json:"_msg"`
+				Message logMessage `json:"_msg"`
 			}
 			// One malformed record — a broken plugin output, a proxy-injected
 			// line, a truncated write — must not discard the valid lines around
@@ -435,8 +498,17 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 				}
 			} else {
 				parsed++
-				if strings.TrimSpace(record.Message) != "" {
-					out = append(out, backendLog{message: record.Message})
+				// A line that carried an _msg field is a log record, even
+				// when the message is blank or null: a blank message is
+				// noise to drop, not a missing record. A parsed line
+				// without the field (an error object, say) is not a record
+				// at all, which is what the no-record condition below
+				// names.
+				if record.Message.present {
+					records++
+					if strings.TrimSpace(record.Message.text) != "" {
+						out = append(out, backendLog{message: record.Message.text})
+					}
 				}
 			}
 		}
@@ -454,16 +526,26 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	// refused for the same reason, but b.query maps that one back to an empty
 	// scope, because VictoriaLogs answers a query that matched nothing with
 	// an empty 200 body. A body that holds at least one line which parsed is
-	// not wholly unparseable, so it degrades to the records it yielded — even
-	// when none of them carried a message, in which case the empty scope is
-	// stated rather than a query failure claimed. An oversized line is a line
-	// seen and not read: it neither fails the read (issue #347) nor lets a
-	// body holding only oversized records slip into the empty-reply case.
+	// not wholly unparseable, so it degrades to the records it yielded; when
+	// none of them carried an _msg field, the reply carried no log record at
+	// all and the empty scope is not stated either (#349). An oversized line is
+	// a line seen and not read: it neither fails the read (issue #347) nor lets
+	// a body holding only oversized records slip into the empty-reply case.
 	if lines == 0 {
 		return nil, errEmptyVictoriaLogsReply
 	}
 	if parsed == 0 {
 		return nil, fmt.Errorf("victorialogs response had no parseable lines (%d unreadable lines)", unreadable)
+	}
+	// A reply whose lines parsed but carried no log record (e.g. an error
+	// object with no _msg) is not a set of log lines: it says nothing about
+	// the window, so the read cannot state that the scope had no lines. It is
+	// not a failed read either — the backend answered — so it is named, and
+	// the caller decides what to say about the scope (#349). A record whose
+	// message was blank is still a record, so a reply holding only those
+	// keeps the empty scope it earned.
+	if records == 0 {
+		return nil, errNoLogRecords
 	}
 	return out, nil
 }
