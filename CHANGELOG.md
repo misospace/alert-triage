@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.1](https://github.com/misospace/alert-triage/compare/v0.3.0...v0.3.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **logs:** state a no-record backend reply as a gap, not an empty scope (issue [#349](https://github.com/misospace/alert-triage/issues/349)) ([#359](https://github.com/misospace/alert-triage/issues/359)) ([c9f4244](https://github.com/misospace/alert-triage/commit/c9f4244772b61e4f1ea288713358dbe1df2fedfa))
+* **logs:** surface group namespaces the pod-scoped query never covers (issue [#339](https://github.com/misospace/alert-triage/issues/339)) ([ad44072](https://github.com/misospace/alert-triage/commit/ad4407270564cc8110534dd9d4641f1ca862e066))
+* **metrics:** accept rules typed "alerting" so rule expressions resolve ([#353](https://github.com/misospace/alert-triage/issues/353)) ([#355](https://github.com/misospace/alert-triage/issues/355)) ([3cd7cc9](https://github.com/misospace/alert-triage/commit/3cd7cc978461223278b443b922e14cee80c120b8))
+* **metrics:** budget each source so one flood cannot evict fixed context or notes ([#344](https://github.com/misospace/alert-triage/issues/344)) ([#350](https://github.com/misospace/alert-triage/issues/350)) ([6382640](https://github.com/misospace/alert-triage/commit/63826403d63d5a9206f19c42a920d20a66dcaff4))
+* **metrics:** keep fixed context negatives ahead of rule notes on overflow (issue [#354](https://github.com/misospace/alert-triage/issues/354)) ([#356](https://github.com/misospace/alert-triage/issues/356)) ([eec2614](https://github.com/misospace/alert-triage/commit/eec261410c7e174b881fc1633c38207d9a9615a3))
+
+
+### Chores
+
+* **container:** update image gcr.io/distroless/static-debian13 (25ac8f0 → aafe993) ([#358](https://github.com/misospace/alert-triage/issues/358)) ([70df6b0](https://github.com/misospace/alert-triage/commit/70df6b0658106947f032be069ce780b3c0b18cf1))
+
 ## [0.3.0](https://github.com/misospace/alert-triage/compare/v0.2.0...v0.3.0) (2026-11-11)
 
 
