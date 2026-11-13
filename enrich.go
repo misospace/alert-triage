@@ -536,12 +536,15 @@ type Enrichment struct {
 	// than trusting them as a service reading.
 	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
-	// "off", "ok", "empty", "ambient", "refused", "partial", "unavailable",
-	// or "error" so missing configuration is not confused with a successful
-	// query that returned no lines. "empty" means the queries issued returned
-	// no lines; "ambient" means no concrete subject could be resolved, the
-	// namespace-wide fallback did return lines, and those lines were routed to
-	// Ambient — the source is configured and answered.
+	// "off", "ok", "empty", "ambient", "refused", "partial", "norecords",
+	// "unavailable", or "error" so missing configuration is not confused
+	// with a successful query that returned no lines. "empty" means the
+	// queries issued returned no lines; "ambient" means no concrete subject
+	// could be resolved, the namespace-wide fallback did return lines, and
+	// those lines were routed to Ambient — the source is configured and
+	// answered; "norecords" means the backend answered, but the reply
+	// carried no log record at all, so the scope is unknown rather than
+	// empty.
 	BackendLogs  []string
 	BackendState string
 	// BackendScoped records whether the backend-log query was bounded to a
@@ -1332,6 +1335,18 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				// negative in the prompt next to the very lines we just
 				// routed to BACKGROUND.
 				e.BackendState = "ambient"
+			case res.NoRecords:
+				// The backend answered, but the reply carried no log record
+				// at all, so nothing is known about the window: the scope is
+				// unknown, not empty. This sits above the scope gaps on
+				// purpose — the refused and partial wordings assert that the
+				// queries that ran returned no lines, which a reply carrying
+				// no record does not support (#349).
+				// The scope gap survives the no-record reply: a namespace
+				// that was never queried is uninspected, not empty (#339),
+				// so it keeps its naming.
+				e.BackendUnqueried = res.SkippedUnresolved
+				e.BackendState = "norecords"
 			case res.SkippedRefused:
 				// A refused namespace sent no request, so "empty" would turn
 				// a scope that was never queried into a "the backend has no

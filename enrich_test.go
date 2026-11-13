@@ -1550,6 +1550,103 @@ func TestEnrichBackendLogsNoSubjectEmptyNotScoped(t *testing.T) {
 	}
 }
 
+// TestEnrichBackendLogsNoRecordReplyStatesGap pins the Enrich-level state
+// mapping for #349: a VictoriaLogs reply that parsed but carried no log
+// record leaves the scope unknown, so the state must name that gap rather
+// than claim an empty scope or a failed read.
+func TestEnrichBackendLogsNoRecordReplyStatesGap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "norecords" {
+		t.Fatalf("expected state \"norecords\", got %q", en.BackendState)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(got, "returned no lines") {
+		t.Errorf("the digest must not claim the scope had no lines:\n%s", got)
+	}
+	if !strings.Contains(got, "carried no log records") {
+		t.Errorf("the digest must state the no-record gap:\n%s", got)
+	}
+}
+
+// TestEnrichBackendLogsNoRecordReplyKeepsUnqueriedNamespace pins that the
+// no-record state keeps #339's naming of a scope that was never queried: the
+// group resolves a subject pod in ns-a, ns-b resolves none, so ns-b is never
+// queried at all, and the digest must say so next to the no-record gap
+// instead of letting the gap imply the window was covered.
+func TestEnrichBackendLogsNoRecordReplyKeepsUnqueriedNamespace(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "norecords" {
+		t.Fatalf("expected state \"norecords\", got %q", en.BackendState)
+	}
+	found := false
+	for _, ns := range en.BackendUnqueried {
+		if ns == "ns-b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the never-queried namespace must keep its naming, got %v", en.BackendUnqueried)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "carried no log records") {
+		t.Errorf("the digest must state the no-record gap:\n%s", got)
+	}
+	if !strings.Contains(got, "was never queried") {
+		t.Errorf("the digest must state that the namespace was never queried:\n%s", got)
+	}
+	if !strings.Contains(got, "ns-b") {
+		t.Errorf("the digest must name the never-queried namespace:\n%s", got)
+	}
+	if strings.Contains(got, "returned no lines") {
+		t.Errorf("the digest must not claim the scope had no lines:\n%s", got)
+	}
+}
+
 // TestEnrichBackendLogsTargetPodIsPrimary proves the primary path: when the
 // resolved target-pod set is non-empty, backend logs are pod-scoped, the
 // namespace-wide query is not issued, and unrelated namespace log lines never

@@ -621,6 +621,21 @@ func renderEvidence(r Report) string {
 		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
 		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
 		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
+	case "norecords":
+		// The backend answered with something that was not a set of log
+		// lines, so nothing is known about the window: the scope is unknown,
+		// not empty. The negative would be a claim the read cannot support.
+		if r.Enrichment.BackendScoped {
+			b.WriteString("\nSubject log source: configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so this subject's logs are unknown rather than empty.\n")
+		} else {
+			b.WriteString("\nLog source: configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so the namespace's logs are unknown rather than empty.\n")
+		}
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			// The scope gap survives the no-record reply: the namespace was
+			// never queried, so it is uninspected, not empty (#339).
+			b.WriteString("One of the group's namespaces was never queried: no subject pod resolved there, so it was never queried - uninspected, not empty.\n")
+			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
+		}
 	case "error":
 		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
 	case "refused":
@@ -639,12 +654,7 @@ func renderEvidence(r Report) string {
 		// and RepoPaths do (#310/#320 reviews).
 		b.WriteString("\nSubject log source: configured, but the backend queries were bounded to resolved subject pods and never covered one of the group's namespaces: no subject pod resolved there, so it was never queried - uninspected, not empty. The queries that ran returned no lines in the window.\n")
 		if len(r.Enrichment.BackendUnqueried) > 0 {
-			b.WriteString("Unqueried namespace(s), as the alert named them (untrusted):\n")
-			b.WriteString(untrustedBegin + "\n")
-			for _, ns := range r.Enrichment.BackendUnqueried {
-				b.WriteString(untrusted(stripSecrets(ns)) + "\n")
-			}
-			b.WriteString(untrustedEnd + "\n")
+			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
 		}
 	case "ok":
 		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
@@ -886,6 +896,19 @@ func writeQuotedValue(b *strings.Builder, label, value string) {
 	b.WriteString(untrustedEnd + "\n")
 }
 
+// writeUnqueriedNamespaces names the namespaces the backend-log queries
+// never covered, so an uninspected scope is never read as an empty one
+// (#339). The names are alert-supplied, so they render inside the
+// untrusted fence.
+func writeUnqueriedNamespaces(b *strings.Builder, unqueried []string) {
+	b.WriteString("Unqueried namespace(s), as the alert named them (untrusted):\n")
+	b.WriteString(untrustedBegin + "\n")
+	for _, ns := range unqueried {
+		b.WriteString(untrusted(stripSecrets(ns)) + "\n")
+	}
+	b.WriteString(untrustedEnd + "\n")
+}
+
 // writePodLogBlock renders a pod-log map inside the untrusted fence. The
 // provenance lookup names the container and stream per entry, so a one-shot
 // Job's current log is not silently mislabelled as a previous-container tail
@@ -1068,6 +1091,16 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n**Backend log source:** configured, but returned no lines for this window.")
 	case "ambient":
 		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are the only backend logs in the window and are shown as ambient context, not evidence of the failing resource.")
+	case "norecords":
+		// The backend answered with something that was not a set of log
+		// lines, so nothing is known about the window: the scope is unknown,
+		// not empty.
+		desc.WriteString("\n**Backend log source:** configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so the logs are unknown rather than empty.")
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			// Same inert rendering the "partial" case applies: the names are
+			// alert-supplied and must not be able to forge a section line.
+			desc.WriteString(" One of the group's namespaces was never queried: namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendUnqueried, ", "))) + " - uninspected, not empty.")
+		}
 	case "error":
 		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
 	case "refused":
