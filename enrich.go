@@ -544,7 +544,9 @@ type Enrichment struct {
 	// those lines were routed to Ambient — the source is configured and
 	// answered; "norecords" means the backend answered, but the reply
 	// carried no log record at all, so the scope is unknown rather than
-	// empty.
+	// empty. Two facts travel beside the state, because neither is a state
+	// of its own: BackendRefused (a namespace that was never queried) and
+	// BackendNoRecords (a scope whose reply was not a set of log lines).
 	BackendLogs  []string
 	BackendState string
 	// BackendScoped records whether the backend-log query was bounded to a
@@ -560,6 +562,20 @@ type Enrichment struct {
 	// namespaces, on the branch that fix did not cover (issue #339).
 	// Alert-supplied: render like any other namespace value.
 	BackendUnqueried []string
+	// BackendRefused records that a namespace the alert named was refused as
+	// not one path segment, so it was never queried at all. A refused scope
+	// is uninspected, not empty (#311 review, #331), and that naming must
+	// survive the no-record gap beside it: a scope that was never queried
+	// cannot be folded into another gap, because no reply about it exists
+	// to be read as one. The name itself is alert-supplied and is not
+	// rendered.
+	BackendRefused bool
+	// BackendNoRecords records that at least one queried scope's reply
+	// carried no log record, so that scope's logs are unknown rather than
+	// empty (#349). It holds even when other scopes returned lines: a
+	// rendered line must not hide a scope whose reply was not a set of log
+	// lines, and the read says nothing about the window for that scope.
+	BackendNoRecords bool
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -1321,6 +1337,12 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 			// resolved) are ambient context for ruling things out, never evidence
 			// about the failing resource, so they go to Ambient, not BackendLogs.
 			e.Ambient = append(e.Ambient, res.Ambient...)
+			// Two facts about the read travel beside the state, because
+			// neither is a state of its own. A refused namespace was never
+			// queried, and a scope whose reply carried no log record is
+			// unknown rather than empty.
+			e.BackendRefused = res.SkippedRefused
+			e.BackendNoRecords = res.NoRecords
 			switch {
 			case len(res.Primary) > 0:
 				// The unqueried and refused gap markers are deliberately
@@ -1328,6 +1350,9 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				// evidence rendered, silence about a skipped scope cannot
 				// read as an empty negative, and #331 set exactly this
 				// precedence for a refused sibling (#339 follows it).
+				// The no-record fact is not a scope gap — the scope was
+				// queried and answered with something that was not log
+				// lines — so it stays visible here (#349).
 				e.BackendState = "ok"
 			case len(res.Ambient) > 0:
 				// The backend did return lines — it is the no-subject
@@ -1342,9 +1367,11 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 				// purpose — the refused and partial wordings assert that the
 				// queries that ran returned no lines, which a reply carrying
 				// no record does not support (#349).
-				// The scope gap survives the no-record reply: a namespace
+				// The scope gaps survive the no-record reply: a namespace
 				// that was never queried is uninspected, not empty (#339),
-				// so it keeps its naming.
+				// and a namespace that was refused was never queried at
+				// all (#331), so it keeps its naming beside this one rather
+				// than being folded into it.
 				e.BackendUnqueried = res.SkippedUnresolved
 				e.BackendState = "norecords"
 			case res.SkippedRefused:

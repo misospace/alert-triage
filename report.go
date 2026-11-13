@@ -618,17 +618,39 @@ func renderEvidence(r Report) string {
 			b.WriteString("\nLog source: configured, but returned no lines for the namespace in the window.\n")
 		}
 	case "ambient":
+		// The lines under CONTEXT are the whole window's backend logs only
+		// when every query answered with lines or an explicit "nothing
+		// matched". A scope whose reply carried no log record leaves the
+		// window's completeness unknown (#349), so the claim narrows to what
+		// the read returned.
+		coverage := "the only\nbackend logs in the window"
+		if r.Enrichment.BackendNoRecords {
+			coverage = "the\nbackend logs the read returned"
+		}
 		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
-		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are the only\n")
-		b.WriteString("backend logs in the window and are context, not evidence about a failing pod.\n")
+		b.WriteString("subject logs are shown - the namespace-wide lines under CONTEXT are " + coverage + " and are context, not evidence about a failing pod.\n")
+		if r.Enrichment.BackendNoRecords {
+			// The lines under CONTEXT do not cover the whole window: one
+			// namespace's reply was not a set of log lines, so that
+			// namespace's logs are unknown rather than empty (#349).
+			b.WriteString("At least one queried namespace's reply carried no log records in the window, so that namespace's logs are unknown rather than empty.\n")
+		}
 	case "norecords":
 		// The backend answered with something that was not a set of log
 		// lines, so nothing is known about the window: the scope is unknown,
 		// not empty. The negative would be a claim the read cannot support.
+		// The gap is per scope: another scope's reply may have carried a
+		// record with no text in it, which is a scope the read did cover.
 		if r.Enrichment.BackendScoped {
-			b.WriteString("\nSubject log source: configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so this subject's logs are unknown rather than empty.\n")
+			b.WriteString("\nSubject log source: configured, but at least one backend reply carried no log records in the window - the backend did not answer with log lines for that scope, so that scope's logs are unknown rather than empty.\n")
 		} else {
-			b.WriteString("\nLog source: configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so the namespace's logs are unknown rather than empty.\n")
+			b.WriteString("\nLog source: configured, but at least one backend reply carried no log records in the window - the backend did not answer with log lines for that scope, so that scope's logs are unknown rather than empty.\n")
+		}
+		if r.Enrichment.BackendRefused {
+			// The refused scope was never queried, so it is uninspected,
+			// not empty — and that naming must not be lost to the
+			// no-record gap it sits beside (#331).
+			b.WriteString("A namespace the alert named was refused as not one path segment, so its logs were never queried - uninspected, not empty.\n")
 		}
 		if len(r.Enrichment.BackendUnqueried) > 0 {
 			// The scope gap survives the no-record reply: the namespace was
@@ -663,6 +685,12 @@ func renderEvidence(r Report) string {
 			b.WriteString(untrusted(line) + "\n")
 		}
 		b.WriteString(untrustedEnd + "\n")
+		if r.Enrichment.BackendNoRecords {
+			// The lines above do not cover the whole subject: another
+			// queried scope's reply was not a set of log lines, so that
+			// scope's logs are unknown rather than empty (#349).
+			b.WriteString("At least one queried scope's reply carried no log records in the window, so that scope's logs are unknown rather than empty.\n")
+		}
 	}
 	// Event messages are written by whatever controller or workload emitted them,
 	// so they carry the same trust as alert text even though the API served them.
@@ -1090,12 +1118,35 @@ func discordDescription(cfg *Config, r Report) string {
 	case "empty":
 		desc.WriteString("\n**Backend log source:** configured, but returned no lines for this window.")
 	case "ambient":
-		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are the only backend logs in the window and are shown as ambient context, not evidence of the failing resource.")
+		// The lines shown are the whole window's backend logs only when
+		// every query answered with lines or an explicit "nothing matched".
+		// A scope whose reply carried no log record leaves the window's
+		// completeness unknown (#349), so the claim narrows to what the read
+		// returned.
+		coverage := "the only backend logs in the window"
+		if r.Enrichment.BackendNoRecords {
+			coverage = "the backend logs the read returned"
+		}
+		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are " + coverage + " and are shown as ambient context, not evidence of the failing resource.")
+		if r.Enrichment.BackendNoRecords {
+			// The ambient lines do not cover the whole window: one
+			// namespace's reply was not a set of log lines, so that
+			// namespace's logs are unknown rather than empty (#349).
+			desc.WriteString(" At least one queried namespace's reply carried no log records in the window, so that namespace's logs are unknown rather than empty.")
+		}
 	case "norecords":
 		// The backend answered with something that was not a set of log
 		// lines, so nothing is known about the window: the scope is unknown,
-		// not empty.
-		desc.WriteString("\n**Backend log source:** configured, but every backend reply carried no log records in the window - the backend did not answer with log lines, so the logs are unknown rather than empty.")
+		// not empty. The gap is per scope: another scope's reply may have
+		// carried a record with no text in it, which is a scope the read
+		// did cover.
+		desc.WriteString("\n**Backend log source:** configured, but at least one backend reply carried no log records in the window - the backend did not answer with log lines for that scope, so that scope's logs are unknown rather than empty.")
+		if r.Enrichment.BackendRefused {
+			// The refused scope was never queried, so it is uninspected,
+			// not empty — and that naming must not be lost to the no-record
+			// gap it sits beside (#331).
+			desc.WriteString(" A namespace the alert named was refused as not one path segment, so its logs were never queried - uninspected, not empty.")
+		}
 		if len(r.Enrichment.BackendUnqueried) > 0 {
 			// Same inert rendering the "partial" case applies: the names are
 			// alert-supplied and must not be able to forge a section line.
@@ -1128,6 +1179,14 @@ func discordDescription(cfg *Config, r Report) string {
 			// fit relies on.
 			desc.WriteString(sanitizeFenceContent(line))
 			desc.WriteByte('\n')
+		}
+		if r.Enrichment.BackendNoRecords {
+			// The lines above do not cover the whole subject: another
+			// queried scope's reply was not a set of log lines, so that
+			// scope's logs are unknown rather than empty (#349). The blank
+			// line ends the bullet list, so the sentence reads as its own
+			// paragraph and not as a continuation of the last bullet.
+			desc.WriteString("\nAt least one queried scope's reply carried no log records in the window, so that scope's logs are unknown rather than empty.")
 		}
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)

@@ -416,6 +416,30 @@ var errEmptyVictoriaLogsReply = errors.New("victorialogs response was empty")
 // answer and stays an empty scope.
 var errNoLogRecords = errors.New("victorialogs reply carried no log record")
 
+// logMessage is the _msg field of a log record. It remembers whether the
+// field was there at all, because "the record carried a blank message" and
+// "the line carried no message field" are different facts: the first is a
+// log record with nothing to show, the second is not a log record at all
+// (#349). A plain string field cannot tell them apart — an absent field and
+// a null field both decode to the empty string — so the presence is
+// recorded here.
+type logMessage struct {
+	present bool
+	text    string
+}
+
+// UnmarshalJSON records that the field was present and reads the text. A
+// null message is a record with no text, not a missing record. A non-string
+// message is not a message: the line stays unreadable, as it was before this
+// type existed, rather than becoming a record with no text.
+func (m *logMessage) UnmarshalJSON(data []byte) error {
+	m.present = true
+	if string(data) == "null" {
+		return nil
+	}
+	return json.Unmarshal(data, &m.text)
+}
+
 func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 	var out []backendLog
 	// The line reader is readHistoryLines' (issue #162), reused for the
@@ -458,7 +482,7 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 		} else if text := strings.TrimSpace(string(line)); text != "" {
 			lines++
 			var record struct {
-				Message *string `json:"_msg"`
+				Message logMessage `json:"_msg"`
 			}
 			// One malformed record — a broken plugin output, a proxy-injected
 			// line, a truncated write — must not discard the valid lines around
@@ -475,14 +499,15 @@ func parseVictoriaLogs(body []byte) ([]backendLog, error) {
 			} else {
 				parsed++
 				// A line that carried an _msg field is a log record, even
-				// when the message is blank: a blank message is noise to
-				// drop, not a missing record. A parsed line without the
-				// field (an error object, say) is not a record at all,
-				// which is what the no-record condition below names.
-				if record.Message != nil {
+				// when the message is blank or null: a blank message is
+				// noise to drop, not a missing record. A parsed line
+				// without the field (an error object, say) is not a record
+				// at all, which is what the no-record condition below
+				// names.
+				if record.Message.present {
 					records++
-					if strings.TrimSpace(*record.Message) != "" {
-						out = append(out, backendLog{message: *record.Message})
+					if strings.TrimSpace(record.Message.text) != "" {
+						out = append(out, backendLog{message: record.Message.text})
 					}
 				}
 			}

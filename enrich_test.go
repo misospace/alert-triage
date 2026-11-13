@@ -1647,6 +1647,106 @@ func TestEnrichBackendLogsNoRecordReplyKeepsUnqueriedNamespace(t *testing.T) {
 	}
 }
 
+// TestEnrichBackendLogsNoRecordReplyKeepsRefusedScope pins that the
+// no-record state does not swallow the refused scope beside it. The group
+// names a namespace that is not one path segment and another whose reply
+// carried no log record: the first was never queried and the second is
+// unknown, and both facts must reach the digest. The refused naming is
+// #311/#331's, and the no-record naming is #349's; neither may swallow the
+// other.
+func TestEnrichBackendLogsNoRecordReplyKeepsRefusedScope(t *testing.T) {
+	const hostile = "ns/../../other"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns-ok", hostile},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-ok", "pod": "p1"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "norecords" {
+		t.Fatalf("expected state \"norecords\", got %q", en.BackendState)
+	}
+	if !en.BackendRefused {
+		t.Fatalf("the refused scope must be carried beside the no-record gap")
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "carried no log records") {
+		t.Errorf("the digest must state the no-record gap:\n%s", got)
+	}
+	if !strings.Contains(got, "refused as not one path segment") {
+		t.Errorf("the digest must name the refused scope as uninspected:\n%s", got)
+	}
+	if strings.Contains(got, "returned no lines") {
+		t.Errorf("the digest must not claim the scope had no lines:\n%s", got)
+	}
+}
+
+// TestEnrichBackendLogsNoRecordScopeStaysVisibleWithLines pins that a scope
+// whose reply carried no log record is still named when another scope's
+// lines are rendered: the rendered lines do not cover the whole subject, so
+// the digest must not read as a complete answer (#349).
+func TestEnrichBackendLogsNoRecordScopeStaysVisibleWithLines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			if strings.Contains(r.URL.Query().Get("query"), `"ns-b"`) {
+				_, _ = io.WriteString(w, "{\"error\":\"unauthorized\"}\n")
+				return
+			}
+			_, _ = io.WriteString(w, "{\"_msg\":\"ns-a subject line\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b", "pod": "p2"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "ok" {
+		t.Fatalf("expected state \"ok\", got %q", en.BackendState)
+	}
+	if !en.BackendNoRecords {
+		t.Fatalf("the no-record scope must stay visible beside the rendered lines")
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "ns-a subject line") {
+		t.Errorf("the digest must still render the lines that came back:\n%s", got)
+	}
+	if !strings.Contains(got, "carried no log records") {
+		t.Errorf("the digest must state that the other scope's logs are unknown:\n%s", got)
+	}
+}
+
 // TestEnrichBackendLogsTargetPodIsPrimary proves the primary path: when the
 // resolved target-pod set is non-empty, backend logs are pod-scoped, the
 // namespace-wide query is not issued, and unrelated namespace log lines never
