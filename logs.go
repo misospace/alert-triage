@@ -133,6 +133,17 @@ type backendLogResult struct {
 	// must apply the same redaction and untrusted treatment they apply to
 	// every other namespace render.
 	SkippedUnresolved []string
+	// FailedReads lists the namespaces whose query was sent but whose reply
+	// could not be read. The read continues with the scopes that answered —
+	// one unreadable namespace must not discard the lines already collected
+	// for the others (#348) — and the names travel with the result so the
+	// caller can state the gap for those namespaces instead of reporting the
+	// whole group's query as failed. Nothing is known about the window for a
+	// namespace named here, so it must not render as an empty scope either.
+	// The names are alert-supplied: callers that render them must apply the
+	// same redaction and untrusted treatment they apply to every other
+	// namespace render.
+	FailedReads []string
 }
 
 // ambientLogMarker prefixes namespace-wide backend-log lines returned when no
@@ -177,12 +188,12 @@ func targetPodsByNamespace(targetPods map[string]bool) map[string][]string {
 	return out
 }
 
-func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, window time.Duration, targetPods map[string]bool) (backendLogResult, error) {
+func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, window time.Duration, targetPods map[string]bool) backendLogResult {
 	if b == nil {
-		return backendLogResult{}, nil
+		return backendLogResult{}
 	}
 	if len(g.Namespaces) == 0 {
-		return backendLogResult{}, nil
+		return backendLogResult{}
 	}
 	if window <= 0 {
 		window = 5 * time.Minute
@@ -211,6 +222,14 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 	// failed read: the group read continues and the fact travels with the
 	// result so the renderer can state the gap instead of a negative.
 	noRecords := false
+	// A query that was sent but whose reply could not be read is a gap for
+	// its namespace, not a failure of the group read: returning early would
+	// discard the lines already collected for the other namespaces and read
+	// as "query failed; no lines were available" for the whole group
+	// (#348). The read continues and the fact travels with the result,
+	// beside the lines the answering scopes returned.
+	failedReads := map[string]bool{}
+	var firstReadErr error
 
 	for _, namespace := range g.Namespaces {
 		// The namespace is alert-supplied text. The query quotes it, so the
@@ -255,7 +274,15 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 					noRecords = true
 					continue
 				}
-				return backendLogResult{}, err
+				// The reply could not be read at all. The query was sent,
+				// so nothing is known about this namespace's window — but
+				// the scopes that already answered keep their lines, and
+				// the scopes after this one are still queried (#348).
+				failedReads[namespace] = true
+				if firstReadErr == nil {
+					firstReadErr = err
+				}
+				continue
 			}
 			for _, record := range records {
 				message := strings.Join(strings.Fields(stripSecrets(record.message)), " ")
@@ -282,6 +309,19 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		// names belong in the log.
 		logf("enrich: backend logs: a backend reply carried no log record, so the scope is unknown rather than empty")
 	}
+	if len(failedReads) > 0 {
+		// One line per read, not per scope, for the same reason: the error
+		// text can carry the queried URL, and the scope names are
+		// alert-supplied. The read's outcome travels in the result, not
+		// here.
+		logf("enrich: backend logs: %d scope read(s) failed (first: %v); the read continues with the scopes that answered", len(failedReads), firstReadErr)
+	}
+
+	var failed []string
+	for ns := range failedReads {
+		failed = append(failed, ns)
+	}
+	sort.Strings(failed)
 
 	collapsed := collapseAndCap(order, b.limit)
 	if len(byNS) == 0 {
@@ -292,14 +332,14 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		for i, line := range collapsed {
 			marked[i] = ambientLogMarker + line
 		}
-		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused, NoRecords: noRecords}, nil
+		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused, NoRecords: noRecords, FailedReads: failed}
 	}
 	var unresolved []string
 	for ns := range skippedUnresolved {
 		unresolved = append(unresolved, ns)
 	}
 	sort.Strings(unresolved)
-	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved, NoRecords: noRecords}, nil
+	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved, NoRecords: noRecords, FailedReads: failed}
 }
 
 // quoteLogValue renders a label value as a double-quoted literal with `"` and

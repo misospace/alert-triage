@@ -1747,6 +1747,102 @@ func TestEnrichBackendLogsNoRecordScopeStaysVisibleWithLines(t *testing.T) {
 	}
 }
 
+// TestEnrichBackendLogsFailedReadKeepsOtherScope pins the end-to-end #348
+// behavior: a group whose second namespace returns an unreadable reply still
+// reports the lines collected from the first namespace, names the gap for the
+// namespace that could not be read, and does not claim the group had no logs.
+func TestEnrichBackendLogsFailedReadKeepsOtherScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			if strings.Contains(r.URL.Query().Get("query"), `"ns-b"`) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = io.WriteString(w, "{\"_msg\":\"ns-a subject line\"}\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b", "pod": "p2"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "ok" {
+		t.Fatalf("expected state \"ok\" (one scope answered), got %q", en.BackendState)
+	}
+	if len(en.BackendFailedReads) != 1 || en.BackendFailedReads[0] != "ns-b" {
+		t.Fatalf("the unreadable namespace must be named beside the lines, got %v", en.BackendFailedReads)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(got, "ns-a subject line") {
+		t.Errorf("the digest must still report the lines the first namespace returned:\n%s", got)
+	}
+	if !strings.Contains(got, "could not be read") || !strings.Contains(got, "ns-b") {
+		t.Errorf("the digest must name the gap for the namespace that could not be read:\n%s", got)
+	}
+	if strings.Contains(got, "query failed") || strings.Contains(got, "returned no lines") {
+		t.Errorf("the digest must not claim the group had no logs:\n%s", got)
+	}
+}
+
+// TestEnrichBackendLogsAllReadsFailStatesGap pins the state for a group whose
+// every scope's reply is unreadable: the gap is stated for the named
+// namespaces instead of the group-wide "query failed" wording (#348).
+func TestEnrichBackendLogsAllReadsFailStatesGap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.HasPrefix(r.URL.Path, "/select/logsql/query") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-a", "pod": "p1"}},
+			{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b", "pod": "p2"}},
+		},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if en.BackendState != "unreadable" {
+		t.Fatalf("expected state \"unreadable\", got %q", en.BackendState)
+	}
+	if len(en.BackendFailedReads) != 2 {
+		t.Fatalf("both failed namespaces must be named, got %v", en.BackendFailedReads)
+	}
+	got := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(got, "query failed") || strings.Contains(got, "returned no lines") {
+		t.Errorf("the digest must state the gap, not a group-wide failure claim:\n%s", got)
+	}
+	if !strings.Contains(got, "could not be read") {
+		t.Errorf("the digest must state that the replies could not be read:\n%s", got)
+	}
+}
+
 // TestEnrichBackendLogsTargetPodIsPrimary proves the primary path: when the
 // resolved target-pod set is non-empty, backend logs are pod-scoped, the
 // namespace-wide query is not issued, and unrelated namespace log lines never
