@@ -624,7 +624,11 @@ func renderEvidence(r Report) string {
 		// window's completeness unknown (#349), so the claim narrows to what
 		// the read returned.
 		coverage := "the only\nbackend logs in the window"
-		if r.Enrichment.BackendNoRecords {
+		if r.Enrichment.BackendNoRecords || len(r.Enrichment.BackendFailedReads) > 0 {
+			// A scope whose reply carried no log record (#349) or whose
+			// reply could not be read (#348) leaves the window's
+			// completeness unknown, so the claim narrows to what the read
+			// returned.
 			coverage = "the\nbackend logs the read returned"
 		}
 		b.WriteString("\nSubject log source: configured; no concrete subject was resolved, so no\n")
@@ -634,6 +638,12 @@ func renderEvidence(r Report) string {
 			// namespace's reply was not a set of log lines, so that
 			// namespace's logs are unknown rather than empty (#349).
 			b.WriteString("At least one queried namespace's reply carried no log records in the window, so that namespace's logs are unknown rather than empty.\n")
+		}
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// The lines under CONTEXT do not cover the whole window either:
+			// one namespace's query was sent but its reply could not be
+			// read, so that namespace's logs are unknown (#348).
+			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
 		}
 	case "norecords":
 		// The backend answered with something that was not a set of log
@@ -658,8 +668,37 @@ func renderEvidence(r Report) string {
 			b.WriteString("One of the group's namespaces was never queried: no subject pod resolved there, so it was never queried - uninspected, not empty.\n")
 			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
 		}
-	case "error":
-		b.WriteString("\nSubject log source: query failed; no lines were available.\n")
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// A failed read is the same kind of gap and must not be lost to
+			// the no-record gap it sits beside (#348).
+			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
+		}
+	case "unreadable":
+		// The queries were sent, but no readable reply came back for the
+		// named namespaces, so nothing is known about the window there. The
+		// old wording — "query failed; no lines were available" — discarded
+		// the other namespaces' lines and turned one bad reply into a
+		// group-wide failure claim (#348). The finding is this service's
+		// reading and stays outside the fence; the namespace names are
+		// alert-supplied and go inside the inert rendering, as
+		// BackendUnqueried does (#310/#320 reviews).
+		source := "Subject log source"
+		if !r.Enrichment.BackendScoped {
+			source = "Log source"
+		}
+		b.WriteString("\n" + source + ": configured, but the backend reply for namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendFailedReads, ", "))) + " could not be read - the query was sent, but no readable reply came back, so those namespaces' logs are unknown rather than empty.\n")
+		if r.Enrichment.BackendRefused {
+			// The refused scope was never queried, so it is uninspected,
+			// not empty — and that naming must not be lost to the
+			// failed-read gap it sits beside (#331).
+			b.WriteString("A namespace the alert named was refused as not one path segment, so its logs were never queried - uninspected, not empty.\n")
+		}
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			// The scope gap survives the failed read: the namespace was
+			// never queried, so it is uninspected, not empty (#339).
+			b.WriteString("One of the group's namespaces was never queried: no subject pod resolved there, so it was never queried - uninspected, not empty.\n")
+			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
+		}
 	case "refused":
 		// The only way into this state is a namespace refused as not one
 		// path segment, so naming the cause is true here. The wording must
@@ -690,6 +729,12 @@ func renderEvidence(r Report) string {
 			// queried scope's reply was not a set of log lines, so that
 			// scope's logs are unknown rather than empty (#349).
 			b.WriteString("At least one queried scope's reply carried no log records in the window, so that scope's logs are unknown rather than empty.\n")
+		}
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// The lines above do not cover every queried scope either: one
+			// namespace's reply could not be read, so that namespace's logs
+			// are unknown rather than empty (#348).
+			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
 		}
 	}
 	// Event messages are written by whatever controller or workload emitted them,
@@ -937,6 +982,20 @@ func writeUnqueriedNamespaces(b *strings.Builder, unqueried []string) {
 	b.WriteString(untrustedEnd + "\n")
 }
 
+// writeFailedReadGap names the namespaces whose backend query was sent but
+// whose reply could not be read, so an unreadable scope is never read as an
+// empty one, and the lines the other namespaces returned are not read as a
+// complete answer (#348). The names are alert-supplied, so they render
+// inside the untrusted fence, exactly as writeUnqueriedNamespaces does.
+func writeFailedReadGap(b *strings.Builder, failed []string) {
+	b.WriteString("Namespace(s) whose backend reply could not be read, as the alert named them (untrusted):\n")
+	b.WriteString(untrustedBegin + "\n")
+	for _, ns := range failed {
+		b.WriteString(untrusted(stripSecrets(ns)) + "\n")
+	}
+	b.WriteString(untrustedEnd + "\n")
+}
+
 // writePodLogBlock renders a pod-log map inside the untrusted fence. The
 // provenance lookup names the container and stream per entry, so a one-shot
 // Job's current log is not silently mislabelled as a previous-container tail
@@ -1124,7 +1183,11 @@ func discordDescription(cfg *Config, r Report) string {
 		// completeness unknown (#349), so the claim narrows to what the read
 		// returned.
 		coverage := "the only backend logs in the window"
-		if r.Enrichment.BackendNoRecords {
+		if r.Enrichment.BackendNoRecords || len(r.Enrichment.BackendFailedReads) > 0 {
+			// A scope whose reply carried no log record (#349) or whose
+			// reply could not be read (#348) leaves the window's
+			// completeness unknown, so the claim narrows to what the read
+			// returned.
 			coverage = "the backend logs the read returned"
 		}
 		desc.WriteString("\n**Backend log source:** configured; no concrete subject was resolved, so the namespace-wide lines are " + coverage + " and are shown as ambient context, not evidence of the failing resource.")
@@ -1133,6 +1196,12 @@ func discordDescription(cfg *Config, r Report) string {
 			// namespace's reply was not a set of log lines, so that
 			// namespace's logs are unknown rather than empty (#349).
 			desc.WriteString(" At least one queried namespace's reply carried no log records in the window, so that namespace's logs are unknown rather than empty.")
+		}
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// The ambient lines do not cover the whole window either: one
+			// namespace's query was sent but its reply could not be read,
+			// so that namespace's logs are unknown (#348).
+			desc.WriteString(" The backend reply for namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendFailedReads, ", "))) + " could not be read, so those namespaces' logs are unknown rather than empty.")
 		}
 	case "norecords":
 		// The backend answered with something that was not a set of log
@@ -1152,8 +1221,29 @@ func discordDescription(cfg *Config, r Report) string {
 			// alert-supplied and must not be able to forge a section line.
 			desc.WriteString(" One of the group's namespaces was never queried: namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendUnqueried, ", "))) + " - uninspected, not empty.")
 		}
-	case "error":
-		desc.WriteString("\n**Backend log source:** query failed; no lines were available.")
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// A failed read is the same kind of gap and must not be lost to
+			// the no-record gap it sits beside (#348).
+			desc.WriteString(" The backend reply for namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendFailedReads, ", "))) + " could not be read, so those namespaces' logs are unknown rather than empty.")
+		}
+	case "unreadable":
+		// The queries were sent, but no readable reply came back for the
+		// named namespaces: the gap is stated, not turned into a "no lines"
+		// negative, and the other namespaces' lines are not discarded into a
+		// group-wide failure claim (#348). The names are alert-supplied and
+		// carry the same inert rendering the "partial" case applies.
+		desc.WriteString("\n**Backend log source:** configured, but the backend reply for namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendFailedReads, ", "))) + " could not be read - the query was sent, but no readable reply came back, so those namespaces' logs are unknown rather than empty.")
+		if r.Enrichment.BackendRefused {
+			// The refused scope was never queried, so it is uninspected,
+			// not empty — and that naming must not be lost to the
+			// failed-read gap it sits beside (#331).
+			desc.WriteString(" A namespace the alert named was refused as not one path segment, so its logs were never queried - uninspected, not empty.")
+		}
+		if len(r.Enrichment.BackendUnqueried) > 0 {
+			// The scope gap survives the failed read: the namespace was
+			// never queried, so it is uninspected, not empty (#339).
+			desc.WriteString(" One of the group's namespaces was never queried: namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendUnqueried, ", "))) + " - uninspected, not empty.")
+		}
 	case "refused":
 		desc.WriteString("\n**Backend log source:** configured, but a namespace was refused as not one path segment, so its logs were not queried and no backend lines were returned in the window.")
 	case "partial":
@@ -1187,6 +1277,12 @@ func discordDescription(cfg *Config, r Report) string {
 			// line ends the bullet list, so the sentence reads as its own
 			// paragraph and not as a continuation of the last bullet.
 			desc.WriteString("\nAt least one queried scope's reply carried no log records in the window, so that scope's logs are unknown rather than empty.")
+		}
+		if len(r.Enrichment.BackendFailedReads) > 0 {
+			// The lines above do not cover every queried scope either: one
+			// namespace's reply could not be read, so that namespace's logs
+			// are unknown rather than empty (#348). Same paragraph break.
+			desc.WriteString("\nThe backend reply for namespace(s) " + untrusted(stripSecrets(strings.Join(r.Enrichment.BackendFailedReads, ", "))) + " could not be read, so those namespaces' logs are unknown rather than empty.")
 		}
 	}
 	writeDiscordSection(&desc, "Recent events", r.Enrichment.Events)

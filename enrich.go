@@ -537,16 +537,19 @@ type Enrichment struct {
 	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
 	// "off", "ok", "empty", "ambient", "refused", "partial", "norecords",
-	// "unavailable", or "error" so missing configuration is not confused
+	// "unreadable", or "unavailable" so missing configuration is not confused
 	// with a successful query that returned no lines. "empty" means the
 	// queries issued returned no lines; "ambient" means no concrete subject
 	// could be resolved, the namespace-wide fallback did return lines, and
 	// those lines were routed to Ambient — the source is configured and
 	// answered; "norecords" means the backend answered, but the reply
 	// carried no log record at all, so the scope is unknown rather than
-	// empty. Two facts travel beside the state, because neither is a state
-	// of its own: BackendRefused (a namespace that was never queried) and
-	// BackendNoRecords (a scope whose reply was not a set of log lines).
+	// empty; "unreadable" means the queries were sent but the replies could
+	// not be read, which is the same unknown rather than empty (#348).
+	// Facts travel beside the state, because none is a state of its own on
+	// every path: BackendRefused (a namespace that was never queried),
+	// BackendNoRecords (a scope whose reply was not a set of log lines), and
+	// BackendFailedReads (namespaces whose reply could not be read).
 	BackendLogs  []string
 	BackendState string
 	// BackendScoped records whether the backend-log query was bounded to a
@@ -576,6 +579,14 @@ type Enrichment struct {
 	// rendered line must not hide a scope whose reply was not a set of log
 	// lines, and the read says nothing about the window for that scope.
 	BackendNoRecords bool
+	// BackendFailedReads lists the namespaces whose backend query was sent
+	// but whose reply could not be read, so those namespaces' logs are
+	// unknown rather than empty (#348). It holds even when other scopes
+	// returned lines: the rendered lines must not read as a complete answer
+	// while a namespace's read failed, and the read says nothing about the
+	// window for that namespace. Alert-supplied: render like
+	// BackendUnqueried.
+	BackendFailedReads []string
 	// Events contains warning events attached to the resolved alert subject graph.
 	// Namespace warnings not attached to those subjects remain Ambient context.
 	Events       []string
@@ -1322,76 +1333,86 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 	}
 	if k.logs != nil {
-		var res backendLogResult
-		var err error
+		// One unreadable namespace must not discard the lines the other
+		// namespaces returned (#348): every per-scope failure travels in
+		// the result as a stated gap, and the group read itself does not
+		// fail.
 		// The query is subject-scoped exactly when a resolved subject existed;
 		// otherwise fetchBackendLogsResult falls back to the namespace.
 		e.BackendScoped = len(targetPods) > 0
-		res, err = k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
-		if err != nil {
-			e.BackendState = "error"
-			logf("enrich: backend logs: %v", err)
-		} else {
-			e.BackendLogs = res.Primary
-			// Namespace-wide lines (present only when no concrete subject was
-			// resolved) are ambient context for ruling things out, never evidence
-			// about the failing resource, so they go to Ambient, not BackendLogs.
-			e.Ambient = append(e.Ambient, res.Ambient...)
-			// Two facts about the read travel beside the state, because
-			// neither is a state of its own. A refused namespace was never
-			// queried, and a scope whose reply carried no log record is
-			// unknown rather than empty.
-			e.BackendRefused = res.SkippedRefused
-			e.BackendNoRecords = res.NoRecords
-			switch {
-			case len(res.Primary) > 0:
-				// The unqueried and refused gap markers are deliberately
-				// consumed only when no lines came back: with primary
-				// evidence rendered, silence about a skipped scope cannot
-				// read as an empty negative, and #331 set exactly this
-				// precedence for a refused sibling (#339 follows it).
-				// The no-record fact is not a scope gap — the scope was
-				// queried and answered with something that was not log
-				// lines — so it stays visible here (#349).
-				e.BackendState = "ok"
-			case len(res.Ambient) > 0:
-				// The backend did return lines — it is the no-subject
-				// fallback. Rendering this as "empty" would put a false
-				// negative in the prompt next to the very lines we just
-				// routed to BACKGROUND.
-				e.BackendState = "ambient"
-			case res.NoRecords:
-				// The backend answered, but the reply carried no log record
-				// at all, so nothing is known about the window: the scope is
-				// unknown, not empty. This sits above the scope gaps on
-				// purpose — the refused and partial wordings assert that the
-				// queries that ran returned no lines, which a reply carrying
-				// no record does not support (#349).
-				// The scope gaps survive the no-record reply: a namespace
-				// that was never queried is uninspected, not empty (#339),
-				// and a namespace that was refused was never queried at
-				// all (#331), so it keeps its naming beside this one rather
-				// than being folded into it.
-				e.BackendUnqueried = res.SkippedUnresolved
-				e.BackendState = "norecords"
-			case res.SkippedRefused:
-				// A refused namespace sent no request, so "empty" would turn
-				// a scope that was never queried into a "the backend has no
-				// lines for it" negative. The gap gets its own state, exactly
-				// as the pod scan does (issue #311 review, #331).
-				e.BackendState = "refused"
-			case len(res.SkippedUnresolved) > 0:
-				// A namespace with no resolved subject sent no request under
-				// the pod-scoped query either, so "empty" would be the same
-				// false negative with a different cause (issue #339). When a
-				// group has both gaps the refused state wins: it is the rarer
-				// and more alarming cause, and its wording states a gap that
-				// is always true here.
-				e.BackendUnqueried = res.SkippedUnresolved
-				e.BackendState = "partial"
-			default:
-				e.BackendState = "empty"
-			}
+		res := k.logs.fetchBackendLogsResult(ctx, g, window, targetPods)
+		e.BackendLogs = res.Primary
+		// Namespace-wide lines (present only when no concrete subject was
+		// resolved) are ambient context for ruling things out, never evidence
+		// about the failing resource, so they go to Ambient, not BackendLogs.
+		e.Ambient = append(e.Ambient, res.Ambient...)
+		// Facts about the read travel beside the state, because none is a
+		// state of its own on every path: a refused namespace was never
+		// queried, a scope whose reply carried no log record is unknown
+		// rather than empty, and a namespace whose reply could not be read
+		// is unknown too.
+		e.BackendRefused = res.SkippedRefused
+		e.BackendNoRecords = res.NoRecords
+		e.BackendFailedReads = res.FailedReads
+		switch {
+		case len(res.Primary) > 0:
+			// The unqueried and refused gap markers are deliberately
+			// consumed only when no lines came back: with primary
+			// evidence rendered, silence about a skipped scope cannot
+			// read as an empty negative, and #331 set exactly this
+			// precedence for a refused sibling (#339 follows it).
+			// The no-record and failed-read facts are not scope gaps in
+			// this shape — the scope was queried — so they stay visible
+			// beside the lines (#349, #348).
+			e.BackendState = "ok"
+		case len(res.Ambient) > 0:
+			// The backend did return lines — it is the no-subject
+			// fallback. Rendering this as "empty" would put a false
+			// negative in the prompt next to the very lines we just
+			// routed to BACKGROUND.
+			e.BackendState = "ambient"
+		case res.NoRecords:
+			// The backend answered, but the reply carried no log record
+			// at all, so nothing is known about the window: the scope is
+			// unknown, not empty. This sits above the scope gaps on
+			// purpose — the refused and partial wordings assert that the
+			// queries that ran returned no lines, which a reply carrying
+			// no record does not support (#349).
+			// The scope gaps survive the no-record reply: a namespace
+			// that was never queried is uninspected, not empty (#339),
+			// and a namespace that was refused was never queried at
+			// all (#331), so it keeps its naming beside this one rather
+			// than being folded into it.
+			e.BackendUnqueried = res.SkippedUnresolved
+			e.BackendState = "norecords"
+		case len(res.FailedReads) > 0:
+			// The queries were sent, but the replies could not be read, so
+			// nothing is known about the window for those namespaces:
+			// unknown, not empty (#348). This sits above the scope gaps for
+			// the same reason norecords does — the refused and partial
+			// wordings assert the queries that ran returned no lines,
+			// which a read that could not be completed does not support.
+			// The scope gaps survive beside it, exactly as they do beside
+			// the no-record reply (#331, #339).
+			e.BackendUnqueried = res.SkippedUnresolved
+			e.BackendState = "unreadable"
+		case res.SkippedRefused:
+			// A refused namespace sent no request, so "empty" would turn
+			// a scope that was never queried into a "the backend has no
+			// lines for it" negative. The gap gets its own state, exactly
+			// as the pod scan does (issue #311 review, #331).
+			e.BackendState = "refused"
+		case len(res.SkippedUnresolved) > 0:
+			// A namespace with no resolved subject sent no request under
+			// the pod-scoped query either, so "empty" would be the same
+			// false negative with a different cause (issue #339). When a
+			// group has both gaps the refused state wins: it is the rarer
+			// and more alarming cause, and its wording states a gap that
+			// is always true here.
+			e.BackendUnqueried = res.SkippedUnresolved
+			e.BackendState = "partial"
+		default:
+			e.BackendState = "empty"
 		}
 	} else {
 		e.BackendState = "off"

@@ -576,10 +576,7 @@ func TestFetchBackendLogsEmptyReplyIsEmptyScope(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("an empty reply must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
 		t.Fatalf("expected no lines from an empty reply, got %#v", res)
 	}
@@ -610,10 +607,7 @@ func TestFetchBackendLogsDegradedReplyKeepsRecords(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("a degraded reply must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 2 {
 		t.Fatalf("expected the 2 valid records as primary evidence, got %#v", res.Primary)
 	}
@@ -646,10 +640,7 @@ func TestFetchBackendLogsNoRecordReplyIsStatedGap(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("a reply carrying no log record must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
 		t.Fatalf("expected no lines from a reply carrying no log record, got %#v", res)
 	}
@@ -690,15 +681,87 @@ func TestFetchBackendLogsNoRecordReplyKeepsOtherScope(t *testing.T) {
 			{Labels: map[string]string{"pod": "p2", "namespace": "ns-b", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("a no-record reply must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "second scope line") {
 		t.Fatalf("expected the other scope's record as primary evidence, got %#v", res.Primary)
 	}
 	if !res.NoRecords {
 		t.Fatalf("the no-record reply must be reported as such")
+	}
+}
+
+// TestFetchBackendLogsFailedReadKeepsOtherScope pins the fetch-level half of
+// #348: one namespace whose reply cannot be read must not discard the lines
+// already collected for the other namespaces of the group. The read
+// continues, the answering scope's lines survive as primary evidence, and the
+// failed namespace is named in the result so the digest can state the gap
+// instead of reporting the whole group's query as failed.
+func TestFetchBackendLogsFailedReadKeepsOtherScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if strings.Contains(r.URL.Query().Get("query"), `"ns-a"`) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "{\"_msg\":\"first scope line\"}\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-a", "ns-b"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+			{Labels: map[string]string{"pod": "p2", "namespace": "ns-b", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "first scope line") {
+		t.Fatalf("the readable scope's lines must survive the sibling's failed read, got %#v", res.Primary)
+	}
+	if len(res.FailedReads) != 1 || res.FailedReads[0] != "ns-a" {
+		t.Fatalf("the unreadable namespace must be named in the result, got %v", res.FailedReads)
+	}
+	if res.NoRecords || res.SkippedRefused {
+		t.Fatalf("a failed read is neither a no-record reply nor a refused scope, got %#v", res)
+	}
+}
+
+// TestFetchBackendLogsAllReadsFailStatesGap pins that a group whose every
+// scope's reply is unreadable ends with the failed namespaces named and no
+// lines, not with a failed read that erases which scopes were affected
+// (#348).
+func TestFetchBackendLogsAllReadsFailStatesGap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &logsBackend{
+		url:    srv.URL,
+		flavor: "victorialogs",
+		limit:  50,
+		hc:     srv.Client(),
+	}
+	g := Group{
+		Namespaces: []string{"ns-b", "ns-a"},
+		Alerts: []Alert{
+			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
+			{Labels: map[string]string{"pod": "p2", "namespace": "ns-b", "alertname": "KubePodNotReady"}},
+		},
+	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
+	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
+		t.Fatalf("expected no lines from unreadable replies, got %#v", res)
+	}
+	if len(res.FailedReads) != 2 || res.FailedReads[0] != "ns-a" || res.FailedReads[1] != "ns-b" {
+		t.Fatalf("both failed namespaces must be named, sorted, got %v", res.FailedReads)
 	}
 }
 
@@ -723,10 +786,7 @@ func TestFetchBackendLogsRecordReplyUnaffected(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("a reply carrying records must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "real line") {
 		t.Fatalf("expected the record as primary evidence, got %#v", res.Primary)
 	}
@@ -759,10 +819,7 @@ func TestFetchBackendLogsNullMessageIsEmptyScope(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "KubePodNotReady"}},
 		},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("a null message must not fail the group read: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if len(res.Primary) != 0 || len(res.Ambient) != 0 {
 		t.Fatalf("expected no lines from a null message, got %#v", res)
 	}
@@ -958,6 +1015,146 @@ func TestNoRecordGapIsStatedPerScope(t *testing.T) {
 	}
 }
 
+// TestFailedReadBackendStateRendersAsGap pins the render-level half of
+// #348: a namespace whose reply could not be read must read as a stated gap
+// that names the namespace, never as the group-wide "query failed" claim or
+// as an empty scope. When lines came back from the other scopes, they still
+// render and the gap stays beside them.
+func TestFailedReadBackendStateRendersAsGap(t *testing.T) {
+	g := Group{
+		Key:        "sig-failedread",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{BackendState: "unreadable", BackendScoped: true, BackendFailedReads: []string{"ns1"}}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "could not be read") {
+		t.Errorf("model prompt must state that the reply could not be read:\n%s", model)
+	}
+	if !strings.Contains(model, "ns1") {
+		t.Errorf("model prompt must name the namespace whose reply failed:\n%s", model)
+	}
+	if strings.Contains(model, "returned no lines") || strings.Contains(model, "query failed") {
+		t.Errorf("model prompt must not claim the group had no logs:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "could not be read") {
+		t.Errorf("discord must state that the reply could not be read:\n%s", discord)
+	}
+	if !strings.Contains(discord, "ns1") {
+		t.Errorf("discord must name the namespace whose reply failed:\n%s", discord)
+	}
+	if strings.Contains(discord, "returned no lines") || strings.Contains(discord, "query failed") {
+		t.Errorf("discord must not claim the group had no logs:\n%s", discord)
+	}
+
+	// Lines the other scopes returned still render, with the gap beside them.
+	ok := Enrichment{
+		BackendState:       "ok",
+		BackendLogs:        []string{"subject backend log line"},
+		BackendFailedReads: []string{"ns2"},
+	}
+	model = renderEvidence(Report{Group: g, Enrichment: ok})
+	if !strings.Contains(model, "subject backend log line") {
+		t.Errorf("model prompt must still render the backend log line:\n%s", model)
+	}
+	if !strings.Contains(model, "could not be read") {
+		t.Errorf("model prompt must state that the other namespace's logs are unknown:\n%s", model)
+	}
+
+	discord = discordDescription(&Config{}, Report{Group: g, Enrichment: ok})
+	if !strings.Contains(discord, "subject backend log line") {
+		t.Errorf("discord must still render the backend log line:\n%s", discord)
+	}
+	if !strings.Contains(discord, "could not be read") {
+		t.Errorf("discord must state that the other namespace's logs are unknown:\n%s", discord)
+	}
+}
+
+// TestAmbientStateDoesNotClaimWindowCoverageBesideFailedRead pins that the
+// ambient rendering does not claim the window's completeness when a
+// namespace's reply could not be read: the lines under CONTEXT are what the
+// read returned, not what the window held (#348). Without the failed read the
+// claim stays as it was.
+func TestAmbientStateDoesNotClaimWindowCoverageBesideFailedRead(t *testing.T) {
+	g := Group{
+		Key:        "sig-ambient-failedread",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubeJobFailed", "namespace": "ns1"}}},
+	}
+	en := Enrichment{
+		BackendState:       "ambient",
+		Ambient:            []string{"(ambient, namespace-wide) namespace chatter line"},
+		BackendFailedReads: []string{"ns2"},
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "backend logs in the window") {
+		t.Errorf("model prompt must not claim the lines cover the window:\n%s", model)
+	}
+	if !strings.Contains(model, "backend logs the read returned") {
+		t.Errorf("model prompt must narrow the claim to what the read returned:\n%s", model)
+	}
+	if !strings.Contains(model, "could not be read") {
+		t.Errorf("model prompt must state that the other namespace's logs are unknown:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "backend logs in the window") {
+		t.Errorf("discord must not claim the lines cover the window:\n%s", discord)
+	}
+	if !strings.Contains(discord, "backend logs the read returned") {
+		t.Errorf("discord must narrow the claim to what the read returned:\n%s", discord)
+	}
+	if !strings.Contains(discord, "could not be read") {
+		t.Errorf("discord must state that the other namespace's logs are unknown:\n%s", discord)
+	}
+
+	// Without the failed read the window claim stands as it always did.
+	plain := Enrichment{
+		BackendState: "ambient",
+		Ambient:      []string{"(ambient, namespace-wide) namespace chatter line"},
+	}
+	if got := renderEvidence(Report{Group: g, Enrichment: plain}); !strings.Contains(got, "backend logs in the window") {
+		t.Errorf("an ambient read with no scope gap must keep the window claim:\n%s", got)
+	}
+}
+
+// TestNoRecordGapKeepsFailedReadNaming pins that the failed-read gap does not
+// swallow the no-record gap beside it, and the other way round: one scope's
+// reply carried no log record (#349) and another's could not be read (#348),
+// and both facts must reach the digest.
+func TestNoRecordGapKeepsFailedReadNaming(t *testing.T) {
+	g := Group{
+		Key:        "sig-norecords-failedread",
+		Namespaces: []string{"ns1"},
+		Alerts:     []Alert{{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns1"}}},
+	}
+	en := Enrichment{
+		BackendState:       "norecords",
+		BackendScoped:      true,
+		BackendFailedReads: []string{"ns2"},
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if !strings.Contains(model, "carried no log records") {
+		t.Errorf("model prompt must state the no-record gap:\n%s", model)
+	}
+	if !strings.Contains(model, "could not be read") {
+		t.Errorf("model prompt must state the failed-read gap beside it:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if !strings.Contains(discord, "carried no log records") {
+		t.Errorf("discord must state the no-record gap:\n%s", discord)
+	}
+	if !strings.Contains(discord, "could not be read") {
+		t.Errorf("discord must state the failed-read gap beside it:\n%s", discord)
+	}
+}
+
 // TestBuildQuery asserts the exact query string per flavor: VictoriaLogs
 // takes LogsQL `field:"value"` filters joined by AND, Loki takes a LogQL
 // stream selector — the two backends do not share a query language.
@@ -1051,9 +1248,7 @@ func TestFetchBackendLogsDedup(t *testing.T) {
 			{Labels: map[string]string{"pod": "p1", "namespace": "ns-a", "alertname": "z"}},
 		},
 	}
-	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts)); err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("expected exactly 1 pod-scoped query after dedup, got %d", got)
 	}
@@ -1090,10 +1285,7 @@ func TestFetchBackendLogsTargetPodsIsPrimary(t *testing.T) {
 		Alerts:     []Alert{{Labels: map[string]string{"alertname": "KubeJobFailed"}}},
 	}
 	targetPods := map[string]bool{"ns-a/p1": true}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPods)
-	if err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPods)
 	if len(res.Primary) == 0 || !strings.Contains(res.Primary[0], "target pod failure line") {
 		t.Fatalf("expected the target pod's line as primary evidence, got %#v", res.Primary)
 	}
@@ -1142,9 +1334,7 @@ func TestFetchBackendLogsTargetDedup(t *testing.T) {
 			{Labels: map[string]string{"pod": "p2", "namespace": "ns-a", "alertname": "z"}},
 		},
 	}
-	if _, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts)); err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if got := atomic.LoadInt32(&hits); got != 2 {
 		t.Fatalf("expected exactly 2 pod-scoped queries (one per distinct pod), got %d", got)
 	}
@@ -1213,10 +1403,7 @@ func TestFetchBackendLogsRefusedNamespaceSendsNoQuery(t *testing.T) {
 				Namespaces: tc.namespaces,
 				Alerts:     []Alert{{Labels: map[string]string{"alertname": "SomeAlert"}}},
 			}
-			res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
-			if err != nil {
-				t.Fatalf("fetchBackendLogsResult: %v", err)
-			}
+			res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
 			if len(queries) != len(tc.wantQueries) {
 				t.Fatalf("queries = %v, want %v", queries, tc.wantQueries)
 			}
@@ -1297,10 +1484,7 @@ func TestFetchBackendLogsUnresolvedNamespaceSurfaced(t *testing.T) {
 					{Status: "firing", Labels: map[string]string{"alertname": "KubePodNotReady", "namespace": "ns-b"}},
 				},
 			}
-			res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
-			if err != nil {
-				t.Fatalf("fetchBackendLogsResult: %v", err)
-			}
+			res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, tc.targetPods)
 			if len(queries) != len(tc.wantQueries) {
 				t.Fatalf("queries = %v, want %v", queries, tc.wantQueries)
 			}
@@ -1351,10 +1535,7 @@ func TestFetchBackendLogsNoSubjectIsAmbient(t *testing.T) {
 		Namespaces: []string{"ns-a"},
 		Alerts:     []Alert{{Labels: map[string]string{"alertname": "SomeAlert"}}},
 	}
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
-	if err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
 	if len(res.Primary) != 0 {
 		t.Fatalf("expected no primary evidence without a subject, got %#v", res.Primary)
 	}
@@ -1394,10 +1575,7 @@ func TestFetchBackendLogsLokiSelectors(t *testing.T) {
 
 	// Resolved subject: the pod-scoped selector must be what hits the wire
 	// and its line must be primary evidence.
-	res, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{"ns-a/p1": true})
-	if err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{"ns-a/p1": true})
 	if len(res.Primary) != 1 || !strings.Contains(res.Primary[0], "resolved pod line") {
 		t.Fatalf("expected the resolved pod's line as primary, got %#v", res.Primary)
 	}
@@ -1407,10 +1585,7 @@ func TestFetchBackendLogsLokiSelectors(t *testing.T) {
 
 	// No subject: only the namespace-only selector may be issued and its
 	// line must be ambient.
-	res, err = b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
-	if err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	res = b.fetchBackendLogsResult(context.Background(), g, time.Minute, map[string]bool{})
 	if len(res.Primary) != 0 {
 		t.Fatalf("no primary expected without a subject, got %#v", res.Primary)
 	}
@@ -1477,10 +1652,7 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 		hc:     srv.Client(),
 	}
 	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "x"}}}}
-	lines, err := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
-	if err != nil {
-		t.Fatalf("fetchBackendLogsResult: %v", err)
-	}
+	lines := b.fetchBackendLogsResult(context.Background(), g, time.Minute, targetPodsFromAlerts(g.Alerts))
 	if lines.Primary != nil {
 		t.Fatalf("expected nil primary for empty namespace, got %v", lines.Primary)
 	}
@@ -1495,10 +1667,7 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 // TestFetchBackendLogsNilReceiver ensures the nil-receiver guard works.
 func TestFetchBackendLogsNilReceiver(t *testing.T) {
 	var b *logsBackend
-	res, err := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute, nil)
-	if err != nil {
-		t.Fatalf("nil receiver should be a no-op, got err=%v", err)
-	}
+	res := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute, nil)
 	if res.Primary != nil || res.Ambient != nil {
 		t.Fatalf("nil receiver should return empty results, got %#v", res)
 	}
