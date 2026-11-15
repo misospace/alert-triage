@@ -252,6 +252,17 @@ func (b *buffer) take(now time.Time, flushDelay, maxWindow time.Duration) []Aler
 	return out
 }
 
+// takeAll returns every buffered alert regardless of the flush window,
+// clearing the buffer. It is take's unconditional counterpart, for the
+// SIGTERM drain: shutdown must flush batches the window would still hold.
+func (b *buffer) takeAll() []Alert {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.alerts
+	b.alerts, b.seen = nil, nil
+	return out
+}
+
 func main() {
 	cfg := loadConfig()
 	log.Printf("alert-triage %s listening on %s (model=%s flush=%s)", version, cfg.ListenAddr, cfg.Model, cfg.FlushDelay)
@@ -506,15 +517,10 @@ func runCompactLoop(ctx context.Context, hist *History) {
 // buffer is empty on return without driving the full signal goroutine.
 func drainBuffer(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *History, seen *recent, prom *Prometheus) (drained int) {
 	for {
-		buf.mu.Lock()
-		if len(buf.alerts) == 0 {
-			buf.mu.Unlock()
+		alerts := buf.takeAll()
+		if len(alerts) == 0 {
 			return drained
 		}
-		alerts := buf.alerts
-		buf.alerts = nil
-		buf.seen = nil
-		buf.mu.Unlock()
 		process(ctx, cfg, alerts, k, hist, seen, prom)
 		drained += len(alerts)
 	}
