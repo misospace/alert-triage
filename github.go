@@ -158,19 +158,10 @@ func shouldComment(existing *ghIssue, r Report, interval time.Duration) bool {
 	// Severity change always warrants a note. Only judge a change when the
 	// issue actually carries labels: labelsFor stamps one severity label on
 	// creation, so a missing current-severity label means the severity moved.
-	if want := severityLabel(r.Group.Severity()); want != "" && len(existing.Labels) > 0 {
-		changed := true
-		for _, l := range existing.Labels {
-			if l.Name == want {
-				// The issue already carries the current severity: no change,
-				// so fall through to the interval gate below.
-				changed = false
-				break
-			}
-		}
-		if changed {
-			return true
-		}
+	// hasLabel is the same scan deliverGitHub runs before the label sync, so
+	// both sites judge the label set identically.
+	if want := severityLabel(r.Group.Severity()); want != "" && len(existing.Labels) > 0 && !hasLabel(existing.Labels, want) {
+		return true
 	}
 	// If we've never commented on this issue yet, the first re-fire is
 	// always worth a note — the initial body captured the first firing, but
@@ -479,31 +470,25 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 	return issues, next, nil
 }
 
+// parseNextPage extracts the next page number from a GitHub Link header by
+// reading the URL parseLinkNext returns, so the issue and PR pagination
+// scans and the commit-file scan read the same header the same way.
 func parseNextPage(link string) int {
-	for _, part := range strings.Split(link, ",") {
-		if !strings.Contains(part, `rel="next"`) {
-			continue
-		}
-		href := part
-		if i := strings.Index(href, "<"); i >= 0 {
-			href = href[i+1:]
-		}
-		if j := strings.Index(href, ">"); j >= 0 {
-			href = href[:j]
-		}
-		u, err := url.Parse(href)
-		if err != nil {
-			return 0
-		}
-		page := u.Query().Get("page")
-		if page == "" {
-			return 0
-		}
-		var n int
-		fmt.Sscanf(page, "%d", &n)
-		return n
+	href := parseLinkNext(link)
+	if href == "" {
+		return 0
 	}
-	return 0
+	u, err := url.Parse(href)
+	if err != nil {
+		return 0
+	}
+	page := u.Query().Get("page")
+	if page == "" {
+		return 0
+	}
+	var n int
+	fmt.Sscanf(page, "%d", &n)
+	return n
 }
 
 func (g *gitHubClient) createIssue(ctx context.Context, title, body string, labels []string) (int, string, error) {
