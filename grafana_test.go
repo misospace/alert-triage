@@ -57,6 +57,183 @@ func TestGroupWindowActiveAlertFallsBackToStartsAt(t *testing.T) {
 	}
 }
 
+// TestGroupWindowMalformedAlertNeverInverted covers the window the Explore
+// links are built from. Alertmanager never sends an alert whose EndsAt
+// precedes its StartsAt, but a malformed webhook payload can, and the
+// inverted pair used to reach the operator as a link with an empty range
+// (#364). Alerts whose timestamps do not line up must not invert the pair
+// either, and the window must keep covering the alerts it covers today.
+func TestGroupWindowMalformedAlertNeverInverted(t *testing.T) {
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name   string
+		alerts []Alert
+		want   [2]time.Time
+	}{
+		{"malformed alert alone", []Alert{
+			{StartsAt: base.Add(time.Hour), EndsAt: base},
+		}, [2]time.Time{base.Add(time.Hour), base.Add(time.Hour)}},
+		{"malformed alert beside a resolved one", []Alert{
+			{StartsAt: base.Add(time.Hour), EndsAt: base},
+			{StartsAt: base, EndsAt: base.Add(10 * time.Minute)},
+		}, [2]time.Time{base, base.Add(time.Hour)}},
+		{"malformed alert beside an active one", []Alert{
+			{StartsAt: base.Add(time.Hour), EndsAt: base},
+			{StartsAt: base.Add(2 * time.Hour)},
+		}, [2]time.Time{base.Add(time.Hour), base.Add(time.Hour)}},
+		{"resolved alert ended before a later alert started", []Alert{
+			{EndsAt: base},
+			{StartsAt: base.Add(time.Hour)},
+		}, [2]time.Time{base, base.Add(time.Hour)}},
+		{"malformed alert beside one without a start", []Alert{
+			{StartsAt: base.Add(time.Hour), EndsAt: base.Add(-time.Hour)},
+			{EndsAt: base},
+		}, [2]time.Time{base.Add(time.Hour), base.Add(time.Hour)}},
+		{"malformed alert beside one that ended earlier", []Alert{
+			{StartsAt: base.Add(time.Hour), EndsAt: base},
+			{StartsAt: base.Add(-2 * time.Hour), EndsAt: base.Add(-time.Hour)},
+		}, [2]time.Time{base.Add(-2 * time.Hour), base.Add(time.Hour)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := groupWindow(Group{Alerts: tc.alerts})
+			if !w[0].Equal(tc.want[0]) || !w[1].Equal(tc.want[1]) {
+				t.Fatalf("window = [%s, %s], want [%s, %s]", w[0], w[1], tc.want[0], tc.want[1])
+			}
+			if w[1].Before(w[0]) {
+				t.Fatalf("window from %s is after to %s", w[0], w[1])
+			}
+			// every alert that carries both timestamps must stay inside the
+			// window
+			for _, a := range tc.alerts {
+				start, end := alertWindow(a)
+				if start.IsZero() || end.IsZero() {
+					continue
+				}
+				if w[0].After(start) || w[1].Before(end) {
+					t.Fatalf("window [%s, %s] does not cover the alert [%s, %s]", w[0], w[1], start, end)
+				}
+			}
+		})
+	}
+}
+
+// TestGroupWindowNeverInvertedForAnyTimestamps walks every combination of
+// alert timestamps over a group of two alerts and over a group of three.
+// The window must not come back inverted for any of them, and the order of
+// the alerts must not change it.
+func TestGroupWindowNeverInvertedForAnyTimestamps(t *testing.T) {
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	stamps := []time.Time{{}, base, base.Add(time.Hour)}
+	var alerts []Alert
+	for _, s := range stamps {
+		for _, e := range stamps {
+			alerts = append(alerts, Alert{StartsAt: s, EndsAt: e})
+		}
+	}
+	for i := range alerts {
+		for j := range alerts {
+			w := groupWindow(Group{Alerts: []Alert{alerts[i], alerts[j]}})
+			if w[1].Before(w[0]) {
+				t.Fatalf("window inverted for %+v and %+v: [%s, %s]", alerts[i], alerts[j], w[0], w[1])
+			}
+			reversed := groupWindow(Group{Alerts: []Alert{alerts[j], alerts[i]}})
+			if !reversed[0].Equal(w[0]) || !reversed[1].Equal(w[1]) {
+				t.Fatalf("window changed with the alert order: [%s, %s] and [%s, %s]", w[0], w[1], reversed[0], reversed[1])
+			}
+		}
+	}
+	for i := range alerts {
+		for j := range alerts {
+			for k := range alerts {
+				group := []Alert{alerts[i], alerts[j], alerts[k]}
+				w := groupWindow(Group{Alerts: group})
+				if w[1].Before(w[0]) {
+					t.Fatalf("window inverted for %+v: [%s, %s]", group, w[0], w[1])
+				}
+			}
+		}
+	}
+}
+
+// TestGroupWindowMalformedAlertKeepsItsStart pins the clamp direction. The
+// alert's own start stays in the window, and the end moves up to meet it:
+// the alert began at that moment, so the window covers it.
+func TestGroupWindowMalformedAlertKeepsItsStart(t *testing.T) {
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	start := base.Add(time.Hour)
+	w := groupWindow(Group{Alerts: []Alert{{StartsAt: start, EndsAt: base}}})
+	if !w[0].Equal(start) {
+		t.Fatalf("expected from %s, got %s", start, w[0])
+	}
+	if !w[1].Equal(start) {
+		t.Fatalf("expected the end clamped up to %s, got %s", start, w[1])
+	}
+}
+
+// TestGroupWindowTimestampLessGroupStaysZeroPair keeps the zero pair alive.
+// A group whose alerts carry no timestamps must still return the zero pair,
+// and grafanaExplore suppresses it rather than linking the unix epoch.
+func TestGroupWindowTimestampLessGroupStaysZeroPair(t *testing.T) {
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "TestAlert"}},
+		{Labels: map[string]string{"alertname": "OtherAlert"}},
+	}}
+	w := groupWindow(g)
+	if !w[0].IsZero() || !w[1].IsZero() {
+		t.Fatalf("expected the zero pair, got [%s, %s]", w[0], w[1])
+	}
+}
+
+// TestGrafanaLinksRangeOrderedForMalformedAlert is the end-to-end check. The
+// link the operator clicks must carry a range that starts before it ends,
+// whether the alert behind it was malformed or not.
+func TestGrafanaLinksRangeOrderedForMalformedAlert(t *testing.T) {
+	cfg := &Config{
+		GrafanaURL:       "https://grafana.example.com",
+		GrafanaMetricsDS: "prom",
+		GrafanaLogsDS:    "loki",
+	}
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	alerts := []Alert{{
+		Labels:      map[string]string{"alertname": "ApiDown", "namespace": "prod"},
+		Annotations: map[string]string{"expr": `up{job="api"}`},
+		StartsAt:    base.Add(time.Hour),
+		EndsAt:      base,
+	}}
+	metrics, logs := grafanaLinks(cfg, firstExpression(alerts), firstNamespace(alerts), groupWindow(Group{Alerts: alerts}))
+	if metrics == "" || logs == "" {
+		t.Fatalf("expected both links, got metrics=%q logs=%q", metrics, logs)
+	}
+	for kind, link := range map[string]string{"metrics": metrics, "logs": logs} {
+		u, err := url.Parse(link)
+		if err != nil {
+			t.Fatalf("%s link is not a valid URL: %v\n%s", kind, err, link)
+		}
+		var doc struct {
+			Range struct {
+				From string `json:"from"`
+				To   string `json:"to"`
+			} `json:"range"`
+		}
+		left := u.Query().Get("left")
+		if err := json.Unmarshal([]byte(left), &doc); err != nil {
+			t.Fatalf("%s link left= envelope is not valid JSON: %v\n%s", kind, err, left)
+		}
+		from, err := time.Parse(time.RFC3339, doc.Range.From)
+		if err != nil {
+			t.Fatalf("%s link range.from is not RFC3339: %v\n%s", kind, err, doc.Range.From)
+		}
+		to, err := time.Parse(time.RFC3339, doc.Range.To)
+		if err != nil {
+			t.Fatalf("%s link range.to is not RFC3339: %v\n%s", kind, err, doc.Range.To)
+		}
+		if to.Before(from) {
+			t.Fatalf("%s link range starts %s after it ends %s", kind, from, to)
+		}
+	}
+}
+
 func TestGrafanaLinksOmittedWhenConfigMissing(t *testing.T) {
 	cfg := &Config{} // GRAFANA_URL unset
 	m, l := grafanaLinks(cfg, "up", "kube-system", [2]time.Time{time.Now(), time.Now()})

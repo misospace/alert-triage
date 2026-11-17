@@ -24,25 +24,48 @@ func envGrafanaURL(key string) string {
 	return raw
 }
 
+// alertWindow returns one alert's own [start, end] pair with the end
+// clamped up to the start. Alertmanager never sends an alert whose EndsAt
+// precedes its StartsAt, but a malformed webhook payload can, and the
+// inverted pair made the window's end precede its start (#364). Clamping
+// the end keeps the alert's start inside the window: the alert is then read
+// as still open at the moment it began, and the start is the field the rest
+// of the service trusts, because it carries the incident's beginning. A
+// zero timestamp is left alone. A zero EndsAt is the normal shape of an
+// active alert, and the group fallback already reads it that way.
+func alertWindow(a Alert) (start, end time.Time) {
+	start, end = a.StartsAt, a.EndsAt
+	if !start.IsZero() && !end.IsZero() && end.Before(start) {
+		end = start
+	}
+	return start, end
+}
+
 // groupWindow returns [from, to] covering every alert in the group. An
 // empty group returns the zero pair, which makes grafanaExplore emit "" -
 // so a malformed group never produces a half-open URL either. A zero
 // EndsAt is the normal shape of an active alert (it has not resolved), so
 // it falls back to the alert's StartsAt; the reverse holds for a zero
-// StartsAt. Only when no alert in the group carries any usable timestamp
+// StartsAt. A malformed alert is clamped to its own start (alertWindow).
+// The two bounds can still cross, because they come from alerts whose
+// timestamps do not line up - one that ended at t1 and one that started at
+// t5 without an end - so they are ordered before they are returned. The
+// window then covers both alerts rather than dropping the one that ended
+// first. Only when no alert in the group carries any usable timestamp
 // does the zero pair survive, and grafanaExplore suppresses it rather than
 // emitting a URL whose range is the unix epoch.
 func groupWindow(g Group) [2]time.Time {
 	if len(g.Alerts) == 0 {
 		return [2]time.Time{}
 	}
-	from, to := g.Alerts[0].StartsAt, g.Alerts[0].EndsAt
+	from, to := alertWindow(g.Alerts[0])
 	for _, a := range g.Alerts[1:] {
-		if !a.StartsAt.IsZero() && (from.IsZero() || a.StartsAt.Before(from)) {
-			from = a.StartsAt
+		start, end := alertWindow(a)
+		if !start.IsZero() && (from.IsZero() || start.Before(from)) {
+			from = start
 		}
-		if a.EndsAt.After(to) {
-			to = a.EndsAt
+		if end.After(to) {
+			to = end
 		}
 	}
 	if to.IsZero() {
@@ -50,6 +73,9 @@ func groupWindow(g Group) [2]time.Time {
 	}
 	if from.IsZero() {
 		from = to
+	}
+	if to.Before(from) {
+		from, to = to, from
 	}
 	return [2]time.Time{from, to}
 }
