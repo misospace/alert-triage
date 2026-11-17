@@ -1,11 +1,11 @@
 package main
 
 import (
-	"encoding/json"
-	"net/url"
-	"os"
-	"strings"
-	"time"
+    "encoding/json"
+    "net/url"
+    "os"
+    "strings"
+    "time"
 )
 
 // envGrafanaURL returns GRAFANA_URL only when it is an absolute http(s) URL.
@@ -13,15 +13,15 @@ import (
 // incident is worse than no link, and the same reasoning already governs
 // what_to_change never naming a path it was not shown.
 func envGrafanaURL(key string) string {
-	raw := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(os.Getenv(key)), "/"))
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return ""
-	}
-	return raw
+    raw := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(os.Getenv(key)), "/"))
+    if raw == "" {
+        return ""
+    }
+    u, err := url.Parse(raw)
+    if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+        return ""
+    }
+    return raw
 }
 
 // alertWindow returns one alert's own [start, end] pair with the end
@@ -34,50 +34,54 @@ func envGrafanaURL(key string) string {
 // zero timestamp is left alone. A zero EndsAt is the normal shape of an
 // active alert, and the group fallback already reads it that way.
 func alertWindow(a Alert) (start, end time.Time) {
-	start, end = a.StartsAt, a.EndsAt
-	if !start.IsZero() && !end.IsZero() && end.Before(start) {
-		end = start
-	}
-	return start, end
+    start, end = a.StartsAt, a.EndsAt
+    if !start.IsZero() && !end.IsZero() && end.Before(start) {
+        end = start
+    }
+    return start, end
 }
 
 // groupWindow returns [from, to] covering every alert in the group. An
 // empty group returns the zero pair, which makes grafanaExplore emit "" -
-// so a malformed group never produces a half-open URL either. A zero
-// EndsAt is the normal shape of an active alert (it has not resolved), so
-// it falls back to the alert's StartsAt; the reverse holds for a zero
-// StartsAt. A malformed alert is clamped to its own start (alertWindow).
-// The two bounds can still cross, because they come from alerts whose
-// timestamps do not line up - one that ended at t1 and one that started at
-// t5 without an end - so they are ordered before they are returned. The
-// window then covers both alerts rather than dropping the one that ended
-// first. Only when no alert in the group carries any usable timestamp
-// does the zero pair survive, and grafanaExplore suppresses it rather than
+// so a malformed group never produces a half-open URL either. The fallback
+// from a zero timestamp is per-alert, not group-wide: a zero EndsAt is the
+// normal shape of an active alert (it has not resolved), so it falls back
+// to that alert's StartsAt - the direction overlaps() already applies -
+// and the reverse holds for a zero StartsAt. A group-wide fallback let a
+// resolved alert ending before a later active alert started cut the window
+// short of that alert (#363). A malformed alert is clamped to its own start
+// (alertWindow). The two bounds can still cross, because they come from
+// alerts whose timestamps do not line up - one that ended at t1 and one
+// that started at t5 without an end - so they are ordered before they are
+// returned. Every alert contributes a usable value to both bounds or to
+// neither, so from and to go zero together and need no group-wide fallback:
+// the zero pair survives only when no alert carries any usable timestamp,
+// and grafanaExplore suppresses it rather than
 // emitting a URL whose range is the unix epoch.
 func groupWindow(g Group) [2]time.Time {
-	if len(g.Alerts) == 0 {
-		return [2]time.Time{}
-	}
-	from, to := alertWindow(g.Alerts[0])
-	for _, a := range g.Alerts[1:] {
-		start, end := alertWindow(a)
-		if !start.IsZero() && (from.IsZero() || start.Before(from)) {
-			from = start
-		}
-		if end.After(to) {
-			to = end
-		}
-	}
-	if to.IsZero() {
-		to = from
-	}
-	if from.IsZero() {
-		from = to
-	}
-	if to.Before(from) {
-		from, to = to, from
-	}
-	return [2]time.Time{from, to}
+    if len(g.Alerts) == 0 {
+        return [2]time.Time{}
+    }
+    var from, to time.Time
+    for _, a := range g.Alerts {
+        start, end := alertWindow(a)
+        if start.IsZero() {
+            start = end
+        }
+        if end.IsZero() {
+            end = start
+        }
+        if !start.IsZero() && (from.IsZero() || start.Before(from)) {
+            from = start
+        }
+        if end.After(to) {
+            to = end
+        }
+    }
+    if to.Before(from) {
+        from, to = to, from
+    }
+    return [2]time.Time{from, to}
 }
 
 // grafanaExplore builds a /explore URL whose left pane carries one query
@@ -91,33 +95,33 @@ func groupWindow(g Group) [2]time.Time {
 // time) would otherwise format as 0001-01-01T00:00:00Z, a valid RFC3339
 // string that sends the operator to the unix epoch instead of the incident.
 func grafanaExplore(base, ds, expr string, from, to time.Time, datasourceType string) string {
-	if base == "" || ds == "" || expr == "" || from.IsZero() || to.IsZero() {
-		return ""
-	}
-	left := map[string]any{
-		"datasource": map[string]string{"uid": ds, "type": datasourceType},
-		"queries": []map[string]any{
-			{
-				"refId": "A",
-				"datasource": map[string]string{
-					"uid":  ds,
-					"type": datasourceType,
-				},
-				"expr":    expr,
-				"range":   true,
-				"instant": false,
-			},
-		},
-		"range": map[string]string{
-			"from": from.UTC().Format(time.RFC3339),
-			"to":   to.UTC().Format(time.RFC3339),
-		},
-	}
-	raw, err := json.Marshal(left)
-	if err != nil {
-		return ""
-	}
-	return base + "/explore?left=" + url.QueryEscape(string(raw))
+    if base == "" || ds == "" || expr == "" || from.IsZero() || to.IsZero() {
+        return ""
+    }
+    left := map[string]any{
+        "datasource": map[string]string{"uid": ds, "type": datasourceType},
+        "queries": []map[string]any{
+            {
+                "refId": "A",
+                "datasource": map[string]string{
+                    "uid":  ds,
+                    "type": datasourceType,
+                },
+                "expr":    expr,
+                "range":   true,
+                "instant": false,
+            },
+        },
+        "range": map[string]string{
+            "from": from.UTC().Format(time.RFC3339),
+            "to":   to.UTC().Format(time.RFC3339),
+        },
+    }
+    raw, err := json.Marshal(left)
+    if err != nil {
+        return ""
+    }
+    return base + "/explore?left=" + url.QueryEscape(string(raw))
 }
 
 // grafanaLinks assembles the Explore links attached to a digest. Each link
@@ -125,27 +129,27 @@ func grafanaExplore(base, ds, expr string, from, to time.Time, datasourceType st
 // invents a dashboard URL. expression is whatever PromQL/LogQL the alert
 // was built around (best effort - empty just means no metrics link).
 func grafanaLinks(cfg *Config, expression, namespace string, window [2]time.Time) (metrics, logs string) {
-	if cfg == nil || cfg.GrafanaURL == "" {
-		return "", ""
-	}
-	from, to := window[0], window[1]
-	metrics = grafanaExplore(cfg.GrafanaURL, cfg.GrafanaMetricsDS, expression, from, to, "prometheus")
-	logs = grafanaExplore(cfg.GrafanaURL, cfg.GrafanaLogsDS, namespaceLabel(namespace), from, to, "loki")
-	return metrics, logs
+    if cfg == nil || cfg.GrafanaURL == "" {
+        return "", ""
+    }
+    from, to := window[0], window[1]
+    metrics = grafanaExplore(cfg.GrafanaURL, cfg.GrafanaMetricsDS, expression, from, to, "prometheus")
+    logs = grafanaExplore(cfg.GrafanaURL, cfg.GrafanaLogsDS, namespaceLabel(namespace), from, to, "loki")
+    return metrics, logs
 }
 
 // namespaceLabel turns "kube-system" into the LogQL convention
 // `{namespace="kube-system"}`. The value is rendered through quoteLogValue
-// (strconv.Quote) so `"` and `\` in the namespace cannot break out of the
-// literal — Grafana decodes the URL envelope and parses the resulting
-// selector, so escaping at the JSON marshaler alone leaves LogQL itself
-// injectable. Namespaces are DNS-1123 in practice, so this is defensive
-// consistency with logs.buildQuery rather than a live defect. An empty
-// namespace yields an empty string, which suppresses the logs link rather
-// than emitting a `{namespace=""}` that would search every namespace.
+// (strconv.Quote) so quote and backslash characters in the namespace cannot
+// break out of the literal — Grafana decodes the URL envelope and parses
+// the resulting selector, so escaping at the JSON marshaler alone leaves
+// LogQL itself injectable. Namespaces are DNS-1123 in practice, so this is
+// defensive consistency with logs.buildQuery rather than a live defect. An
+// empty namespace yields an empty string, which suppresses the logs link
+// rather than emitting a `{namespace=""}` that would search every namespace.
 func namespaceLabel(ns string) string {
-	if ns == "" {
-		return ""
-	}
-	return "{namespace=" + quoteLogValue(ns) + "}"
+    if ns == "" {
+        return ""
+    }
+    return "{namespace=" + quoteLogValue(ns) + "}"
 }
