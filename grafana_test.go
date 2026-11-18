@@ -80,7 +80,7 @@ func TestGroupWindowMalformedAlertNeverInverted(t *testing.T) {
 		{"malformed alert beside an active one", []Alert{
 			{StartsAt: base.Add(time.Hour), EndsAt: base},
 			{StartsAt: base.Add(2 * time.Hour)},
-		}, [2]time.Time{base.Add(time.Hour), base.Add(time.Hour)}},
+		}, [2]time.Time{base.Add(time.Hour), base.Add(2 * time.Hour)}},
 		{"resolved alert ended before a later alert started", []Alert{
 			{EndsAt: base},
 			{StartsAt: base.Add(time.Hour)},
@@ -88,7 +88,7 @@ func TestGroupWindowMalformedAlertNeverInverted(t *testing.T) {
 		{"malformed alert beside one without a start", []Alert{
 			{StartsAt: base.Add(time.Hour), EndsAt: base.Add(-time.Hour)},
 			{EndsAt: base},
-		}, [2]time.Time{base.Add(time.Hour), base.Add(time.Hour)}},
+		}, [2]time.Time{base, base.Add(time.Hour)}},
 		{"malformed alert beside one that ended earlier", []Alert{
 			{StartsAt: base.Add(time.Hour), EndsAt: base},
 			{StartsAt: base.Add(-2 * time.Hour), EndsAt: base.Add(-time.Hour)},
@@ -234,6 +234,83 @@ func TestGrafanaLinksRangeOrderedForMalformedAlert(t *testing.T) {
 	}
 }
 
+func TestGroupWindowZeroStartFallsBackToEndsAt(t *testing.T) {
+	end := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "Up"}, EndsAt: end}}} // StartsAt zero: timestamp dropped
+	w := groupWindow(g)
+	if !w[0].Equal(end) || !w[1].Equal(end) {
+		t.Fatalf("expected [end, end] for zero-start alert, got [%s, %s]", w[0], w[1])
+	}
+}
+
+func TestGroupWindowSingleResolvedAlert(t *testing.T) {
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	end := start.Add(10 * time.Minute)
+	g := Group{Alerts: []Alert{{Labels: map[string]string{"alertname": "Up"}, StartsAt: start, EndsAt: end}}}
+	w := groupWindow(g)
+	if !w[0].Equal(start) || !w[1].Equal(end) {
+		t.Fatalf("expected [start, end] for resolved alert, got [%s, %s]", w[0], w[1])
+	}
+}
+
+func TestGroupWindowAllZeroStaysZero(t *testing.T) {
+	g := Group{Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "A"}},
+		{Labels: map[string]string{"alertname": "B"}},
+	}}
+	w := groupWindow(g)
+	if !w[0].IsZero() || !w[1].IsZero() {
+		t.Fatalf("expected zero pair for timestamp-less group, got [%s, %s]", w[0], w[1])
+	}
+}
+
+// TestGroupWindowMixedResolvedAndActive guards #363: the window's end must
+// consider every alert's effective end, where an active alert's effective
+// end is its StartsAt. A group-wide fallback let a resolved alert that
+// ended before a later active alert began produce end < that alert's
+// start, so the Explore link excluded the incident it linked. The order of
+// the alerts in the group must not matter.
+func TestGroupWindowMixedResolvedAndActive(t *testing.T) {
+	resolvedStart := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	resolvedEnd := resolvedStart.Add(time.Minute)
+	activeStart := resolvedEnd.Add(time.Minute)
+	resolved := Alert{Labels: map[string]string{"alertname": "DiskFull"}, StartsAt: resolvedStart, EndsAt: resolvedEnd}
+	active := Alert{Labels: map[string]string{"alertname": "PodCrashloop"}, StartsAt: activeStart}
+	timestampless := Alert{Labels: map[string]string{"alertname": "Dropped"}}
+
+	for name, alerts := range map[string][]Alert{
+		"resolved first":     {resolved, active},
+		"active first":       {active, resolved},
+		"with timestampless": {resolved, timestampless, active},
+	} {
+		w := groupWindow(Group{Alerts: alerts})
+		if !w[0].Equal(resolvedStart) || !w[1].Equal(activeStart) {
+			t.Errorf("%s: expected [%s, %s], got [%s, %s]", name, resolvedStart, activeStart, w[0], w[1])
+		}
+	}
+}
+
+// TestGroupWindowStartOnlyEndOnlyMix pins the property that each alert's
+// effective timestamps bound the window no matter which single timestamp
+// it carries. Pre-fix, both orders of a start-only active alert and an
+// end-only alert produced the inverted window [t3, t1]: the window's
+// `from` was seeded from the first alert with no per-alert fallback.
+func TestGroupWindowStartOnlyEndOnlyMix(t *testing.T) {
+	t1 := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	t3 := t1.Add(3 * time.Minute)
+	startOnly := Alert{Labels: map[string]string{"alertname": "Active"}, StartsAt: t3}
+	endOnly := Alert{Labels: map[string]string{"alertname": "Dropped"}, EndsAt: t1}
+	for name, alerts := range map[string][]Alert{
+		"start-only first": {startOnly, endOnly},
+		"end-only first":   {endOnly, startOnly},
+	} {
+		w := groupWindow(Group{Alerts: alerts})
+		if !w[0].Equal(t1) || !w[1].Equal(t3) {
+			t.Errorf("%s: expected [%s, %s], got [%s, %s]", name, t1, t3, w[0], w[1])
+		}
+	}
+}
+
 func TestGrafanaLinksOmittedWhenConfigMissing(t *testing.T) {
 	cfg := &Config{} // GRAFANA_URL unset
 	m, l := grafanaLinks(cfg, "up", "kube-system", [2]time.Time{time.Now(), time.Now()})
@@ -294,10 +371,7 @@ func TestNamespaceLabelEmptySuppressed(t *testing.T) {
 }
 
 // TestNamespaceLabelEscapesValues verifies the LogQL literal in the
-// Explore link is built through quoteLogValue so a `"` or `\` in the
-// namespace cannot break out of the quoted literal and inject selector
-// syntax. The envelope selector shape is the one Grafana decodes and
-// parses, so URL-encoding at the outer JSON marshaler is not enough.
+// Explore link is escaped through quoteLogValue.
 // TestGrafanaLinksRedactCredentialBearingExpression (#278): scrape-target
 // URLs and hard-coded bearer params do occur in rule expressions, and the
 // Explore links embedded in the issue body and chat digest are durable and

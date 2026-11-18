@@ -43,36 +43,42 @@ func alertWindow(a Alert) (start, end time.Time) {
 
 // groupWindow returns [from, to] covering every alert in the group. An
 // empty group returns the zero pair, which makes grafanaExplore emit "" -
-// so a malformed group never produces a half-open URL either. A zero
-// EndsAt is the normal shape of an active alert (it has not resolved), so
-// it falls back to the alert's StartsAt; the reverse holds for a zero
-// StartsAt. A malformed alert is clamped to its own start (alertWindow).
-// The two bounds can still cross, because they come from alerts whose
-// timestamps do not line up - one that ended at t1 and one that started at
-// t5 without an end - so they are ordered before they are returned. The
-// window then covers both alerts rather than dropping the one that ended
-// first. Only when no alert in the group carries any usable timestamp
-// does the zero pair survive, and grafanaExplore suppresses it rather than
-// emitting a URL whose range is the unix epoch.
+// so a malformed group never produces a half-open URL either. The fallback
+// from a zero timestamp is per-alert, not group-wide: a zero EndsAt is the
+// normal shape of an active alert (it has not resolved), so it falls back
+// to that alert's StartsAt - the direction overlaps() already applies -
+// and the reverse holds for a zero StartsAt. A group-wide fallback let a
+// resolved alert ending before a later active alert started cut the window
+// short of that alert (#363). A malformed alert is clamped to its own start
+// (alertWindow), so every alert contributes an ordered pair and the minimum
+// start can no longer exceed the maximum end: the bounds cannot cross the
+// way the group-wide fallback allowed (one alert ending at t1, another
+// starting at t5 without an end). The pair is still ordered before it is
+// returned, as a guard in case a future change reintroduces a crossing.
+// Every alert contributes a usable value to both bounds or to neither, so
+// from and to go zero together and need no group-wide fallback: the zero
+// pair survives only when no alert carries any usable timestamp, and
+// grafanaExplore suppresses it rather than emitting a URL whose range is
+// the unix epoch.
 func groupWindow(g Group) [2]time.Time {
 	if len(g.Alerts) == 0 {
 		return [2]time.Time{}
 	}
-	from, to := alertWindow(g.Alerts[0])
-	for _, a := range g.Alerts[1:] {
+	var from, to time.Time
+	for _, a := range g.Alerts {
 		start, end := alertWindow(a)
+		if start.IsZero() {
+			start = end
+		}
+		if end.IsZero() {
+			end = start
+		}
 		if !start.IsZero() && (from.IsZero() || start.Before(from)) {
 			from = start
 		}
 		if end.After(to) {
 			to = end
 		}
-	}
-	if to.IsZero() {
-		to = from
-	}
-	if from.IsZero() {
-		from = to
 	}
 	if to.Before(from) {
 		from, to = to, from
@@ -136,13 +142,13 @@ func grafanaLinks(cfg *Config, expression, namespace string, window [2]time.Time
 
 // namespaceLabel turns "kube-system" into the LogQL convention
 // `{namespace="kube-system"}`. The value is rendered through quoteLogValue
-// (strconv.Quote) so `"` and `\` in the namespace cannot break out of the
-// literal — Grafana decodes the URL envelope and parses the resulting
-// selector, so escaping at the JSON marshaler alone leaves LogQL itself
-// injectable. Namespaces are DNS-1123 in practice, so this is defensive
-// consistency with logs.buildQuery rather than a live defect. An empty
-// namespace yields an empty string, which suppresses the logs link rather
-// than emitting a `{namespace=""}` that would search every namespace.
+// (strconv.Quote) so quote and backslash characters in the namespace cannot
+// break out of the literal — Grafana decodes the URL envelope and parses
+// the resulting selector, so escaping at the JSON marshaler alone leaves
+// LogQL itself injectable. Namespaces are DNS-1123 in practice, so this is
+// defensive consistency with logs.buildQuery rather than a live defect. An
+// empty namespace yields an empty string, which suppresses the logs link
+// rather than emitting a `{namespace=""}` that would search every namespace.
 func namespaceLabel(ns string) string {
 	if ns == "" {
 		return ""
