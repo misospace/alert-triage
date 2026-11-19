@@ -317,11 +317,7 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		logf("enrich: backend logs: %d scope read(s) failed (first: %v); the read continues with the scopes that answered", len(failedReads), firstReadErr)
 	}
 
-	var failed []string
-	for ns := range failedReads {
-		failed = append(failed, ns)
-	}
-	sort.Strings(failed)
+	failed := sortedKeys(failedReads)
 
 	collapsed := collapseAndCap(order, b.limit)
 	if len(byNS) == 0 {
@@ -334,11 +330,7 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		}
 		return backendLogResult{Ambient: marked, SkippedRefused: skippedRefused, NoRecords: noRecords, FailedReads: failed}
 	}
-	var unresolved []string
-	for ns := range skippedUnresolved {
-		unresolved = append(unresolved, ns)
-	}
-	sort.Strings(unresolved)
+	unresolved := sortedKeys(skippedUnresolved)
 	return backendLogResult{Primary: collapsed, SkippedRefused: skippedRefused, SkippedUnresolved: unresolved, NoRecords: noRecords, FailedReads: failed}
 }
 
@@ -355,28 +347,19 @@ func quoteLogValue(v string) string {
 // `field:"value"` filters joined by AND, Loki takes a `{label="value"}`
 // stream selector, so the query is built per flavor.
 func (b *logsBackend) buildQuery(namespace, pod string) string {
-	switch b.flavor {
-	case "loki":
+	if b.flavor == "loki" {
 		if pod != "" {
 			return "{namespace=" + quoteLogValue(namespace) + ",pod=" + quoteLogValue(pod) + "}"
 		}
 		return "{namespace=" + quoteLogValue(namespace) + "}"
-	case "victorialogs":
-		query := "namespace:" + quoteLogValue(namespace)
-		if pod != "" {
-			query += " AND pod:" + quoteLogValue(pod)
-		}
-		return query
-	default:
-		// Unreachable: endpoint() rejects unknown flavors before query()
-		// builds a request, so the flavor whitelist stays in one mental
-		// place without dead code.
-		query := "namespace:" + quoteLogValue(namespace)
-		if pod != "" {
-			query += " AND pod:" + quoteLogValue(pod)
-		}
-		return query
 	}
+	// VictoriaLogs, and any other flavor: endpoint() refuses an unknown
+	// flavor before a request is built, so this arm only ever spells LogsQL.
+	query := "namespace:" + quoteLogValue(namespace)
+	if pod != "" {
+		query += " AND pod:" + quoteLogValue(pod)
+	}
+	return query
 }
 
 // query reads the backend for one scope. The error it returns is either a

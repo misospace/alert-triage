@@ -409,23 +409,21 @@ func newGroup(key, reason string, members []Alert, nodeOf map[string]string) Gro
 	g := Group{Key: stripSecrets(key), Reason: stripSecrets(reason), Alerts: members}
 	seenNS := map[string]bool{}
 	seenNode := map[string]bool{}
-	var nodes []string
 	for _, a := range members {
-		if ns := a.namespace(); ns != "" && !seenNS[ns] {
+		if ns := a.namespace(); ns != "" {
 			seenNS[ns] = true
-			g.Namespaces = append(g.Namespaces, ns)
 		}
-		if n := nodeFor(a, nodeOf); n != "" && !seenNode[n] {
+		if n := nodeFor(a, nodeOf); n != "" {
 			seenNode[n] = true
-			nodes = append(nodes, n)
 		}
 		if g.Cluster == "" {
 			g.Cluster = a.cluster()
 		}
 	}
-	sort.Strings(g.Namespaces)
-	sort.Strings(nodes)
-	if len(nodes) > 0 {
+	if len(seenNS) > 0 {
+		g.Namespaces = sortedKeys(seenNS)
+	}
+	if nodes := sortedKeys(seenNode); len(nodes) > 0 {
 		g.Node = nodes[0]
 	}
 	return g
