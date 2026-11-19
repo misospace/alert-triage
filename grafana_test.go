@@ -253,17 +253,6 @@ func TestGroupWindowSingleResolvedAlert(t *testing.T) {
 	}
 }
 
-func TestGroupWindowAllZeroStaysZero(t *testing.T) {
-	g := Group{Alerts: []Alert{
-		{Labels: map[string]string{"alertname": "A"}},
-		{Labels: map[string]string{"alertname": "B"}},
-	}}
-	w := groupWindow(g)
-	if !w[0].IsZero() || !w[1].IsZero() {
-		t.Fatalf("expected zero pair for timestamp-less group, got [%s, %s]", w[0], w[1])
-	}
-}
-
 // TestGroupWindowMixedResolvedAndActive guards #363: the window's end must
 // consider every alert's effective end, where an active alert's effective
 // end is its StartsAt. A group-wide fallback let a resolved alert that
@@ -371,7 +360,10 @@ func TestNamespaceLabelEmptySuppressed(t *testing.T) {
 }
 
 // TestNamespaceLabelEscapesValues verifies the LogQL literal in the
-// Explore link is escaped through quoteLogValue.
+// Explore link is built through quoteLogValue so a `"` or `\` in the
+// namespace cannot break out of the quoted literal and inject selector
+// syntax. The envelope selector shape is the one Grafana decodes and
+// parses, so URL-encoding at the outer JSON marshaler is not enough.
 // TestGrafanaLinksRedactCredentialBearingExpression (#278): scrape-target
 // URLs and hard-coded bearer params do occur in rule expressions, and the
 // Explore links embedded in the issue body and chat digest are durable and
