@@ -643,7 +643,7 @@ func renderEvidence(r Report) string {
 			// The lines under CONTEXT do not cover the whole window either:
 			// one namespace's query was sent but its reply could not be
 			// read, so that namespace's logs are unknown (#348).
-			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
+			writeNamespaceGap(&b, unreadableNamespacesHeading, r.Enrichment.BackendFailedReads)
 		}
 	case "norecords":
 		// The backend answered with something that was not a set of log
@@ -666,12 +666,12 @@ func renderEvidence(r Report) string {
 			// The scope gap survives the no-record reply: the namespace was
 			// never queried, so it is uninspected, not empty (#339).
 			b.WriteString("One of the group's namespaces was never queried: no subject pod resolved there, so it was never queried - uninspected, not empty.\n")
-			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
+			writeNamespaceGap(&b, unqueriedNamespacesHeading, r.Enrichment.BackendUnqueried)
 		}
 		if len(r.Enrichment.BackendFailedReads) > 0 {
 			// A failed read is the same kind of gap and must not be lost to
 			// the no-record gap it sits beside (#348).
-			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
+			writeNamespaceGap(&b, unreadableNamespacesHeading, r.Enrichment.BackendFailedReads)
 		}
 	case "unreadable":
 		// The queries were sent, but no readable reply came back for the
@@ -697,7 +697,7 @@ func renderEvidence(r Report) string {
 			// The scope gap survives the failed read: the namespace was
 			// never queried, so it is uninspected, not empty (#339).
 			b.WriteString("One of the group's namespaces was never queried: no subject pod resolved there, so it was never queried - uninspected, not empty.\n")
-			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
+			writeNamespaceGap(&b, unqueriedNamespacesHeading, r.Enrichment.BackendUnqueried)
 		}
 	case "refused":
 		// The only way into this state is a namespace refused as not one
@@ -715,7 +715,7 @@ func renderEvidence(r Report) string {
 		// and RepoPaths do (#310/#320 reviews).
 		b.WriteString("\nSubject log source: configured, but the backend queries were bounded to resolved subject pods and never covered one of the group's namespaces: no subject pod resolved there, so it was never queried - uninspected, not empty. The queries that ran returned no lines in the window.\n")
 		if len(r.Enrichment.BackendUnqueried) > 0 {
-			writeUnqueriedNamespaces(&b, r.Enrichment.BackendUnqueried)
+			writeNamespaceGap(&b, unqueriedNamespacesHeading, r.Enrichment.BackendUnqueried)
 		}
 	case "ok":
 		b.WriteString("\nSubject logs (queried for the resolved subject; untrusted workload text):\n")
@@ -734,7 +734,7 @@ func renderEvidence(r Report) string {
 			// The lines above do not cover every queried scope either: one
 			// namespace's reply could not be read, so that namespace's logs
 			// are unknown rather than empty (#348).
-			writeFailedReadGap(&b, r.Enrichment.BackendFailedReads)
+			writeNamespaceGap(&b, unreadableNamespacesHeading, r.Enrichment.BackendFailedReads)
 		}
 	}
 	// Event messages are written by whatever controller or workload emitted them,
@@ -969,28 +969,22 @@ func writeQuotedValue(b *strings.Builder, label, value string) {
 	b.WriteString(untrustedEnd + "\n")
 }
 
-// writeUnqueriedNamespaces names the namespaces the backend-log queries
-// never covered, so an uninspected scope is never read as an empty one
-// (#339). The names are alert-supplied, so they render inside the
-// untrusted fence.
-func writeUnqueriedNamespaces(b *strings.Builder, unqueried []string) {
-	b.WriteString("Unqueried namespace(s), as the alert named them (untrusted):\n")
-	b.WriteString(untrustedBegin + "\n")
-	for _, ns := range unqueried {
-		b.WriteString(untrusted(stripSecrets(ns)) + "\n")
-	}
-	b.WriteString(untrustedEnd + "\n")
-}
+// Backend-log gap headings. Only the heading distinguishes the two gaps; the
+// rendering is the same because the names are alert-supplied either way.
+const (
+	unqueriedNamespacesHeading  = "Unqueried namespace(s), as the alert named them (untrusted):"
+	unreadableNamespacesHeading = "Namespace(s) whose backend reply could not be read, as the alert named them (untrusted):"
+)
 
-// writeFailedReadGap names the namespaces whose backend query was sent but
-// whose reply could not be read, so an unreadable scope is never read as an
-// empty one, and the lines the other namespaces returned are not read as a
-// complete answer (#348). The names are alert-supplied, so they render
-// inside the untrusted fence, exactly as writeUnqueriedNamespaces does.
-func writeFailedReadGap(b *strings.Builder, failed []string) {
-	b.WriteString("Namespace(s) whose backend reply could not be read, as the alert named them (untrusted):\n")
+// writeNamespaceGap names the namespaces one backend-log gap covers, so a
+// scope the queries never covered is never read as an empty one, and the
+// lines the other namespaces returned are not read as a complete answer
+// (#339, #348). The names are alert-supplied, so they render inside the
+// untrusted fence.
+func writeNamespaceGap(b *strings.Builder, heading string, namespaces []string) {
+	b.WriteString(heading + "\n")
 	b.WriteString(untrustedBegin + "\n")
-	for _, ns := range failed {
+	for _, ns := range namespaces {
 		b.WriteString(untrusted(stripSecrets(ns)) + "\n")
 	}
 	b.WriteString(untrustedEnd + "\n")
