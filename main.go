@@ -527,6 +527,13 @@ func drainBuffer(ctx context.Context, cfg *Config, buf *buffer, k *kube, hist *H
 }
 
 func process(ctx context.Context, cfg *Config, alerts []Alert, k *kube, hist *History, seen *recent, prom *Prometheus) {
+	// Node attribution and every group's enrichment read the same namespace
+	// pod lists and the same node list, so serve the flush from one memo per
+	// read instead of once per group (issue #374). The memo lives on a copy
+	// of the client: the shared *kube must stay immutable across the drain
+	// overlap (issue #146), and a canceled flush's copy must not share cache
+	// with the draining one.
+	k = k.withFlush()
 	nodeOf := k.ResolveNodes(ctx, alerts)
 	groups := Correlate(alerts, nodeOf, DefaultSignatures(), cfg.CorrelateSlack, cfg.Cluster)
 	// Count groups once per flush; if the count stays at zero while alerts

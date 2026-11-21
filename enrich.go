@@ -35,6 +35,10 @@ type kube struct {
 	hc      *http.Client
 	logs    *logsBackend
 	cluster string // cluster label this client belongs to (empty = local/default)
+	// flush memoizes the reads every group of one flush shares. It is nil on
+	// the shared client and set only on the per-flush copy from withFlush, so
+	// it is never written on a *kube two goroutines share (issue #374).
+	flush *flushReads
 }
 
 // newKube builds the read-only client. cluster names the cluster this instance
@@ -841,6 +845,66 @@ func alertNamespace(a Alert) string {
 	return ""
 }
 
+// flushReads memoizes the cluster reads every group of one flush shares: the
+// namespace pod listings and the node list. Node attribution lists each
+// alert namespace once, and every group then listed its namespaces again, so
+// one flush with N groups on M shared namespaces cost (N+1)*M pod listings
+// and N node lists instead of M and 1 (issue #374).
+//
+// The first read of a namespace wins for the whole flush, failures included.
+// Pods that arrive or leave between groups are not the evidence a digest
+// needs — one flush describes one moment — and caching a failure is the
+// point: a namespace the apiserver refuses must be refused once per flush,
+// not once per group. Callers still react to the error at their own site, so
+// a cached failure keeps every scope statement and inspected flag it drove.
+type flushReads struct {
+	pods  map[string]podsResult
+	nodes *nodesResult
+}
+
+type podsResult struct {
+	pods podList
+	err  error
+}
+
+type nodesResult struct {
+	names     []string
+	inspected bool
+}
+
+// withFlush returns a copy of the client whose pod and node reads are
+// memoized for one flush. The receiver is untouched: the drain overlap in
+// issue #146 means a second process can run while a canceled one is still
+// unwinding, so per-flush state travels on a copy one process owns, never on
+// the shared struct. Use the returned client for every read of the flush.
+func (k *kube) withFlush() *kube {
+	if k == nil {
+		return nil
+	}
+	c := *k
+	c.flush = &flushReads{pods: map[string]podsResult{}}
+	return &c
+}
+
+// podsForNamespace lists the pods of a namespace the caller has already
+// vetted as one path segment (fluxPathSegment's allow-list means nothing
+// here is escaped into a different segment). The namespace is alert-supplied
+// text, so callers keep their own refusal checks and log the escaped value,
+// never the raw label; this helper reads, and caches the read for the flush.
+func (k *kube) podsForNamespace(ctx context.Context, ns string) (podList, error) {
+	if k.flush != nil {
+		if r, ok := k.flush.pods[ns]; ok {
+			return r.pods, r.err
+		}
+	}
+	var pods podList
+	err := k.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods", &pods)
+	if k.flush != nil {
+		k.flush.pods[ns] = podsResult{pods: pods, err: err}
+	}
+	return pods, err
+}
+
 // ResolveNodes maps alert identities to the node their pod runs on, so
 // correlation can group by node even though most alerts only carry pod labels.
 //
@@ -874,8 +938,8 @@ func (k *kube) ResolveNodes(ctx context.Context, alerts []Alert) map[string]stri
 			logf("enrich: namespace is not one path segment; skipping the pods-to-node read for it")
 			continue
 		}
-		var pods podList
-		if err := k.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods", &pods); err != nil {
+		pods, err := k.podsForNamespace(ctx, ns)
+		if err != nil {
 			// The escaped value, not the raw label, is what reaches the
 			// journal: the namespace is alert-supplied text.
 			logf("enrich: pods in %s: %v", url.PathEscape(ns), err)
@@ -1080,8 +1144,8 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		}
 		esc := url.PathEscape(ns)
 
-		var pods podList
-		if err := k.get(ctx, "/api/v1/namespaces/"+esc+"/pods", &pods); err != nil {
+		pods, err := k.podsForNamespace(ctx, ns)
+		if err != nil {
 			// The escaped value, not the raw label, is what reaches the
 			// journal: the namespace is alert-supplied text.
 			logf("enrich: pods in %s: %v", esc, err)
@@ -1626,10 +1690,19 @@ func ownershipChain(kind, nsName string, refs []ownerRef, identity string) strin
 // been cordoned. A healthy cluster returns nothing, which is itself evidence —
 // but only when the second result says the read succeeded. Failed reads return
 // false so the empty list is never rendered as a healthy cluster (issue #294).
+// Inside a flush the list is read once and shared by every group; the cached
+// result carries the success flag with it, so a failed read keeps failing
+// honestly for later groups instead of re-reading (issue #374).
 func (k *kube) unhealthyNodes(ctx context.Context) ([]string, bool) {
+	if k.flush != nil && k.flush.nodes != nil {
+		return k.flush.nodes.names, k.flush.nodes.inspected
+	}
 	var nodes nodeList
 	if err := k.get(ctx, "/api/v1/nodes", &nodes); err != nil {
 		logf("enrich: nodes: %v", err)
+		if k.flush != nil {
+			k.flush.nodes = &nodesResult{inspected: false}
+		}
 		return nil, false
 	}
 	var out []string
@@ -1649,6 +1722,9 @@ func (k *kube) unhealthyNodes(ctx context.Context) ([]string, bool) {
 		if len(problems) > 0 {
 			out = append(out, n.Metadata.Name+" "+strings.Join(problems, ", "))
 		}
+	}
+	if k.flush != nil {
+		k.flush.nodes = &nodesResult{names: out, inspected: true}
 	}
 	return out, true
 }
