@@ -801,6 +801,35 @@ func TestPartialBackendStateNamesTheGap(t *testing.T) {
 	}
 }
 
+// TestNoscopeBackendStateStatesUnqueried pins the render-level half of issue
+// #373: a group that named no namespace sent no backend query, so neither
+// surface may print the "returned no lines" negative — there is no namespace
+// for it to describe and no query that came back empty. Both must carry the
+// scope statement instead: unqueried, not empty.
+func TestNoscopeBackendStateStatesUnqueried(t *testing.T) {
+	g := Group{
+		Key:    "sig-noscope-backend",
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "Watchdog"}}},
+	}
+	en := Enrichment{BackendState: "noscope"}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "returned no lines") {
+		t.Errorf("model prompt must not claim the backend returned no lines for a scope that was never queried:\n%s", model)
+	}
+	if !strings.Contains(model, "named no namespace") || !strings.Contains(model, "unqueried, not empty") {
+		t.Errorf("model prompt must carry the scope statement:\n%s", model)
+	}
+
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "returned no lines") {
+		t.Errorf("discord must not claim the backend returned no lines for a scope that was never queried:\n%s", discord)
+	}
+	if !strings.Contains(discord, "named no namespace") {
+		t.Errorf("discord must carry the scope statement:\n%s", discord)
+	}
+}
+
 func TestParseTriageTolerance(t *testing.T) {
 	want := `{"narrative":"n","fix_location":"git","what_to_change":"w","confidence":"high"}`
 	for name, raw := range map[string]string{

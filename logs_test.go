@@ -1635,7 +1635,9 @@ func TestTargetPodsByNamespace(t *testing.T) {
 }
 
 // TestFetchBackendLogsEmptyNamespace verifies the short-circuit when the
-// group has no namespaces — the backend should not be hit at all.
+// group has no namespaces — the backend should not be hit at all, and the
+// result must carry the NoScope marker so the caller states an unqueried
+// scope instead of rendering the short-circuit as an empty one (issue #373).
 func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1659,6 +1661,12 @@ func TestFetchBackendLogsEmptyNamespace(t *testing.T) {
 	if lines.Ambient != nil {
 		t.Fatalf("expected no ambient for empty namespace, got %v", lines.Ambient)
 	}
+	if !lines.NoScope {
+		t.Fatal("a group with no namespace must report NoScope: no query was sent, so the result is not an empty one")
+	}
+	if lines.SkippedRefused || lines.NoRecords || lines.SkippedUnresolved != nil || lines.FailedReads != nil {
+		t.Fatalf("NoScope short-circuits every other fact, got %+v", lines)
+	}
 	if got := atomic.LoadInt32(&hits); got != 0 {
 		t.Fatalf("expected zero backend hits for empty-namespace short-circuit, got %d", got)
 	}
@@ -1670,5 +1678,10 @@ func TestFetchBackendLogsNilReceiver(t *testing.T) {
 	res := b.fetchBackendLogsResult(context.Background(), Group{}, time.Minute, nil)
 	if res.Primary != nil || res.Ambient != nil {
 		t.Fatalf("nil receiver should return empty results, got %#v", res)
+	}
+	// A nil backend is "off", not "no scope": the state comes from the
+	// caller never consulting a nil backend, so the marker stays false.
+	if res.NoScope {
+		t.Fatal("a nil backend must not report NoScope")
 	}
 }

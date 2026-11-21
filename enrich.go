@@ -540,13 +540,15 @@ type Enrichment struct {
 	// than trusting them as a service reading.
 	ContainerTerminationMessages []string
 	// BackendLogs are workload-authored and untrusted. BackendState is
-	// "off", "ok", "empty", "ambient", "refused", "partial", "norecords",
-	// "unreadable", or "unavailable" so missing configuration is not confused
-	// with a successful query that returned no lines. "empty" means the
-	// queries issued returned no lines; "ambient" means no concrete subject
-	// could be resolved, the namespace-wide fallback did return lines, and
-	// those lines were routed to Ambient — the source is configured and
-	// answered; "norecords" means the backend answered, but the reply
+	// "off", "ok", "empty", "ambient", "noscope", "refused", "partial",
+	// "norecords", "unreadable", or "unavailable" so missing configuration is
+	// not confused with a successful query that returned no lines. "empty"
+	// means the queries issued returned no lines; "ambient" means no concrete
+	// subject could be resolved, the namespace-wide fallback did return lines,
+	// and those lines were routed to Ambient — the source is configured and
+	// answered; "noscope" means the group named no namespace, so no query was
+	// sent and nothing was checked — unqueried, not empty (issue #373);
+	// "norecords" means the backend answered, but the reply
 	// carried no log record at all, so the scope is unknown rather than
 	// empty; "unreadable" means the queries were sent but the replies could
 	// not be read, which is the same unknown rather than empty (#348).
@@ -1419,6 +1421,14 @@ func (k *kube) Enrich(ctx context.Context, g Group, window time.Duration, cfg *C
 		e.BackendNoRecords = res.NoRecords
 		e.BackendFailedReads = res.FailedReads
 		switch {
+		case res.NoScope:
+			// The group named no namespace, so the backend query
+			// short-circuited before sending any request: every other fact
+			// in res is empty by construction. Falling through to the
+			// default would render "returned no lines" — a confident
+			// negative about a scope that was never queried and does not
+			// exist, the #311/#331 rule one branch further up (issue #373).
+			e.BackendState = "noscope"
 		case len(res.Primary) > 0:
 			// The unqueried and refused gap markers are deliberately
 			// consumed only when no lines came back: with primary

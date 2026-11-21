@@ -1670,6 +1670,61 @@ func TestEnrichBackendLogsNoSubjectEmptyNotScoped(t *testing.T) {
 	}
 }
 
+// TestEnrichBackendLogsNoNamespaceGroupIsNoscope is the issue #373
+// regression: a group that names no namespace has no scope for the log
+// backend, so no query is sent. That short-circuit used to land in the
+// "empty" state, and the digest then asserted "backend logs returned no
+// lines for this incident window" without the backend ever having seen a
+// request. The state must instead say the scope was never queried, and
+// neither render surface may print the "returned no lines" negative.
+func TestEnrichBackendLogsNoNamespaceGroupIsNoscope(t *testing.T) {
+	var backendHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/select") || strings.Contains(r.URL.Path, "/loki/") {
+			atomic.AddInt32(&backendHits, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	k := &kube{base: srv.URL, hc: srv.Client(), logs: newLogsBackendForTest(t, srv)}
+	// A node-level alert: no namespace label, so the group carries none.
+	g := Group{
+		Key:    "sig-noscope",
+		Alerts: []Alert{{Status: "firing", Labels: map[string]string{"alertname": "Watchdog"}}},
+	}
+	en := k.Enrich(context.Background(), g, time.Minute, &Config{}, nil)
+
+	if got := atomic.LoadInt32(&backendHits); got != 0 {
+		t.Fatalf("a group with no namespace must send no backend query, got %d hits", got)
+	}
+	if en.BackendState == "empty" {
+		t.Fatal(`state "empty" claims a query came back with no lines; no query was sent`)
+	}
+	if en.BackendState != "noscope" {
+		t.Fatalf("expected state \"noscope\", got %q", en.BackendState)
+	}
+	if en.BackendScoped {
+		t.Error("no namespace means no subject scoping")
+	}
+
+	model := renderEvidence(Report{Group: g, Enrichment: en})
+	if strings.Contains(model, "returned no lines") {
+		t.Errorf("model prompt must not claim the backend returned no lines when no query was sent:\n%s", model)
+	}
+	if !strings.Contains(model, "named no namespace") || !strings.Contains(model, "unqueried, not empty") {
+		t.Errorf("model prompt must state the scope was never queried:\n%s", model)
+	}
+	discord := discordDescription(&Config{}, Report{Group: g, Enrichment: en})
+	if strings.Contains(discord, "returned no lines") {
+		t.Errorf("discord must not claim the backend returned no lines when no query was sent:\n%s", discord)
+	}
+	if !strings.Contains(discord, "named no namespace") || !strings.Contains(discord, "unqueried, not empty") {
+		t.Errorf("discord must state the scope was never queried:\n%s", discord)
+	}
+}
+
 // TestEnrichBackendLogsNoRecordReplyStatesGap pins the Enrich-level state
 // mapping for #349: a VictoriaLogs reply that parsed but carried no log
 // record leaves the scope unknown, so the state must name that gap rather

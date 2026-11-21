@@ -617,6 +617,12 @@ func renderEvidence(r Report) string {
 		} else {
 			b.WriteString("\nLog source: configured, but returned no lines for the namespace in the window.\n")
 		}
+	case "noscope":
+		// The group named no namespace, so there was no scope to query and
+		// no request was sent. Render the scope statement, never the
+		// negative: "returned no lines" would assert an inspection that
+		// never happened, about a scope that does not exist (issue #373).
+		b.WriteString("\nLog source: configured, but the group named no namespace, so no backend query was sent - unqueried, not empty.\n")
 	case "ambient":
 		// The lines under CONTEXT are the whole window's backend logs only
 		// when every query answered with lines or an explicit "nothing
@@ -1170,6 +1176,11 @@ func discordDescription(cfg *Config, r Report) string {
 		desc.WriteString("\n**Backend log source:** not configured (no LOGS_URL).")
 	case "empty":
 		desc.WriteString("\n**Backend log source:** configured, but returned no lines for this window.")
+	case "noscope":
+		// Scope statement, not a negative: the group named no namespace, so
+		// no query was sent and nothing could have come back empty
+		// (issue #373).
+		desc.WriteString("\n**Backend log source:** configured, but the group named no namespace, so no backend query was sent - unqueried, not empty.")
 	case "ambient":
 		// The lines shown are the whole window's backend logs only when
 		// every query answered with lines or an explicit "nothing matched".
