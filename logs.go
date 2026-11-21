@@ -144,6 +144,13 @@ type backendLogResult struct {
 	// same redaction and untrusted treatment they apply to every other
 	// namespace render.
 	FailedReads []string
+	// NoScope records that the group named no namespace, so there was no
+	// scope to query: the read short-circuited before sending any request.
+	// That is not an empty scope — no query ran that could have come back
+	// empty — and there is no namespace for such a negative to name, so the
+	// caller must state the gap instead (issue #373). All other fields of a
+	// NoScope result are empty by construction: nothing was queried.
+	NoScope bool
 }
 
 // ambientLogMarker prefixes namespace-wide backend-log lines returned when no
@@ -193,7 +200,12 @@ func (b *logsBackend) fetchBackendLogsResult(ctx context.Context, g Group, windo
 		return backendLogResult{}
 	}
 	if len(g.Namespaces) == 0 {
-		return backendLogResult{}
+		// No namespace, so no scope to query — and no query sent. The
+		// short-circuit itself stays (a cluster-wide log dump would drown
+		// the digest), but it must not reach the caller as an empty result:
+		// "no lines came back" and "no query was sent" are different facts,
+		// and only the negative the read supports may render (issue #373).
+		return backendLogResult{NoScope: true}
 	}
 	if window <= 0 {
 		window = 5 * time.Minute
