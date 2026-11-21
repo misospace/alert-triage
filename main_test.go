@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -684,5 +686,57 @@ func TestProcessCapsMetricSeriesLines(t *testing.T) {
 			check("METRICS (queried from metrics backend for the resolved subject", tt.wantSubjectSeries, tt.subjectTails, maxSubjectMetricSeries)
 			check("METRICS (queried from metrics backend for the namespace", tt.wantContextSeries, tt.contextTails, maxContextMetricSeries)
 		})
+	}
+}
+
+// TestProcessReadsEachNamespaceOncePerFlush drives a whole flush whose two
+// groups share one namespace — namespace grouping only fuses alerts whose
+// windows overlap, so two windows keep two groups — and pins the apiserver
+// cost: node attribution and both enrichments read the namespace's pod list,
+// and both read the node list, but the flush must issue each read once, not
+// once per group (issue #374).
+func TestProcessReadsEachNamespaceOncePerFlush(t *testing.T) {
+	var podHits, nodeHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/namespaces/ns-a/pods":
+			atomic.AddInt32(&podHits, 1)
+			_, _ = io.WriteString(w, `{"items":[`+
+				`{"metadata":{"name":"p1","namespace":"ns-a"},"spec":{"nodeName":"worker-1"}},`+
+				`{"metadata":{"name":"p2","namespace":"ns-a"},"spec":{"nodeName":"worker-2"}}]}`)
+		case "/api/v1/nodes":
+			atomic.AddInt32(&nodeHits, 1)
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	hist, err := NewHistory(t.TempDir()+"/history.json", time.Hour)
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+	var cfg Config
+	seen := recent{max: 20}
+	now := time.Now()
+	alerts := []Alert{
+		{Status: "firing", Fingerprint: "fp-old", StartsAt: now.Add(-2 * time.Hour), EndsAt: now.Add(-time.Hour),
+			Labels: map[string]string{"alertname": "Alpha", "namespace": "ns-a", "pod": "p1"}},
+		{Status: "firing", Fingerprint: "fp-new", StartsAt: now.Add(-10 * time.Minute),
+			Labels: map[string]string{"alertname": "Beta", "namespace": "ns-a", "pod": "p2"}},
+	}
+	process(context.Background(), &cfg, alerts, &kube{hc: srv.Client(), base: srv.URL}, hist, &seen, nil)
+
+	recs := seen.snapshot()
+	if len(recs) != 2 {
+		t.Fatalf("digests recorded = %d, want 2 groups sharing the namespace", len(recs))
+	}
+	if got := atomic.LoadInt32(&podHits); got != 1 {
+		t.Errorf("namespace pod list read %d times, want 1 per flush", got)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 1 {
+		t.Errorf("node list read %d times, want 1 per flush", got)
 	}
 }

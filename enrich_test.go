@@ -448,6 +448,126 @@ func TestFingerprintlessAlertsStayIndependentEndToEnd(t *testing.T) {
 	}
 }
 
+// One flush lists each namespace once for node attribution, and then every
+// group's enrichment listed it again — (groups+1) GETs per namespace and one
+// node list per group. A flushed client reads each at most once and every
+// reader sees the same result, so the digests do not change while the
+// apiserver sees one read (issue #374).
+func TestFlushReadsSharePodListingAndNodes(t *testing.T) {
+	var podHits, nodeHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/namespaces/ns-a/pods":
+			atomic.AddInt32(&podHits, 1)
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"p1","namespace":"ns-a"},"spec":{"nodeName":"worker-1"}}]}`)
+		case "/api/v1/nodes":
+			atomic.AddInt32(&nodeHits, 1)
+			_, _ = io.WriteString(w, `{"items":[{"metadata":{"name":"worker-9"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"KubeletNotReady"}]}}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := (&kube{hc: srv.Client(), base: srv.URL}).withFlush()
+	alerts := []Alert{
+		{Fingerprint: "fp-1", Labels: map[string]string{"pod": "p1", "namespace": "ns-a"}},
+	}
+	nodeOf := k.ResolveNodes(context.Background(), alerts)
+	if nodeOf[alerts[0].identity()] != "worker-1" {
+		t.Fatalf("attribution lost through the flush memo: %q", nodeOf[alerts[0].identity()])
+	}
+
+	group := Group{Alerts: alerts, Namespaces: []string{"ns-a"}}
+	e1 := k.Enrich(context.Background(), group, time.Minute, &Config{}, nil)
+	e2 := k.Enrich(context.Background(), group, time.Minute, &Config{}, nil)
+
+	if got := atomic.LoadInt32(&podHits); got != 1 {
+		t.Errorf("namespace pod list read %d times, want 1 per flush", got)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 1 {
+		t.Errorf("node list read %d times, want 1 per flush", got)
+	}
+	for i, e := range []Enrichment{e1, e2} {
+		if !e.NodesInspected || len(e.Nodes) != 1 || e.Nodes[0] != "worker-9 NotReady: KubeletNotReady" {
+			t.Errorf("group %d node finding = %q (inspected %v), want the same finding both groups", i, e.Nodes, e.NodesInspected)
+		}
+		if !e.PodScanInspected || !e.SubjectPodObserved {
+			t.Errorf("group %d lost pod-scope findings through the memo: inspected %v, subject observed %v", i, e.PodScanInspected, e.SubjectPodObserved)
+		}
+	}
+}
+
+// A cached failure must keep every consequence the fresh failure drove: the
+// group still reports the scan as uninspected and names the gap in its
+// scope, and the apiserver is asked once per flush rather than once per
+// group (issue #374).
+func TestFlushReadsCachesFailedReadsPerFlush(t *testing.T) {
+	var podHits, nodeHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/namespaces/ns-a/pods":
+			atomic.AddInt32(&podHits, 1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/api/v1/nodes":
+			atomic.AddInt32(&nodeHits, 1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	k := (&kube{hc: srv.Client(), base: srv.URL}).withFlush()
+	group := Group{
+		Alerts:     []Alert{{Fingerprint: "fp-1", Labels: map[string]string{"alertname": "Alpha", "pod": "p1", "namespace": "ns-a"}}},
+		Namespaces: []string{"ns-a"},
+	}
+	e1 := k.Enrich(context.Background(), group, time.Minute, &Config{}, nil)
+	e2 := k.Enrich(context.Background(), group, time.Minute, &Config{}, nil)
+
+	if got := atomic.LoadInt32(&podHits); got != 1 {
+		t.Errorf("failed pod read retried per group: %d hits, want 1", got)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 1 {
+		t.Errorf("failed node read retried per group: %d hits, want 1", got)
+	}
+	for i, e := range []Enrichment{e1, e2} {
+		if e.PodScanInspected {
+			t.Errorf("group %d claims a namespace-wide negative after a failed pod read", i)
+		}
+		if !strings.Contains(e.Scope, "a namespace pod read did not succeed") {
+			t.Errorf("group %d scope omits the pod-read gap: %q", i, e.Scope)
+		}
+		if e.NodesInspected {
+			t.Errorf("group %d claims healthy nodes after a failed node read", i)
+		}
+	}
+}
+
+// The memo travels on a copy so the shared *kube stays immutable across the
+// drain overlap (issue #146); the shared client must never carry it, and a
+// nil client must survive the call (issue #374).
+func TestWithFlushKeepsSharedClientImmutable(t *testing.T) {
+	var nilK *kube
+	if nilK.withFlush() != nil {
+		t.Fatal("withFlush on a nil client must stay nil")
+	}
+	shared := &kube{base: "https://api.invalid"}
+	c := shared.withFlush()
+	if c == shared {
+		t.Fatal("withFlush returned the receiver, not a copy")
+	}
+	if c.flush == nil {
+		t.Fatal("the flushed copy carries no memo")
+	}
+	if shared.flush != nil {
+		t.Fatal("withFlush wrote the shared client")
+	}
+}
+
 // TestKubeGetContextCancelled verifies that a stalled apiserver call is
 // cancelled promptly when the caller's context is cancelled, rather than
 // blocking for the full http.Client.Timeout (15s).
