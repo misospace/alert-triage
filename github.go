@@ -278,9 +278,10 @@ func renderIssueBody(r Report, sig string) string {
 	}
 	b.WriteString("\n")
 
-	if evid := renderEvidence(r); evid != "" {
-		fmt.Fprintf(&b, "<details><summary>Evidence</summary>\n\n%s\n\n</details>\n\n", evid)
-	}
+	// renderEvidence always renders at least the identity block, so the
+	// evidence section is unconditional; the old empty-skip guard guarded
+	// nothing.
+	fmt.Fprintf(&b, "<details><summary>Evidence</summary>\n\n%s\n\n</details>\n\n", renderEvidence(r))
 
 	payloadJSON := renderPayload(r)
 	if payloadJSON != "" {
@@ -763,19 +764,9 @@ func parseFluxRevisionSHA(rev string) (sha string, ok bool) {
 // currently produced by Flux but the helper is kept strict so the parser
 // does not silently accept a truncated value.
 func isHex40(s string) bool {
-	if len(s) != 40 {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r >= '0' && r <= '9':
-		case r >= 'a' && r <= 'f':
-		case r >= 'A' && r <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
+	// The hex scan is enrich_redact.go's isHexRun; the length bound is what
+	// keeps this strict to SHA-1.
+	return len(s) == 40 && isHexRun(s)
 }
 
 // pathIntersects reports whether any changed file lives under one of the
@@ -1148,7 +1139,3 @@ func classifyCommit(ctx context.Context, gh *gitHubClient, repoURL, revision, wo
 }
 
 // clamp lives in enrich.go; the GitHub body builder reuses it.
-
-// renderEvidence assembles the cluster evidence collected during enrichment
-// into one Markdown section. Returns "" if there is nothing to show so the
-// <details> block is omitted entirely.

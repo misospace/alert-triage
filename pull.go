@@ -806,9 +806,10 @@ func prBody(r Report, patch *filePatch, digestURL string) string {
 	b.WriteString(strings.TrimRight(patch.diff, "\n"))
 	b.WriteString("\n```\n\n")
 
-	if evid := renderEvidence(r); evid != "" {
-		fmt.Fprintf(&b, "<details><summary>Evidence</summary>\n\n%s\n\n</details>\n\n", evid)
-	}
+	// renderEvidence always renders at least the identity block, so the
+	// evidence section is unconditional; the old empty-skip guard guarded
+	// nothing.
+	fmt.Fprintf(&b, "<details><summary>Evidence</summary>\n\n%s\n\n</details>\n\n", renderEvidence(r))
 
 	fmt.Fprintf(&b, "**Branch:** `%s`\n", patch.branch)
 	if digestURL != "" {
