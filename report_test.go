@@ -544,6 +544,18 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	}
 }
 
+// TestSessionIdRejectsKeyIdentitySplice pins the length-prefixed digest
+// input: a fingerprint is untrusted sender text and JSON lets it carry a NUL,
+// so with a bare separator one alert whose fingerprint embeds
+// "\x00fp:..." hashes the same as two alerts (issue #372 review).
+func TestSessionIdRejectsKeyIdentitySplice(t *testing.T) {
+	one := Group{Key: "K", Alerts: []Alert{{Fingerprint: "a\x00fp:b"}}}
+	two := Group{Key: "K", Alerts: []Alert{{Fingerprint: "a"}, {Fingerprint: "b"}}}
+	if sessionId(one) == sessionId(two) {
+		t.Fatalf("an embedded-NUL fingerprint merged two incidents into session id %q", sessionId(one))
+	}
+}
+
 // litellmSessionIDRE is the shape LiteLLM accepts for session ids
 // (litellm/proxy/litellm_pre_call_utils.py: alphanumerics, hyphen and
 // underscore, at least 8 chars). An id outside it is dropped upstream, so the
@@ -611,9 +623,12 @@ func TestNarrateSessionIdStableAcrossFires(t *testing.T) {
 // the header before conversion. A fingerprint-less alert must still yield a
 // usable id (identity() falls back to a labels hash).
 func TestNarrateSessionIdReachesAnthropicFormat(t *testing.T) {
-	var got string
+	var mu sync.Mutex
+	var got, path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("x-litellm-session-id")
+		mu.Lock()
+		got, path = r.Header.Get("x-litellm-session-id"), r.URL.Path
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"narrative\":\"n\",\"fix_location\":\"cluster\",\"confidence\":\"low\"}"}]}`)
 	}))
@@ -624,6 +639,11 @@ func TestNarrateSessionIdReachesAnthropicFormat(t *testing.T) {
 	}}}
 	if _, ok := Narrate(context.Background(), cfg, r); !ok {
 		t.Fatal("Narrate returned ok=false")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if path != "/messages" {
+		t.Fatalf("request went to %q, want the anthropic /messages route", path)
 	}
 	if !litellmSessionIDRE.MatchString(got) {
 		t.Fatalf("anthropic-format request carried session id %q, want a LiteLLM-acceptable id", got)

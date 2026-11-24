@@ -291,15 +291,25 @@ func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
 //
 // Members are keyed by Alert.identity() — the fingerprint, or a labels hash
 // when the sender omitted it — and sorted, so the id depends on who is in
-// the group, not on the order members arrived.
+// the group, not on the order members arrived. Membership changes (a member
+// recovers between fires) therefore start a new session; that is deliberate
+// and differs from Signature(), which keys history on names alone.
+//
+// The digest input length-prefixes each component: a fingerprint is untrusted
+// sender text and can carry NUL, so a bare "\x00" separator would let a
+// key/identity splice collide with a different incident's (issue #372 review).
 func sessionId(g Group) string {
 	ids := make([]string, 0, len(g.Alerts))
 	for _, a := range g.Alerts {
 		ids = append(ids, a.identity())
 	}
 	sort.Strings(ids)
-	sum := sha256.Sum256([]byte(g.Key + "\x00" + strings.Join(ids, "\x00")))
-	return "alert-triage-" + hex.EncodeToString(sum[:16])
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s", len(g.Key), g.Key)
+	for _, id := range ids {
+		fmt.Fprintf(h, "|%d:%s", len(id), id)
+	}
+	return "alert-triage-" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // Narrate asks the model for a story and a judgement about where a fix belongs.
