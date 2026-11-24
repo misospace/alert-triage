@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -540,6 +541,95 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "thinking block fallback narrative" {
 		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
+	}
+}
+
+// litellmSessionIDRE is the shape LiteLLM accepts for session ids
+// (litellm/proxy/litellm_pre_call_utils.py: alphanumerics, hyphen and
+// underscore, at least 8 chars). An id outside it is dropped upstream, so the
+// header would silently stop grouping traces.
+var litellmSessionIDRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,}$`)
+
+// TestNarrateSessionIdStableAcrossFires is the acceptance test for issue #372:
+// the model call must carry x-litellm-session-id, and repeated fires of the
+// same incident — including a replay whose members arrive in a different
+// order — must carry the same id so LiteLLM groups their traces into one
+// session, while a different incident must not reuse it.
+func TestNarrateSessionIdStableAcrossFires(t *testing.T) {
+	var mu sync.Mutex
+	var ids []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ids = append(ids, r.Header.Get("x-litellm-session-id"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"narrative\":\"n\",\"fix_location\":\"cluster\",\"confidence\":\"low\"}"}}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+
+	group := Group{Key: "alert/HighCPU", Alerts: []Alert{
+		{Fingerprint: "fp-b", Labels: map[string]string{"alertname": "HighCPU"}},
+		{Fingerprint: "fp-a", Labels: map[string]string{"alertname": "HighMem"}},
+	}}
+	fires := []Group{
+		group,
+		group,
+		// Same members, reversed arrival order: the id keys on who is in
+		// the group, not on payload order.
+		{Key: group.Key, Alerts: []Alert{group.Alerts[1], group.Alerts[0]}},
+	}
+	for i, g := range fires {
+		if _, ok := Narrate(context.Background(), cfg, Report{Group: g}); !ok {
+			t.Fatalf("fire %d: Narrate returned ok=false", i)
+		}
+	}
+	if _, ok := Narrate(context.Background(), cfg, Report{
+		Group: Group{Key: "namespace/other", Alerts: []Alert{{Fingerprint: "fp-c"}}},
+	}); !ok {
+		t.Fatal("different incident: Narrate returned ok=false")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 4 {
+		t.Fatalf("server saw %d requests, want 4", len(ids))
+	}
+	if !litellmSessionIDRE.MatchString(ids[0]) {
+		t.Errorf("session id %q is not a shape LiteLLM accepts", ids[0])
+	}
+	if ids[1] != ids[0] || ids[2] != ids[0] {
+		t.Errorf("session id changed across repeated fires: %q, %q, %q", ids[0], ids[1], ids[2])
+	}
+	if ids[3] == ids[0] {
+		t.Errorf("a different incident reused session id %q", ids[3])
+	}
+}
+
+// TestNarrateSessionIdReachesAnthropicFormat pins that the same header is set
+// on the /messages request, where the body shape differs but the proxy reads
+// the header before conversion. A fingerprint-less alert must still yield a
+// usable id (identity() falls back to a labels hash).
+func TestNarrateSessionIdReachesAnthropicFormat(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("x-litellm-session-id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"narrative\":\"n\",\"fix_location\":\"cluster\",\"confidence\":\"low\"}"}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "anthropic", "claude")
+	r := Report{Group: Group{Key: "single/DiskFull", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "DiskFull", "namespace": "n1"}},
+	}}}
+	if _, ok := Narrate(context.Background(), cfg, r); !ok {
+		t.Fatal("Narrate returned ok=false")
+	}
+	if !litellmSessionIDRE.MatchString(got) {
+		t.Fatalf("anthropic-format request carried session id %q, want a LiteLLM-acceptable id", got)
+	}
+	if got != sessionId(r.Group) {
+		t.Fatalf("header %q does not match sessionId(group) %q", got, sessionId(r.Group))
 	}
 }
 

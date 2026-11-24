@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -274,6 +276,32 @@ func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
 	return body, err
 }
 
+// sessionId derives the LiteLLM session id for a group's narration. LiteLLM
+// reads x-litellm-session-id on both its OpenAI-compatible and Anthropic
+// routes and groups spend-log and trace rows by it, so repeated fires of the
+// same incident must produce the same id while different incidents must not
+// collide (issue #372).
+//
+// The raw inputs cannot ride the header: Group.Key echoes alert-supplied
+// bucket values that a header cannot hold (spaces, non-ASCII), and sender
+// text may carry secrets, so the id is a hash of them rendered as hex with a
+// constant prefix. The prefix names this producer in traces and keeps the
+// value inside the shape LiteLLM accepts for session ids (alphanumerics,
+// hyphen, underscore, at least 8 chars).
+//
+// Members are keyed by Alert.identity() — the fingerprint, or a labels hash
+// when the sender omitted it — and sorted, so the id depends on who is in
+// the group, not on the order members arrived.
+func sessionId(g Group) string {
+	ids := make([]string, 0, len(g.Alerts))
+	for _, a := range g.Alerts {
+		ids = append(ids, a.identity())
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(g.Key + "\x00" + strings.Join(ids, "\x00")))
+	return "alert-triage-" + hex.EncodeToString(sum[:16])
+}
+
 // Narrate asks the model for a story and a judgement about where a fix belongs.
 // A failure here is not fatal: the digest still ships with its evidence, just
 // without the summary. The caller's context bounds the in-flight model call, so
@@ -317,6 +345,10 @@ func Narrate(ctx context.Context, cfg *Config, r Report) (Triage, bool) {
 		return Triage{}, false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Same id on every API format: the proxy reads x-litellm-session-id
+	// before converting either route, so one header groups this incident's
+	// traces on both the OpenAI-compatible and Anthropic paths.
+	req.Header.Set("x-litellm-session-id", sessionId(r.Group))
 	if cfg.LiteLLMKey != "" {
 		if strings.EqualFold(cfg.APIFormat, "anthropic") {
 			req.Header.Set("x-api-key", cfg.LiteLLMKey)
