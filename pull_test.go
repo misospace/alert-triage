@@ -1498,6 +1498,9 @@ func TestDeliverPullRetriesFailedReconcile(t *testing.T) {
 	// A failed seed must not be cached: the next attempt retries, and when it
 	// succeeds the day's budget reflects PRs the process never saw. Otherwise
 	// one transient 5xx would quietly reinstate the per-process cap (#383).
+	// The retry seed includes the PR this process itself opened, so the fold
+	// must adopt the GitHub count (max): adding it to the local count would
+	// double-count that PR and cap the second attempt instead of opening.
 	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	orig := timeNow
 	defer func() { timeNow = orig }()
@@ -1510,13 +1513,14 @@ func TestDeliverPullRetriesFailedReconcile(t *testing.T) {
 				_ = json.NewEncoder(w).Encode([]ghPR{})
 				return
 			}
-			// First seed fails; the retry sees two PRs this process never
-			// opened, spending the cap of 2.
+			// First seed fails; the retry sees the PR this process opened
+			// plus one it never saw, spending two of the cap of three.
 			if allGets.Add(1) == 1 {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "pre-restart-1"), CreatedAt: now}, {Body: fmt.Sprintf(prMarker, "pre-restart-2"), CreatedAt: now}})
+			own := fmt.Sprintf(prMarker, triageReport().Group.Signature())
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: own, CreatedAt: now}, {Body: fmt.Sprintf(prMarker, "pre-restart"), CreatedAt: now}})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
 			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/git/ref/heads/main":
@@ -1536,7 +1540,7 @@ func TestDeliverPullRetriesFailedReconcile(t *testing.T) {
 	defer srv.Close()
 	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
 	cfg := prCfg()
-	cfg.DailyCap = 2
+	cfg.DailyCap = 3
 
 	act, err := deliverPull(context.Background(), gh, cfg, triageReport())
 	if err != nil || act.Outcome != "created" {
@@ -1545,11 +1549,17 @@ func TestDeliverPullRetriesFailedReconcile(t *testing.T) {
 	r2 := triageReport()
 	r2.Group.Alerts[0].Labels["alertname"] = "ContainerOOMKilled"
 	act, err = deliverPull(context.Background(), gh, cfg, r2)
-	if err != nil || act.Outcome != "capped" {
-		t.Fatalf("attempt 2 after the retry seeds the pre-restart PRs: action=%+v err=%v", act, err)
+	if err != nil || act.Outcome != "created" {
+		t.Fatalf("attempt 2 must open (max fold, not addition): action=%+v err=%v", act, err)
 	}
-	if allGets.Load() != 2 || creates.Load() != 1 || puts.Load() != 1 {
-		t.Fatalf("all=%d creates=%d puts=%d; want the seed retried once and no second write", allGets.Load(), creates.Load(), puts.Load())
+	r3 := triageReport()
+	r3.Group.Alerts[0].Labels["alertname"] = "OOMKilled"
+	act, err = deliverPull(context.Background(), gh, cfg, r3)
+	if err != nil || act.Outcome != "capped" {
+		t.Fatalf("attempt 3 must hit the cap the seed counted: action=%+v err=%v", act, err)
+	}
+	if allGets.Load() != 2 || creates.Load() != 2 || puts.Load() != 2 {
+		t.Fatalf("all=%d creates=%d puts=%d; want the seed retried once and exactly two writes", allGets.Load(), creates.Load(), puts.Load())
 	}
 }
 

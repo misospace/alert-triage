@@ -159,10 +159,11 @@ func utcDayStart(t time.Time) time.Time {
 // with callers concurrent to the fold the day can overshoot the cap by at
 // most the number of in-flight reservations; the delivery loop invokes this
 // sequentially, so no reservation is ever in flight in the shipped wiring.
-// Runs at most once per process per calendar day: a successful seed records
-// reconciledDay and suppresses further calls, while a failed seed records
-// nothing and is retried by the next attempt — falling back to the
-// process-local count for the day only if every seed keeps failing.
+// A seed succeeds at most once per process per calendar day: a successful
+// seed records reconciledDay and suppresses further calls, while a failed
+// seed records nothing and is retried by each subsequent attempt — so a day
+// whose seed keeps failing pays at most one paginated scan (bounded at 20
+// pages) per eligible group, and degrades to the process-local count.
 // Multi-replica deployments still multiply the cap; there is no cross-process
 // lock, and this only repairs the single-process case the counter models. An
 // error is returned to the caller, which degrades to the process-local count
@@ -590,7 +591,8 @@ func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage i
 // is an error, and the caller degrades to the process-local count.
 func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
 	count := 0
-	for page := 1; page <= 20; page++ {
+	page := 1
+	for {
 		prs, next, err := g.listPRsByCreatedDesc(ctx, page, 100)
 		if err != nil {
 			return 0, err
@@ -609,8 +611,11 @@ func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since tim
 		if next == 0 {
 			return count, nil
 		}
+		page = next
+		if page > 20 {
+			return 0, fmt.Errorf("github pr count: day scan hit the 20-page bound with more pages left")
+		}
 	}
-	return 0, fmt.Errorf("github pr count: day scan hit the 20-page bound with more pages left")
 }
 
 // listPRs returns one page of open PRs and the next page number (0 when the
