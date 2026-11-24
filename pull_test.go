@@ -1249,3 +1249,240 @@ func TestGetFileCapsOverSizeResponse(t *testing.T) {
 		t.Errorf("error = %q, want substring %q", err.Error(), "exceeded")
 	}
 }
+
+func TestPRMarkerPrefixPinned(t *testing.T) {
+	if !strings.HasPrefix(fmt.Sprintf(prMarker, "abc"), prMarkerPrefix) || strings.Contains(prMarkerPrefix, "%") {
+		t.Fatalf("marker prefix %q does not safely match the marker", prMarkerPrefix)
+	}
+}
+
+func TestUTCDayStart(t *testing.T) {
+	zone := time.FixedZone("UTC+2", 2*60*60)
+	cases := []struct {
+		in   time.Time
+		want time.Time
+	}{
+		{time.Date(2026, 8, 19, 15, 30, 0, 0, time.UTC), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC)},
+		{time.Date(2026, 8, 19, 1, 30, 0, 0, zone), time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range cases {
+		if got := utcDayStart(tc.in); !got.Equal(tc.want) {
+			t.Errorf("utcDayStart(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCountMarkerPRsCreatedSince(t *testing.T) {
+	gets := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if r.URL.Query().Get("state") != "all" || r.URL.Query().Get("sort") != "created" || r.URL.Query().Get("direction") != "desc" {
+			t.Errorf("unexpected query: %s", r.URL.RawQuery)
+		}
+		switch r.URL.Query().Get("page") {
+		case "1":
+			w.Header().Set("Link", `<https://api.example/pulls?page=2>; rel="next"`)
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}, {Body: "other", CreatedAt: time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)}})
+		case "2":
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "yesterday"), CreatedAt: time.Date(2026, 8, 18, 23, 0, 0, 0, time.UTC)}, {Body: fmt.Sprintf(prMarker, "older"), CreatedAt: time.Date(2026, 8, 17, 23, 0, 0, 0, time.UTC)}})
+		default:
+			t.Errorf("unexpected page request: %s", r.URL.Query().Get("page"))
+		}
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	got, err := gh.countMarkerPRsCreatedSince(context.Background(), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
+	if err != nil || got != 1 || gets != 2 {
+		t.Fatalf("count=%d gets=%d err=%v; want 1, 2, nil", got, gets, err)
+	}
+}
+
+func TestCountMarkerPRsStopsAtSafetyCap(t *testing.T) {
+	gets := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		gets++
+		if page != fmt.Sprint(gets) || r.URL.Query().Get("per_page") != "100" {
+			t.Errorf("unexpected page/per_page: %s/%s", page, r.URL.Query().Get("per_page"))
+		}
+		if gets < 21 {
+			w.Header().Set("Link", fmt.Sprintf(`<https://api.example/pulls?page=%d>; rel="next"`, gets+1))
+		}
+		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}})
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	got, err := gh.countMarkerPRsCreatedSince(context.Background(), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
+	if err != nil || got != 20 || gets != 20 {
+		t.Fatalf("count=%d gets=%d err=%v; want 20, 20, nil", got, gets, err)
+	}
+}
+
+func markerListServer(t *testing.T, prs []ghPR, calls *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*calls++
+		_ = json.NewEncoder(w).Encode(prs)
+	}))
+}
+
+func TestReconcileAllowanceSeedsCounterAndKeepsInFlight(t *testing.T) {
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	cfg := &PRConfig{DailyCap: 3}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if !cfg.reserveAllowance(now) {
+			t.Error("concurrent in-flight reservation denied")
+		}
+		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "a"), CreatedAt: now}, {Body: fmt.Sprintf(prMarker, "b"), CreatedAt: now}})
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	if err := cfg.reconcileAllowance(context.Background(), gh, now); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.reserveAllowance(now) || cfg.reserveAllowance(now) {
+		t.Fatal("GitHub count should combine with the in-flight reservation to fill exactly the cap")
+	}
+	if err := cfg.reconcileAllowance(context.Background(), gh, now.Add(time.Hour)); err != nil || calls != 1 {
+		t.Fatalf("second reconciliation calls=%d err=%v", calls, err)
+	}
+}
+
+func TestReconcileAllowanceDayRollsReseeds(t *testing.T) {
+	dayA := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		count := 2
+		created := dayA
+		if calls > 1 {
+			count = 0
+			created = dayA.Add(24 * time.Hour)
+		}
+		prs := make([]ghPR, count)
+		for i := range prs {
+			prs[i] = ghPR{Body: fmt.Sprintf(prMarker, fmt.Sprint(i)), CreatedAt: created}
+		}
+		_ = json.NewEncoder(w).Encode(prs)
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	cfg := &PRConfig{DailyCap: 1}
+	if err := cfg.reconcileAllowance(context.Background(), gh, dayA); err != nil {
+		t.Fatal(err)
+	}
+	dayB := dayA.Add(24 * time.Hour)
+	if err := cfg.reconcileAllowance(context.Background(), gh, dayB); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.reserveAllowance(dayB) || cfg.reserveAllowance(dayB) {
+		t.Fatal("day B must have an independent one-slot budget")
+	}
+}
+
+func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	orig := timeNow
+	defer func() { timeNow = orig }()
+	timeNow = func() time.Time { return now }
+	var creates, puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
+			if r.URL.Query().Get("state") == "open" {
+				_ = json.NewEncoder(w).Encode([]ghPR{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "othersig-1"), CreatedAt: now}, {Body: fmt.Sprintf(prMarker, "othersig-2"), CreatedAt: now}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
+			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/git/ref/heads/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "headsha123"}})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(patchableManifest)), "sha": "blobsha123", "encoding": "base64", "type": "file"})
+		case r.Method == http.MethodPut:
+			puts++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/pulls":
+			creates++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+	cfg := prCfg()
+	cfg.DailyCap = 2
+	act, err := deliverPull(context.Background(), &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}, cfg, triageReport())
+	if err != nil || act.Outcome != "capped" || creates != 0 || puts != 0 {
+		t.Fatalf("action=%+v creates=%d puts=%d err=%v; want capped without writes", act, creates, puts, err)
+	}
+}
+
+func TestDeliverPullReconcilesOncePerDay(t *testing.T) {
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	orig := timeNow
+	defer func() { timeNow = orig }()
+	timeNow = func() time.Time { return now }
+	allGets, openGets, creates := 0, 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
+			if r.URL.Query().Get("state") == "all" {
+				allGets++
+				_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "seed"), CreatedAt: now}})
+			} else {
+				openGets++
+				_ = json.NewEncoder(w).Encode([]ghPR{})
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
+			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/git/ref/heads/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "headsha123"}})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(patchableManifest)), "sha": "blobsha123", "encoding": "base64", "type": "file"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/pulls":
+			creates++
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	cfg := prCfg()
+	cfg.DailyCap = 5
+	for i := 0; i < 2; i++ {
+		r := triageReport()
+		if i == 1 {
+			r.Group.Alerts[0].Labels["alertname"] = "ContainerOOMKilled"
+		}
+		act, err := deliverPull(context.Background(), gh, cfg, r)
+		if err != nil || act.Outcome != "created" {
+			t.Fatalf("attempt %d: action=%+v err=%v", i+1, act, err)
+		}
+	}
+	if allGets != 1 || openGets != 2 || creates != 2 {
+		t.Fatalf("all=%d open=%d creates=%d; want 1, 2, 2", allGets, openGets, creates)
+	}
+}
+
+func TestDeliverPullReconcileFailureDegrades(t *testing.T) {
+	f := newFakeGH(t, nil, 0)
+	orig := f.srv.Config.Handler
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls" && r.URL.Query().Get("state") == "all" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		orig.ServeHTTP(w, r)
+	})
+	act, err := deliverPull(context.Background(), f.client(), prCfg(), triageReport())
+	if err != nil || act.Outcome != "created" {
+		t.Fatalf("action=%+v err=%v; reconciliation failure should degrade", act, err)
+	}
+}

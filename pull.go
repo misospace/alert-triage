@@ -24,7 +24,9 @@ package main
 //     PR carrying the marker and comments on it instead of opening a second.
 //   - Branches always fork off the default branch HEAD; the default branch
 //     itself is never written.
-//   - New PRs are capped per calendar day; the trip is logged.
+//   - New PRs are capped per calendar day; the counter is seeded once per
+//     process-day from this arm's PRs created that day, so a restart does not
+//     reset the budget. The trip is logged.
 //   - Any API failure (revoked token, timeout, 4xx/5xx) is logged and degrades
 //     to "proposal only". It never blocks the digest.
 
@@ -48,6 +50,9 @@ import (
 // durable identity regardless of which GitHub surface it first reaches.
 const prMarker = signatureMarker
 
+// prMarkerPrefix ends before the signature, identifying PRs authored by this arm.
+const prMarkerPrefix = `<!-- alert-triage:{"sig":"`
+
 // defaultPRDailyCap is the per-day budget for NEW PRs when
 // GITHUB_PR_DAILY_CAP is unset or malformed. Deliberately small: a PR is a
 // proposed code change, not a log line, so the arm stays quiet unless a human
@@ -56,16 +61,18 @@ const defaultPRDailyCap = 5
 
 // PRConfig is the opt-in plus gates for the PR write arm. It is nil unless
 // every hard prerequisite is configured so the rest of the program can treat
-// "off" as "no behaviour change".
+// "off" as "no behaviour change". day/opened model the cap window and are
+// reconciled from GitHub (see reconcileAllowance).
 type PRConfig struct {
 	OptIn     bool
 	Allowlist []string
 	DailyCap  int
 	PublicURL string // optional public base URL; digest link is only emitted when set
 
-	mu     sync.Mutex
-	day    string // calendar day ("2006-01-02") for the current cap window
-	opened int    // PRs created within that window
+	mu            sync.Mutex
+	day           string // calendar day ("2006-01-02") for the current cap window
+	opened        int    // PRs created within that window
+	reconciledDay string // day already seeded from GitHub
 }
 
 // loadPRConfig reads the PR env vars. It returns nil when opt-in is off or a
@@ -135,6 +142,52 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// utcDayStart truncates t to the start of its UTC calendar day: the instant
+// the current cap window began.
+func utcDayStart(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// reconcileAllowance seeds the process-local counter from GitHub so the cap
+// survives a restart. A restart resets `opened` to zero while PRs opened
+// earlier that day remain on the forge, which would turn the effective cap
+// into DailyCap x restarts. The count is folded with max() rather than
+// assigned: a reservation taken by a concurrent caller between the API read
+// and this fold is not on GitHub yet, and max() preserves it, while a fresh
+// process (opened == 0) adopts the GitHub count. Runs at most once per
+// process per calendar day — after it, the reservation bookkeeping above is
+// exact on its own. Multi-replica deployments still multiply the cap; there
+// is no cross-process lock, and this only repairs the single-process case
+// the counter models. An error is returned to the caller, which degrades to
+// the process-local count rather than blocking the write.
+func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now time.Time) error {
+	day := now.UTC().Format("2006-01-02")
+	c.mu.Lock()
+	if c.reconciledDay == day || (c.day == day && c.opened > 0) {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.day != day {
+		c.day = day
+		c.opened = 0
+	}
+	if n > c.opened {
+		c.opened = n
+	}
+	c.reconciledDay = day
+	return nil
+}
+
 // reserveAllowance takes one slot from the per-day budget for a NEW PR,
 // rolling the window forward when the calendar day changes. It returns false
 // when the cap is already spent. The slot is *reserved*, not yet spent: the
@@ -142,7 +195,9 @@ func splitCSV(s string) []string {
 // fails, so a branch/file/PR creation error does not burn the day's budget.
 // Updates to existing PRs never call this. Safe for concurrent callers: at
 // most DailyCap slots can be reserved at once, and every reservation that ends
-// in a successful open is exactly one real PR.
+// in a successful open is exactly one real PR. The counter is seeded from
+// GitHub by reconcileAllowance; this exactness holds after that seed within a
+// process-day.
 func (c *PRConfig) reserveAllowance(now time.Time) bool {
 	day := now.UTC().Format("2006-01-02")
 	c.mu.Lock()
@@ -238,9 +293,12 @@ func deliverPull(ctx context.Context, gh *gitHubClient, prcfg *PRConfig, r Repor
 		return PRAction{}, err
 	}
 
-	// One clock reading for reserve and the matching refund, so the two are
-	// guaranteed to agree on which calendar window the slot belongs to.
+	// One clock reading for reconcile, reserve and the matching refund, so
+	// all three agree on which calendar window the slot belongs to.
 	now := timeNow()
+	if err := prcfg.reconcileAllowance(ctx, gh, now); err != nil {
+		logf("github-pr: daily-cap reconciliation unavailable; using process-local count: %v", err)
+	}
 	if !prcfg.reserveAllowance(now) {
 		logf("github-pr: daily cap %d reached; proposal stays open for %s", prcfg.DailyCap, sig)
 		return PRAction{Outcome: "capped"}, nil
@@ -440,12 +498,13 @@ var (
 // --- GitHub PR API ---
 
 type ghPR struct {
-	Number  int    `json:"number"`
-	State   string `json:"state"`
-	Title   string `json:"title"`
-	Body    string `json:"body"`
-	HTMLURL string `json:"html_url"`
-	Head    struct {
+	Number    int       `json:"number"`
+	State     string    `json:"state"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	HTMLURL   string    `json:"html_url"`
+	CreatedAt time.Time `json:"created_at"`
+	Head      struct {
 		Ref string `json:"ref"`
 	} `json:"head"`
 	Base struct {
@@ -478,6 +537,74 @@ func (g *gitHubClient) findOpenPR(ctx context.Context, sig string) (*ghPR, error
 			return nil, nil
 		}
 	}
+}
+
+// listPRsByCreatedDesc returns one page of PRs across every state, newest
+// first. state=all matters: a PR created today and already merged or closed
+// still spent the day's budget, so the cap count must see it.
+func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage int) ([]ghPR, int, error) {
+	u, _ := url.Parse(g.apiURL + "/repos/" + g.repo + "/pulls")
+	q := u.Query()
+	q.Set("state", "all")
+	q.Set("sort", "created")
+	q.Set("direction", "desc")
+	q.Set("per_page", fmt.Sprintf("%d", perPage))
+	q.Set("page", fmt.Sprintf("%d", page))
+	u.RawQuery = q.Encode()
+	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, 0, githubStatusError("github pr list by created", resp)
+	}
+	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	if err != nil {
+		return nil, 0, fmt.Errorf("github pr list by created: %w", err)
+	}
+	var raw []ghPR
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, 0, err
+	}
+	next := 0
+	if link := resp.Header.Get("Link"); link != "" {
+		next = parseNextPage(link)
+	}
+	return raw, next, nil
+}
+
+// countMarkerPRsCreatedSince counts PRs authored by this arm since the UTC
+// day boundary. Newest-first ordering allows an early stop at the first older
+// PR; malformed timestamps are skipped without ending the scan. Pagination is
+// bounded like findOpenPR: 2000 arm-authored PRs in one day is far past any
+// sane cap, and a truncated count still exceeds the reservation limit.
+func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
+	count := 0
+	for page := 1; page <= 20; page++ {
+		prs, next, err := g.listPRsByCreatedDesc(ctx, page, 100)
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if pr.CreatedAt.IsZero() {
+				continue
+			}
+			if pr.CreatedAt.Before(since) {
+				return count, nil
+			}
+			if strings.Contains(pr.Body, prMarkerPrefix) {
+				count++
+			}
+		}
+		if next == 0 {
+			return count, nil
+		}
+		if page == 20 {
+			return count, nil
+		}
+	}
+	return count, nil
 }
 
 // listPRs returns one page of open PRs and the next page number (0 when the
