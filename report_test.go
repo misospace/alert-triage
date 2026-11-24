@@ -587,9 +587,11 @@ func TestSessionIdIncludesCluster(t *testing.T) {
 }
 
 // litellmSessionIDRE is the shape LiteLLM accepts for session ids
-// (litellm/proxy/litellm_pre_call_utils.py: alphanumerics, hyphen and
-// underscore, at least 8 chars). An id outside it is dropped upstream, so the
-// header would silently stop grouping traces.
+// (litellm/proxy/litellm_pre_call_utils.py: _SESSION_ID_VALUE_RE,
+// alphanumerics, hyphen and underscore, at least 8 chars). Upstream applies
+// it to inferred vendor headers, and non-conforming values are dropped
+// silently rather than rejected, so this pin is the load-bearing guard:
+// outside the shape, trace grouping is lost with no error anywhere.
 var litellmSessionIDRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,}$`)
 
 // TestNarrateSessionIdStableAcrossFires is the acceptance test for issue #372:
