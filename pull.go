@@ -59,6 +59,15 @@ const prMarkerPrefix = `<!-- alert-triage:{"sig":"`
 // has raised the cap to match the incident volume.
 const defaultPRDailyCap = 5
 
+// prSeedScanBudget bounds one seed scan's share of the caller's context. The
+// scan pages up to 20 API responses before the write it precedes, and both
+// run on the caller's single PR-write budget; without a bound of its own a
+// scan that hangs (a stalled proxy, a wedged connection) pins reconciliation
+// until the caller's deadline and leaves the write no context to run in. A
+// scan that outlives the budget fails like any other scan failure and
+// degrades to the process-local count. Var only so tests can shrink it.
+var prSeedScanBudget = 15 * time.Second
+
 // PRConfig is the opt-in plus gates for the PR write arm. It is nil unless
 // every hard prerequisite is configured so the rest of the program can treat
 // "off" as "no behaviour change". day/opened model the cap window and are
@@ -171,11 +180,15 @@ func utcDayStart(t time.Time) time.Time {
 // the scan while the rest wait on it, so at most one scan is in flight; a
 // waiter adopts a successful seed, and a failed one is retried by a single
 // new scan at a time. Waiting honours ctx, so a cancelled caller degrades
-// like any other reconciliation failure. Multi-replica deployments still
-// multiply the cap; there is no cross-process lock, and this only repairs
-// the single-process case the counter models. An error is returned to the
-// caller, which degrades to the process-local count rather than blocking
-// the write.
+// like any other reconciliation failure. The scan runs on a budget of its
+// own (prSeedScanBudget) inside ctx: it shares the caller's PR-write budget
+// with the write this reconciliation gates, so a scan that hangs must fail
+// the seed — which degrades to the process-local count — rather than pin
+// reconciliation until the caller's deadline and starve that write.
+// Multi-replica deployments still multiply the cap; there is no
+// cross-process lock, and this only repairs the single-process case the
+// counter models. An error is returned to the caller, which degrades to the
+// process-local count rather than blocking the write.
 func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now time.Time) error {
 	day := now.UTC().Format("2006-01-02")
 	for {
@@ -213,7 +226,17 @@ func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now
 			c.mu.Unlock()
 		}()
 
-		n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
+		// The scan carries a budget of its own inside ctx (see
+		// prSeedScanBudget): capture its error before cancel so a plain API
+		// failure — whose ctx is still alive — is reported as-is, and only a
+		// scan outliving its budget is named as such for the operator log.
+		scanCtx, cancel := context.WithTimeout(ctx, prSeedScanBudget)
+		n, err := gh.countMarkerPRsCreatedSince(scanCtx, utcDayStart(now))
+		scanErr := scanCtx.Err()
+		cancel()
+		if err != nil && ctx.Err() == nil && scanErr != nil {
+			err = fmt.Errorf("seed scan outlived its %s budget: %w", prSeedScanBudget, err)
+		}
 
 		c.mu.Lock()
 		if err == nil {

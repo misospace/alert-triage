@@ -1515,6 +1515,63 @@ func TestReconcileAllowanceDayRollsReseeds(t *testing.T) {
 	}
 }
 
+func TestReconcileAllowanceScanBudgetBoundsSeedScan(t *testing.T) {
+	// The seed scan and the write it precedes share the caller's context, so
+	// a scan that hangs must fail at a budget of its own: run on the caller's
+	// deadline alone, it would pin reconciliation until that deadline and
+	// leave the write the allowance is computed for no context to run in.
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	cfg := &PRConfig{DailyCap: 2}
+	var gets atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		<-r.Context().Done() // upstream never answers; cut when the request's context does
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+
+	orig := prSeedScanBudget
+	defer func() { prSeedScanBudget = orig }()
+	prSeedScanBudget = 50 * time.Millisecond
+
+	// The parent context is generous: a regression that runs the scan on the
+	// caller's deadline blocks for all of it and trips the elapsed bound.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := cfg.reconcileAllowance(ctx, gh, now)
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the scan budget to fail the seed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("want the budget named in the error for the operator log, got %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("reconcile blocked %v; the scan must fail at its own budget, not the caller's deadline", elapsed)
+	}
+	if cfg.reconciledDay != "" {
+		t.Fatal("a budget-failed seed must not be cached")
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("expected exactly one scan request, got %d", gets.Load())
+	}
+
+	// A budget failure is an ordinary failed seed: nothing is cached, and the
+	// next attempt retries it against a healthy upstream.
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "a"), CreatedAt: now}})
+	}))
+	defer healthy.Close()
+	retry := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: healthy.URL}
+	if err := cfg.reconcileAllowance(context.Background(), retry, now); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.reconciledDay == "" || cfg.opened != 1 {
+		t.Fatalf("retry must seed normally; day=%q opened=%d", cfg.reconciledDay, cfg.opened)
+	}
+}
+
 func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
 	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	orig := timeNow
