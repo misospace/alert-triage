@@ -1373,6 +1373,55 @@ func TestReconcileAllowanceSeedsCounterAndKeepsInFlight(t *testing.T) {
 	}
 }
 
+func TestReconcileAllowanceConcurrentCallersCoalesce(t *testing.T) {
+	// The day check and the reconciledDay write are not atomic on their own:
+	// callers arriving while a seed scan is in flight must wait on it instead
+	// of each issuing the same day's scan, or a burst would reconcile one day
+	// several times over.
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	cfg := &PRConfig{DailyCap: 2}
+	var scans atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scans.Add(1)
+		<-release // hold the scan open so later callers must find it in flight
+		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "a"), CreatedAt: now}})
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+
+	const callers = 8
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = cfg.reconcileAllowance(context.Background(), gh, now)
+		}(i)
+	}
+	// Let every caller pile onto the in-flight scan before it finishes. The
+	// scans==1 assertion is structural, so this sleep only buys discrimination
+	// against a regression to un-coalesced callers.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if scans.Load() != 1 {
+		t.Fatalf("scans=%d; concurrent callers must coalesce onto exactly one seed scan", scans.Load())
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	// The seed counted one marker PR, so of the cap of two exactly one slot
+	// remains.
+	if !cfg.reserveAllowance(now) || cfg.reserveAllowance(now) {
+		t.Fatal("seed must adopt the GitHub count, leaving exactly one slot of two")
+	}
+}
+
 func TestReconcileAllowanceDayRollsReseeds(t *testing.T) {
 	dayA := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	var calls atomic.Int32

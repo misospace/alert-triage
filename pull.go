@@ -70,9 +70,10 @@ type PRConfig struct {
 	PublicURL string // optional public base URL; digest link is only emitted when set
 
 	mu            sync.Mutex
-	day           string // calendar day ("2006-01-02") for the current cap window
-	opened        int    // PRs created within that window
-	reconciledDay string // day already seeded from GitHub
+	day           string        // calendar day ("2006-01-02") for the current cap window
+	opened        int           // PRs created within that window
+	reconciledDay string        // day already seeded from GitHub
+	seeding       chan struct{} // non-nil while one seed scan is in flight; closed when it ends
 }
 
 // loadPRConfig reads the PR env vars. It returns nil when opt-in is off or a
@@ -164,35 +165,57 @@ func utcDayStart(t time.Time) time.Time {
 // seed records nothing and is retried by each subsequent attempt — so a day
 // whose seed keeps failing pays at most one paginated scan (bounded at 20
 // pages) per eligible group, and degrades to the process-local count.
-// Multi-replica deployments still multiply the cap; there is no cross-process
-// lock, and this only repairs the single-process case the counter models. An
-// error is returned to the caller, which degrades to the process-local count
-// rather than blocking the write.
+// Concurrent callers coalesce: the first arrival for an unseeded day runs
+// the scan while the rest wait on it, so at most one scan is in flight; a
+// waiter adopts a successful seed, and a failed one is retried by a single
+// new scan at a time. Waiting honours ctx, so a cancelled caller degrades
+// like any other reconciliation failure. Multi-replica deployments still
+// multiply the cap; there is no cross-process lock, and this only repairs
+// the single-process case the counter models. An error is returned to the
+// caller, which degrades to the process-local count rather than blocking
+// the write.
 func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now time.Time) error {
 	day := now.UTC().Format("2006-01-02")
-	c.mu.Lock()
-	done := c.reconciledDay == day
-	c.mu.Unlock()
-	if done {
-		return nil
-	}
+	for {
+		c.mu.Lock()
+		if c.reconciledDay == day {
+			c.mu.Unlock()
+			return nil
+		}
+		if inFlight := c.seeding; inFlight != nil {
+			// A seed for this day is already running: wait for it rather
+			// than issuing a second scan, then loop to adopt its outcome —
+			// success short-circuits on the reconciledDay check, failure
+			// is retried by exactly one new scan at a time.
+			c.mu.Unlock()
+			select {
+			case <-inFlight:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		c.seeding = make(chan struct{})
+		c.mu.Unlock()
 
-	n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
-	if err != nil {
+		n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
+
+		c.mu.Lock()
+		close(c.seeding)
+		c.seeding = nil
+		if err == nil {
+			if c.day != day {
+				c.day = day
+				c.opened = 0
+			}
+			if n > c.opened {
+				c.opened = n
+			}
+			c.reconciledDay = day
+		}
+		c.mu.Unlock()
 		return err
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.day != day {
-		c.day = day
-		c.opened = 0
-	}
-	if n > c.opened {
-		c.opened = n
-	}
-	c.reconciledDay = day
-	return nil
 }
 
 // reserveAllowance takes one slot from the per-day budget for a NEW PR,
