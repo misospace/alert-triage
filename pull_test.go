@@ -1347,6 +1347,32 @@ func TestCountMarkerPRsFailsLoudAtSafetyCap(t *testing.T) {
 	}
 }
 
+func TestCountMarkerPRsRejectsNonAdvancingPagination(t *testing.T) {
+	// A Link header that always advertises the page just fetched would pin
+	// the scan there forever: the 20-page bound only catches increasing
+	// page numbers. The scan must fail loud after one pinned page instead
+	// of looping until the caller's context expires.
+	var gets atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		w.Header().Set("Link", `<https://api.example/pulls?page=1>; rel="next"`)
+		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}})
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	// Bounded so a regression that loops on the pinned page fails the test
+	// instead of hanging it until the package timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := gh.countMarkerPRsCreatedSince(ctx, time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
+	if err == nil || !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("want a non-advancing pagination error, got %v", err)
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("expected the scan to stop after one pinned page, got %d requests", gets.Load())
+	}
+}
+
 func TestReconcileAllowanceSeedsCounterAndKeepsInFlight(t *testing.T) {
 	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	cfg := &PRConfig{DailyCap: 3}

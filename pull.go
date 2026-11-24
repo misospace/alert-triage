@@ -624,7 +624,11 @@ func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage i
 // without ending the scan. The scan is bounded at 20 pages like findOpenPR,
 // but where that scan under-counting merely misses a dedup, a truncated count
 // here would silently reset the cap — so running out of bound with pages left
-// is an error, and the caller degrades to the process-local count.
+// is an error, and the caller degrades to the process-local count. A Link
+// header that does not advance (the page just fetched, or a lower one,
+// advertised as rel="next") would pin the scan on one page until the caller's
+// context expires, because the page bound only catches increasing numbers —
+// so it fails loud like the truncation.
 func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
 	count := 0
 	page := 1
@@ -646,6 +650,9 @@ func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since tim
 		}
 		if next == 0 {
 			return count, nil
+		}
+		if next <= page {
+			return 0, fmt.Errorf("github pr count: page %d advertises next %d; pagination did not advance", page, next)
 		}
 		page = next
 		if page > 20 {
