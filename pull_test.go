@@ -1393,11 +1393,15 @@ func TestReconcileAllowanceConcurrentCallersCoalesce(t *testing.T) {
 	const callers = 8
 	errs := make([]error, callers)
 	var wg sync.WaitGroup
+	// Bounded so a regression that wedges the in-flight marker fails the
+	// test instead of hanging it until the package timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	for i := range errs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = cfg.reconcileAllowance(context.Background(), gh, now)
+			errs[i] = cfg.reconcileAllowance(ctx, gh, now)
 		}(i)
 	}
 	// Let every caller pile onto the in-flight scan before it finishes. The

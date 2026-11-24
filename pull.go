@@ -158,8 +158,10 @@ func utcDayStart(t time.Time) time.Time {
 // and this fold is not on GitHub yet, and max() preserves it, while a fresh
 // process (opened == 0) adopts the GitHub count. The price of max() is that
 // with callers concurrent to the fold the day can overshoot the cap by at
-// most the number of in-flight reservations; the delivery loop invokes this
-// sequentially, so no reservation is ever in flight in the shipped wiring.
+// most the number of in-flight reservations; the flush loop delivers one
+// digest at a time, but shutdown's drainBuffer can overlap its last
+// in-flight delivery, so a concurrent reservation is possible, not just
+// theoretical.
 // A seed succeeds at most once per process per calendar day: a successful
 // seed records reconciledDay and suppresses further calls, while a failed
 // seed records nothing and is retried by each subsequent attempt — so a day
@@ -183,10 +185,12 @@ func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now
 			return nil
 		}
 		if inFlight := c.seeding; inFlight != nil {
-			// A seed for this day is already running: wait for it rather
-			// than issuing a second scan, then loop to adopt its outcome —
-			// success short-circuits on the reconciledDay check, failure
-			// is retried by exactly one new scan at a time.
+			// A seed scan is already running — possibly for the previous
+			// day, since only one scan runs process-wide: wait for it
+			// rather than issuing a second scan, then loop to adopt its
+			// outcome. Success short-circuits on the reconciledDay check
+			// against this caller's own day; failure is retried by
+			// exactly one new scan at a time.
 			c.mu.Unlock()
 			select {
 			case <-inFlight:
@@ -195,14 +199,23 @@ func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now
 			}
 			continue
 		}
-		c.seeding = make(chan struct{})
+		inFlight := make(chan struct{})
+		c.seeding = inFlight
 		c.mu.Unlock()
+		// The marker lifecycle lives in this defer so the scan's exit —
+		// even a panic inside it — always closes the channel: a leader
+		// that vanishes without closing would hang every later caller
+		// instead of letting the next one retry the seed.
+		defer func() {
+			c.mu.Lock()
+			close(inFlight)
+			c.seeding = nil
+			c.mu.Unlock()
+		}()
 
 		n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
 
 		c.mu.Lock()
-		close(c.seeding)
-		c.seeding = nil
 		if err == nil {
 			if c.day != day {
 				c.day = day
