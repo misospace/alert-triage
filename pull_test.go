@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1348,28 +1349,58 @@ func TestCountMarkerPRsFailsLoudAtSafetyCap(t *testing.T) {
 }
 
 func TestCountMarkerPRsRejectsNonAdvancingPagination(t *testing.T) {
-	// A Link header that always advertises the page just fetched would pin
-	// the scan there forever: the 20-page bound only catches increasing
-	// page numbers. The scan must fail loud after one pinned page instead
-	// of looping until the caller's context expires.
-	var gets atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gets.Add(1)
-		w.Header().Set("Link", `<https://api.example/pulls?page=1>; rel="next"`)
-		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}})
-	}))
-	defer srv.Close()
-	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
-	// Bounded so a regression that loops on the pinned page fails the test
-	// instead of hanging it until the package timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err := gh.countMarkerPRsCreatedSince(ctx, time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
-	if err == nil || !strings.Contains(err.Error(), "did not advance") {
-		t.Fatalf("want a non-advancing pagination error, got %v", err)
+	// A Link header that advertises the page just fetched — or one already
+	// visited — would pin the scan in a loop: the 20-page bound only catches
+	// increasing page numbers. The scan must fail loud after the first
+	// non-advancing page instead of looping until the caller's context
+	// expires.
+	tests := []struct {
+		name    string
+		next    func(page int) string
+		wantReq int32
+	}{
+		{
+			// The finding's exact shape: every page advertises page 1.
+			name:    "pinned at page 1",
+			next:    func(int) string { return `<https://api.example/pulls?page=1>; rel="next"` },
+			wantReq: 1,
+		},
+		{
+			// Page 2 advertising an already-visited page must also stop the
+			// scan, not walk it backwards.
+			name: "page 2 advertises page 1",
+			next: func(page int) string {
+				if page == 1 {
+					return `<https://api.example/pulls?page=2>; rel="next"`
+				}
+				return `<https://api.example/pulls?page=1>; rel="next"`
+			},
+			wantReq: 2,
+		},
 	}
-	if gets.Load() != 1 {
-		t.Fatalf("expected the scan to stop after one pinned page, got %d requests", gets.Load())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gets atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gets.Add(1)
+				page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+				w.Header().Set("Link", tt.next(page))
+				_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}})
+			}))
+			defer srv.Close()
+			gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+			// Bounded so a regression that loops on a non-advancing page
+			// fails the test instead of hanging it until the package timeout.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := gh.countMarkerPRsCreatedSince(ctx, time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
+			if err == nil || !strings.Contains(err.Error(), "did not advance") {
+				t.Fatalf("want a non-advancing pagination error, got %v", err)
+			}
+			if gets.Load() != tt.wantReq {
+				t.Fatalf("expected %d requests, got %d", tt.wantReq, gets.Load())
+			}
+		})
 	}
 }
 

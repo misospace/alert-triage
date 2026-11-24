@@ -628,7 +628,10 @@ func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage i
 // header that does not advance (the page just fetched, or a lower one,
 // advertised as rel="next") would pin the scan on one page until the caller's
 // context expires, because the page bound only catches increasing numbers —
-// so it fails loud like the truncation.
+// so it fails loud like the truncation. next == 0 is assumed to mean "no
+// more pages"; a Link header stripped of its query string would therefore
+// silently under-count rather than error, which is parseNextPage's shared
+// ambiguity, tracked for the whole PR arm in #386.
 func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
 	count := 0
 	page := 1
