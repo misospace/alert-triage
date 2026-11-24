@@ -1572,6 +1572,42 @@ func TestReconcileAllowanceScanBudgetBoundsSeedScan(t *testing.T) {
 	}
 }
 
+func TestReconcileAllowanceDoesNotLabelNonBudgetFailures(t *testing.T) {
+	// The "outlived its budget" label must name only the scan's own budget
+	// firing while the caller's context lives on: a plain API failure or the
+	// caller's deadline expiring is a different diagnosis, and mislabelling
+	// either sends an operator after the wrong bound.
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+
+	t.Run("plain API failure is reported as-is", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+		cfg := &PRConfig{DailyCap: 2}
+		err := cfg.reconcileAllowance(context.Background(), gh, now)
+		if err == nil || strings.Contains(err.Error(), "budget") {
+			t.Fatalf("a plain API failure must not be labelled a budget trip, got %v", err)
+		}
+	})
+
+	t.Run("the caller's own deadline is not labelled either", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done() // upstream never answers; the caller's ctx expires first
+		}))
+		defer srv.Close()
+		gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+		cfg := &PRConfig{DailyCap: 2}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		err := cfg.reconcileAllowance(ctx, gh, now)
+		if err == nil || strings.Contains(err.Error(), "budget") {
+			t.Fatalf("the caller's own deadline must not be labelled a budget trip, got %v", err)
+		}
+	})
+}
+
 func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
 	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	orig := timeNow
