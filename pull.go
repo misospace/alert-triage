@@ -155,20 +155,26 @@ func utcDayStart(t time.Time) time.Time {
 // into DailyCap x restarts. The count is folded with max() rather than
 // assigned: a reservation taken by a concurrent caller between the API read
 // and this fold is not on GitHub yet, and max() preserves it, while a fresh
-// process (opened == 0) adopts the GitHub count. Runs at most once per
-// process per calendar day — after it, the reservation bookkeeping above is
-// exact on its own. Multi-replica deployments still multiply the cap; there
-// is no cross-process lock, and this only repairs the single-process case
-// the counter models. An error is returned to the caller, which degrades to
-// the process-local count rather than blocking the write.
+// process (opened == 0) adopts the GitHub count. The price of max() is that
+// with callers concurrent to the fold the day can overshoot the cap by at
+// most the number of in-flight reservations; the delivery loop invokes this
+// sequentially, so no reservation is ever in flight in the shipped wiring.
+// Runs at most once per process per calendar day: a successful seed records
+// reconciledDay and suppresses further calls, while a failed seed records
+// nothing and is retried by the next attempt — falling back to the
+// process-local count for the day only if every seed keeps failing.
+// Multi-replica deployments still multiply the cap; there is no cross-process
+// lock, and this only repairs the single-process case the counter models. An
+// error is returned to the caller, which degrades to the process-local count
+// rather than blocking the write.
 func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now time.Time) error {
 	day := now.UTC().Format("2006-01-02")
 	c.mu.Lock()
-	if c.reconciledDay == day || (c.day == day && c.opened > 0) {
-		c.mu.Unlock()
+	done := c.reconciledDay == day
+	c.mu.Unlock()
+	if done {
 		return nil
 	}
-	c.mu.Unlock()
 
 	n, err := gh.countMarkerPRsCreatedSince(ctx, utcDayStart(now))
 	if err != nil {
@@ -574,11 +580,14 @@ func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage i
 	return raw, next, nil
 }
 
-// countMarkerPRsCreatedSince counts PRs authored by this arm since the UTC
-// day boundary. Newest-first ordering allows an early stop at the first older
-// PR; malformed timestamps are skipped without ending the scan. Pagination is
-// bounded like findOpenPR: 2000 arm-authored PRs in one day is far past any
-// sane cap, and a truncated count still exceeds the reservation limit.
+// countMarkerPRsCreatedSince counts PRs authored by this arm (body carries
+// prMarkerPrefix) created at or after since. The early stop trusts the API's
+// sort=created&direction=desc: the first PR older than since proves every PR
+// after it is older too. PRs without a parseable created_at are skipped
+// without ending the scan. The scan is bounded at 20 pages like findOpenPR,
+// but where that scan under-counting merely misses a dedup, a truncated count
+// here would silently reset the cap — so running out of bound with pages left
+// is an error, and the caller degrades to the process-local count.
 func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
 	count := 0
 	for page := 1; page <= 20; page++ {
@@ -600,11 +609,8 @@ func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since tim
 		if next == 0 {
 			return count, nil
 		}
-		if page == 20 {
-			return count, nil
-		}
 	}
-	return count, nil
+	return 0, fmt.Errorf("github pr count: day scan hit the 20-page bound with more pages left")
 }
 
 // listPRs returns one page of open PRs and the next page number (0 when the

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -562,6 +563,17 @@ func TestDeliverPullRecurrenceUpdatesNotDuplicates(t *testing.T) {
 	existing.Head.Ref = "alert-triage/abc"
 	f := newFakeGH(t, existing, 0)
 
+	// Updates never consume the daily budget, so they must never reconcile
+	// the cap counter either.
+	var allGets atomic.Int32
+	origHandler := f.srv.Config.Handler
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == "/repos/o/r/pulls" && req.URL.Query().Get("state") == "all" {
+			allGets.Add(1)
+		}
+		origHandler.ServeHTTP(w, req)
+	})
+
 	r := triageReport()
 	act, err := deliverPull(context.Background(), f.client(), prCfg(), r)
 	if err != nil {
@@ -578,6 +590,9 @@ func TestDeliverPullRecurrenceUpdatesNotDuplicates(t *testing.T) {
 	}
 	if f.comments != 1 {
 		t.Errorf("expected 1 re-fire comment, got %d", f.comments)
+	}
+	if allGets.Load() != 0 {
+		t.Errorf("an update must not reconcile the daily cap, got %d seed calls", allGets.Load())
 	}
 }
 
@@ -1273,18 +1288,28 @@ func TestUTCDayStart(t *testing.T) {
 }
 
 func TestCountMarkerPRsCreatedSince(t *testing.T) {
-	gets := 0
+	var gets atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gets++
+		gets.Add(1)
 		if r.URL.Query().Get("state") != "all" || r.URL.Query().Get("sort") != "created" || r.URL.Query().Get("direction") != "desc" {
 			t.Errorf("unexpected query: %s", r.URL.RawQuery)
 		}
 		switch r.URL.Query().Get("page") {
 		case "1":
 			w.Header().Set("Link", `<https://api.example/pulls?page=2>; rel="next"`)
-			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}, {Body: "other", CreatedAt: time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)}})
+			// A closed PR created today still spent the budget; a PR with no
+			// parseable created_at is neither counted nor allowed to end the
+			// scan; a PR created exactly at the day boundary counts.
+			_ = json.NewEncoder(w).Encode([]ghPR{
+				{State: "closed", Body: fmt.Sprintf(prMarker, "merged"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)},
+				{Body: "other", CreatedAt: time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)},
+				{Body: fmt.Sprintf(prMarker, "unknown-age")},
+				{Body: fmt.Sprintf(prMarker, "boundary"), CreatedAt: time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC)},
+			})
 		case "2":
-			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "yesterday"), CreatedAt: time.Date(2026, 8, 18, 23, 0, 0, 0, time.UTC)}, {Body: fmt.Sprintf(prMarker, "older"), CreatedAt: time.Date(2026, 8, 17, 23, 0, 0, 0, time.UTC)}})
+			// Sorted newest-first, so this older PR ends the scan: page 3
+			// must never be requested.
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "yesterday"), CreatedAt: time.Date(2026, 8, 18, 23, 0, 0, 0, time.UTC)}})
 		default:
 			t.Errorf("unexpected page request: %s", r.URL.Query().Get("page"))
 		}
@@ -1292,46 +1317,44 @@ func TestCountMarkerPRsCreatedSince(t *testing.T) {
 	defer srv.Close()
 	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
 	got, err := gh.countMarkerPRsCreatedSince(context.Background(), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
-	if err != nil || got != 1 || gets != 2 {
-		t.Fatalf("count=%d gets=%d err=%v; want 1, 2, nil", got, gets, err)
+	if err != nil || got != 2 || gets.Load() != 2 {
+		t.Fatalf("count=%d gets=%d err=%v; want 2, 2, nil", got, gets.Load(), err)
 	}
 }
 
-func TestCountMarkerPRsStopsAtSafetyCap(t *testing.T) {
-	gets := 0
+func TestCountMarkerPRsFailsLoudAtSafetyCap(t *testing.T) {
+	// A scan that runs out of bound with pages left cannot know the true
+	// count, and a silently low count would reset the cap. It must error so
+	// the caller degrades to the process-local count instead of seeding.
+	var gets atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := gets.Add(1)
 		page := r.URL.Query().Get("page")
-		gets++
-		if page != fmt.Sprint(gets) || r.URL.Query().Get("per_page") != "100" {
+		if page != fmt.Sprint(n) || r.URL.Query().Get("per_page") != "100" {
 			t.Errorf("unexpected page/per_page: %s/%s", page, r.URL.Query().Get("per_page"))
 		}
-		if gets < 21 {
-			w.Header().Set("Link", fmt.Sprintf(`<https://api.example/pulls?page=%d>; rel="next"`, gets+1))
-		}
+		w.Header().Set("Link", fmt.Sprintf(`<https://api.example/pulls?page=%d>; rel="next"`, n+1))
 		_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "today"), CreatedAt: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)}})
 	}))
 	defer srv.Close()
 	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
-	got, err := gh.countMarkerPRsCreatedSince(context.Background(), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
-	if err != nil || got != 20 || gets != 20 {
-		t.Fatalf("count=%d gets=%d err=%v; want 20, 20, nil", got, gets, err)
+	_, err := gh.countMarkerPRsCreatedSince(context.Background(), time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC))
+	if err == nil || !strings.Contains(err.Error(), "20-page") {
+		t.Fatalf("want a truncation error after the 20-page bound, got %v", err)
 	}
-}
-
-func markerListServer(t *testing.T, prs []ghPR, calls *int) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*calls++
-		_ = json.NewEncoder(w).Encode(prs)
-	}))
+	if gets.Load() != 20 {
+		t.Fatalf("expected exactly 20 page requests, got %d", gets.Load())
+	}
 }
 
 func TestReconcileAllowanceSeedsCounterAndKeepsInFlight(t *testing.T) {
 	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
 	cfg := &PRConfig{DailyCap: 3}
-	calls := 0
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
+		// Simulate a caller concurrent to the fold: its reservation is not on
+		// GitHub yet, so the seed must not discard it.
 		if !cfg.reserveAllowance(now) {
 			t.Error("concurrent in-flight reservation denied")
 		}
@@ -1343,21 +1366,21 @@ func TestReconcileAllowanceSeedsCounterAndKeepsInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cfg.reserveAllowance(now) || cfg.reserveAllowance(now) {
-		t.Fatal("GitHub count should combine with the in-flight reservation to fill exactly the cap")
+		t.Fatal("the seed must adopt the GitHub count without discarding the in-flight reservation, leaving exactly one slot")
 	}
-	if err := cfg.reconcileAllowance(context.Background(), gh, now.Add(time.Hour)); err != nil || calls != 1 {
-		t.Fatalf("second reconciliation calls=%d err=%v", calls, err)
+	if err := cfg.reconcileAllowance(context.Background(), gh, now.Add(time.Hour)); err != nil || calls.Load() != 1 {
+		t.Fatalf("second reconciliation calls=%d err=%v", calls.Load(), err)
 	}
 }
 
 func TestReconcileAllowanceDayRollsReseeds(t *testing.T) {
 	dayA := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
-	calls := 0
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		n := calls.Add(1)
 		count := 2
 		created := dayA
-		if calls > 1 {
+		if n > 1 {
 			count = 0
 			created = dayA.Add(24 * time.Hour)
 		}
@@ -1387,7 +1410,7 @@ func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
 	orig := timeNow
 	defer func() { timeNow = orig }()
 	timeNow = func() time.Time { return now }
-	var creates, puts int
+	var creates, puts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
@@ -1403,10 +1426,10 @@ func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
 			_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(patchableManifest)), "sha": "blobsha123", "encoding": "base64", "type": "file"})
 		case r.Method == http.MethodPut:
-			puts++
+			puts.Add(1)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/pulls":
-			creates++
+			creates.Add(1)
 			w.WriteHeader(http.StatusCreated)
 		default:
 			w.WriteHeader(http.StatusCreated)
@@ -1416,8 +1439,8 @@ func TestDeliverPullReconcilesCapFromGitHub(t *testing.T) {
 	cfg := prCfg()
 	cfg.DailyCap = 2
 	act, err := deliverPull(context.Background(), &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}, cfg, triageReport())
-	if err != nil || act.Outcome != "capped" || creates != 0 || puts != 0 {
-		t.Fatalf("action=%+v creates=%d puts=%d err=%v; want capped without writes", act, creates, puts, err)
+	if err != nil || act.Outcome != "capped" || creates.Load() != 0 || puts.Load() != 0 {
+		t.Fatalf("action=%+v creates=%d puts=%d err=%v; want capped without writes", act, creates.Load(), puts.Load(), err)
 	}
 }
 
@@ -1426,15 +1449,15 @@ func TestDeliverPullReconcilesOncePerDay(t *testing.T) {
 	orig := timeNow
 	defer func() { timeNow = orig }()
 	timeNow = func() time.Time { return now }
-	allGets, openGets, creates := 0, 0, 0
+	var allGets, openGets, creates atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
 			if r.URL.Query().Get("state") == "all" {
-				allGets++
+				allGets.Add(1)
 				_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "seed"), CreatedAt: now}})
 			} else {
-				openGets++
+				openGets.Add(1)
 				_ = json.NewEncoder(w).Encode([]ghPR{})
 			}
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
@@ -1444,7 +1467,7 @@ func TestDeliverPullReconcilesOncePerDay(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
 			_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(patchableManifest)), "sha": "blobsha123", "encoding": "base64", "type": "file"})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/pulls":
-			creates++
+			creates.Add(1)
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodPut:
 			w.WriteHeader(http.StatusOK)
@@ -1466,8 +1489,67 @@ func TestDeliverPullReconcilesOncePerDay(t *testing.T) {
 			t.Fatalf("attempt %d: action=%+v err=%v", i+1, act, err)
 		}
 	}
-	if allGets != 1 || openGets != 2 || creates != 2 {
-		t.Fatalf("all=%d open=%d creates=%d; want 1, 2, 2", allGets, openGets, creates)
+	if allGets.Load() != 1 || openGets.Load() != 2 || creates.Load() != 2 {
+		t.Fatalf("all=%d open=%d creates=%d; want 1, 2, 2", allGets.Load(), openGets.Load(), creates.Load())
+	}
+}
+
+func TestDeliverPullRetriesFailedReconcile(t *testing.T) {
+	// A failed seed must not be cached: the next attempt retries, and when it
+	// succeeds the day's budget reflects PRs the process never saw. Otherwise
+	// one transient 5xx would quietly reinstate the per-process cap (#383).
+	now := time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC)
+	orig := timeNow
+	defer func() { timeNow = orig }()
+	timeNow = func() time.Time { return now }
+	var allGets, creates, puts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/pulls":
+			if r.URL.Query().Get("state") == "open" {
+				_ = json.NewEncoder(w).Encode([]ghPR{})
+				return
+			}
+			// First seed fails; the retry sees two PRs this process never
+			// opened, spending the cap of 2.
+			if allGets.Add(1) == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]ghPR{{Body: fmt.Sprintf(prMarker, "pre-restart-1"), CreatedAt: now}, {Body: fmt.Sprintf(prMarker, "pre-restart-2"), CreatedAt: now}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
+			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/git/ref/heads/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "headsha123"}})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(patchableManifest)), "sha": "blobsha123", "encoding": "base64", "type": "file"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/pulls":
+			creates.Add(1)
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut:
+			puts.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+	gh := &gitHubClient{token: "t", repo: "o/r", hc: http.DefaultClient, apiURL: srv.URL}
+	cfg := prCfg()
+	cfg.DailyCap = 2
+
+	act, err := deliverPull(context.Background(), gh, cfg, triageReport())
+	if err != nil || act.Outcome != "created" {
+		t.Fatalf("attempt 1 with a failed seed: action=%+v err=%v", act, err)
+	}
+	r2 := triageReport()
+	r2.Group.Alerts[0].Labels["alertname"] = "ContainerOOMKilled"
+	act, err = deliverPull(context.Background(), gh, cfg, r2)
+	if err != nil || act.Outcome != "capped" {
+		t.Fatalf("attempt 2 after the retry seeds the pre-restart PRs: action=%+v err=%v", act, err)
+	}
+	if allGets.Load() != 2 || creates.Load() != 1 || puts.Load() != 1 {
+		t.Fatalf("all=%d creates=%d puts=%d; want the seed retried once and no second write", allGets.Load(), creates.Load(), puts.Load())
 	}
 }
 
