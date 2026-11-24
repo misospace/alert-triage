@@ -24,7 +24,9 @@ package main
 //     PR carrying the marker and comments on it instead of opening a second.
 //   - Branches always fork off the default branch HEAD; the default branch
 //     itself is never written.
-//   - New PRs are capped per calendar day; the trip is logged.
+//   - New PRs are capped per calendar day; the counter is seeded once per
+//     process-day from this arm's PRs created that day, so a restart does not
+//     reset the budget. The trip is logged.
 //   - Any API failure (revoked token, timeout, 4xx/5xx) is logged and degrades
 //     to "proposal only". It never blocks the digest.
 
@@ -48,24 +50,39 @@ import (
 // durable identity regardless of which GitHub surface it first reaches.
 const prMarker = signatureMarker
 
+// prMarkerPrefix ends before the signature, identifying PRs authored by this arm.
+const prMarkerPrefix = `<!-- alert-triage:{"sig":"`
+
 // defaultPRDailyCap is the per-day budget for NEW PRs when
 // GITHUB_PR_DAILY_CAP is unset or malformed. Deliberately small: a PR is a
 // proposed code change, not a log line, so the arm stays quiet unless a human
 // has raised the cap to match the incident volume.
 const defaultPRDailyCap = 5
 
+// prSeedScanBudget bounds one seed scan's share of the caller's context. The
+// scan pages up to 20 API responses before the write it precedes, and both
+// run on the caller's single PR-write budget; without a bound of its own a
+// scan that hangs (a stalled proxy, a wedged connection) pins reconciliation
+// until the caller's deadline and leaves the write no context to run in. A
+// scan that outlives the budget fails like any other scan failure and
+// degrades to the process-local count. Var only so tests can shrink it.
+var prSeedScanBudget = 15 * time.Second
+
 // PRConfig is the opt-in plus gates for the PR write arm. It is nil unless
 // every hard prerequisite is configured so the rest of the program can treat
-// "off" as "no behaviour change".
+// "off" as "no behaviour change". day/opened model the cap window and are
+// reconciled from GitHub (see reconcileAllowance).
 type PRConfig struct {
 	OptIn     bool
 	Allowlist []string
 	DailyCap  int
 	PublicURL string // optional public base URL; digest link is only emitted when set
 
-	mu     sync.Mutex
-	day    string // calendar day ("2006-01-02") for the current cap window
-	opened int    // PRs created within that window
+	mu            sync.Mutex
+	day           string        // calendar day ("2006-01-02") for the current cap window
+	opened        int           // PRs created within that window
+	reconciledDay string        // day already seeded from GitHub
+	seeding       chan struct{} // non-nil while one seed scan is in flight; closed when it ends
 }
 
 // loadPRConfig reads the PR env vars. It returns nil when opt-in is off or a
@@ -135,6 +152,108 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// utcDayStart truncates t to the start of its UTC calendar day: the instant
+// the current cap window began.
+func utcDayStart(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// reconcileAllowance seeds the process-local counter from GitHub so the cap
+// survives a restart. A restart resets `opened` to zero while PRs opened
+// earlier that day remain on the forge, which would turn the effective cap
+// into DailyCap x restarts. The count is folded with max() rather than
+// assigned: a reservation taken by a concurrent caller between the API read
+// and this fold is not on GitHub yet, and max() preserves it, while a fresh
+// process (opened == 0) adopts the GitHub count. The price of max() is that
+// with callers concurrent to the fold the day can overshoot the cap by at
+// most the number of in-flight reservations; the flush loop delivers one
+// digest at a time, but shutdown's drainBuffer can overlap its last
+// in-flight delivery, so a concurrent reservation is possible, not just
+// theoretical.
+// A seed succeeds at most once per process per calendar day: a successful
+// seed records reconciledDay and suppresses further calls, while a failed
+// seed records nothing and is retried by each subsequent attempt — so a day
+// whose seed keeps failing pays at most one paginated scan (bounded at 20
+// pages) per eligible group, and degrades to the process-local count.
+// Concurrent callers coalesce: the first arrival for an unseeded day runs
+// the scan while the rest wait on it, so at most one scan is in flight; a
+// waiter adopts a successful seed, and a failed one is retried by a single
+// new scan at a time. Waiting honours ctx, so a cancelled caller degrades
+// like any other reconciliation failure. The scan runs on a budget of its
+// own (prSeedScanBudget) inside ctx: it shares the caller's PR-write budget
+// with the write this reconciliation gates, so a scan that hangs must fail
+// the seed — which degrades to the process-local count — rather than pin
+// reconciliation until the caller's deadline and starve that write.
+// Multi-replica deployments still multiply the cap; there is no
+// cross-process lock, and this only repairs the single-process case the
+// counter models. An error is returned to the caller, which degrades to the
+// process-local count rather than blocking the write.
+func (c *PRConfig) reconcileAllowance(ctx context.Context, gh *gitHubClient, now time.Time) error {
+	day := now.UTC().Format("2006-01-02")
+	for {
+		c.mu.Lock()
+		if c.reconciledDay == day {
+			c.mu.Unlock()
+			return nil
+		}
+		if inFlight := c.seeding; inFlight != nil {
+			// A seed scan is already running — possibly for the previous
+			// day, since only one scan runs process-wide: wait for it
+			// rather than issuing a second scan, then loop to adopt its
+			// outcome. Success short-circuits on the reconciledDay check
+			// against this caller's own day; failure is retried by
+			// exactly one new scan at a time.
+			c.mu.Unlock()
+			select {
+			case <-inFlight:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		inFlight := make(chan struct{})
+		c.seeding = inFlight
+		c.mu.Unlock()
+		// The marker lifecycle lives in this defer so the scan's exit —
+		// even a panic inside it — always closes the channel: a leader
+		// that vanishes without closing would hang every later caller
+		// instead of letting the next one retry the seed.
+		defer func() {
+			c.mu.Lock()
+			close(inFlight)
+			c.seeding = nil
+			c.mu.Unlock()
+		}()
+
+		// The scan carries a budget of its own inside ctx (see
+		// prSeedScanBudget): capture its error before cancel so a plain API
+		// failure — whose ctx is still alive — is reported as-is, and only a
+		// scan outliving its budget is named as such for the operator log.
+		scanCtx, cancel := context.WithTimeout(ctx, prSeedScanBudget)
+		n, err := gh.countMarkerPRsCreatedSince(scanCtx, utcDayStart(now))
+		scanErr := scanCtx.Err()
+		cancel()
+		if err != nil && ctx.Err() == nil && scanErr != nil {
+			err = fmt.Errorf("seed scan outlived its %s budget: %w", prSeedScanBudget, err)
+		}
+
+		c.mu.Lock()
+		if err == nil {
+			if c.day != day {
+				c.day = day
+				c.opened = 0
+			}
+			if n > c.opened {
+				c.opened = n
+			}
+			c.reconciledDay = day
+		}
+		c.mu.Unlock()
+		return err
+	}
+}
+
 // reserveAllowance takes one slot from the per-day budget for a NEW PR,
 // rolling the window forward when the calendar day changes. It returns false
 // when the cap is already spent. The slot is *reserved*, not yet spent: the
@@ -142,7 +261,9 @@ func splitCSV(s string) []string {
 // fails, so a branch/file/PR creation error does not burn the day's budget.
 // Updates to existing PRs never call this. Safe for concurrent callers: at
 // most DailyCap slots can be reserved at once, and every reservation that ends
-// in a successful open is exactly one real PR.
+// in a successful open is exactly one real PR. The counter is seeded from
+// GitHub by reconcileAllowance; this exactness holds after that seed within a
+// process-day.
 func (c *PRConfig) reserveAllowance(now time.Time) bool {
 	day := now.UTC().Format("2006-01-02")
 	c.mu.Lock()
@@ -238,9 +359,12 @@ func deliverPull(ctx context.Context, gh *gitHubClient, prcfg *PRConfig, r Repor
 		return PRAction{}, err
 	}
 
-	// One clock reading for reserve and the matching refund, so the two are
-	// guaranteed to agree on which calendar window the slot belongs to.
+	// One clock reading for reconcile, reserve and the matching refund, so
+	// all three agree on which calendar window the slot belongs to.
 	now := timeNow()
+	if err := prcfg.reconcileAllowance(ctx, gh, now); err != nil {
+		logf("github-pr: daily-cap reconciliation unavailable; using process-local count: %v", err)
+	}
 	if !prcfg.reserveAllowance(now) {
 		logf("github-pr: daily cap %d reached; proposal stays open for %s", prcfg.DailyCap, sig)
 		return PRAction{Outcome: "capped"}, nil
@@ -440,12 +564,13 @@ var (
 // --- GitHub PR API ---
 
 type ghPR struct {
-	Number  int    `json:"number"`
-	State   string `json:"state"`
-	Title   string `json:"title"`
-	Body    string `json:"body"`
-	HTMLURL string `json:"html_url"`
-	Head    struct {
+	Number    int       `json:"number"`
+	State     string    `json:"state"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	HTMLURL   string    `json:"html_url"`
+	CreatedAt time.Time `json:"created_at"`
+	Head      struct {
 		Ref string `json:"ref"`
 	} `json:"head"`
 	Base struct {
@@ -476,6 +601,88 @@ func (g *gitHubClient) findOpenPR(ctx context.Context, sig string) (*ghPR, error
 		page = next
 		if page > 20 { // safety: 2000 open PRs is enough
 			return nil, nil
+		}
+	}
+}
+
+// listPRsByCreatedDesc returns one page of PRs across every state, newest
+// first. state=all matters: a PR created today and already merged or closed
+// still spent the day's budget, so the cap count must see it.
+func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage int) ([]ghPR, int, error) {
+	u, _ := url.Parse(g.apiURL + "/repos/" + g.repo + "/pulls")
+	q := u.Query()
+	q.Set("state", "all")
+	q.Set("sort", "created")
+	q.Set("direction", "desc")
+	q.Set("per_page", fmt.Sprintf("%d", perPage))
+	q.Set("page", fmt.Sprintf("%d", page))
+	u.RawQuery = q.Encode()
+	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, 0, githubStatusError("github pr list by created", resp)
+	}
+	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	if err != nil {
+		return nil, 0, fmt.Errorf("github pr list by created: %w", err)
+	}
+	var raw []ghPR
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, 0, err
+	}
+	next := 0
+	if link := resp.Header.Get("Link"); link != "" {
+		next = parseNextPage(link)
+	}
+	return raw, next, nil
+}
+
+// countMarkerPRsCreatedSince counts PRs authored by this arm (body carries
+// prMarkerPrefix) created at or after since. The early stop trusts the API's
+// sort=created&direction=desc: the first PR older than since proves every PR
+// after it is older too. PRs without a parseable created_at are skipped
+// without ending the scan. The scan is bounded at 20 pages like findOpenPR,
+// but where that scan under-counting merely misses a dedup, a truncated count
+// here would silently reset the cap — so running out of bound with pages left
+// is an error, and the caller degrades to the process-local count. A Link
+// header that does not advance (the page just fetched, or a lower one,
+// advertised as rel="next") would pin the scan on one page until the caller's
+// context expires, because the page bound only catches increasing numbers —
+// so it fails loud like the truncation. next == 0 is assumed to mean "no
+// more pages"; a Link header stripped of its query string would therefore
+// silently under-count rather than error, which is parseNextPage's shared
+// ambiguity, tracked for the whole PR arm in #386.
+func (g *gitHubClient) countMarkerPRsCreatedSince(ctx context.Context, since time.Time) (int, error) {
+	count := 0
+	page := 1
+	for {
+		prs, next, err := g.listPRsByCreatedDesc(ctx, page, 100)
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if pr.CreatedAt.IsZero() {
+				continue
+			}
+			if pr.CreatedAt.Before(since) {
+				return count, nil
+			}
+			if strings.Contains(pr.Body, prMarkerPrefix) {
+				count++
+			}
+		}
+		if next == 0 {
+			return count, nil
+		}
+		if next <= page {
+			return 0, fmt.Errorf("github pr count: page %d advertises next %d; pagination did not advance", page, next)
+		}
+		page = next
+		if page > 20 {
+			return 0, fmt.Errorf("github pr count: day scan hit the 20-page bound with more pages left")
 		}
 	}
 }
