@@ -556,6 +556,36 @@ func TestSessionIdRejectsKeyIdentitySplice(t *testing.T) {
 	}
 }
 
+// TestSessionIdIncludesCluster pins the issue #381 review fix: the same
+// incident shape on two clusters — identical key and member fingerprints,
+// which is what two instances behind one LiteLLM emit when their alerts
+// carry no cluster label and each group's cluster comes from CLUSTER — must
+// not share a session id. An unset cluster must not fold into a cluster
+// actually named "default" either, the way Signature() does for history.
+func TestSessionIdIncludesCluster(t *testing.T) {
+	newGroup := func(cluster string) Group {
+		return Group{
+			Key:     "namespace/payments",
+			Cluster: cluster,
+			Alerts: []Alert{
+				{Fingerprint: "fp-a", Labels: map[string]string{"alertname": "HighCPU"}},
+			},
+		}
+	}
+	if sessionId(newGroup("primary")) == sessionId(newGroup("utility")) {
+		t.Fatalf("identical incidents on different clusters share session id %q", sessionId(newGroup("primary")))
+	}
+	if sessionId(newGroup("")) == sessionId(newGroup("default")) {
+		t.Fatalf("an unset cluster shares session id %q with a cluster named default", sessionId(newGroup("")))
+	}
+	if id := sessionId(newGroup("primary")); !litellmSessionIDRE.MatchString(id) {
+		t.Errorf("session id %q for a clustered group is not a shape LiteLLM accepts", id)
+	}
+	if sessionId(newGroup("primary")) != sessionId(newGroup("primary")) {
+		t.Error("a clustered group's session id changed between identical fires")
+	}
+}
+
 // litellmSessionIDRE is the shape LiteLLM accepts for session ids
 // (litellm/proxy/litellm_pre_call_utils.py: alphanumerics, hyphen and
 // underscore, at least 8 chars). An id outside it is dropped upstream, so the

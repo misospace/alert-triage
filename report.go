@@ -295,6 +295,15 @@ func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
 // recovers between fires) therefore start a new session; that is deliberate
 // and differs from Signature(), which keys history on names alone.
 //
+// The cluster joins the digest because the id scopes a shared proxy's traces,
+// not one instance's groups: two instances behind one LiteLLM can produce
+// byte-identical keys and fingerprints for unrelated incidents, because an
+// alert without a cluster label gets its group's cluster from CLUSTER while
+// its fingerprint — hashed from the labels alone — carries none. Unlike
+// Signature(), which folds an empty cluster into the "default" placeholder,
+// the digest hashes Cluster raw: an unknown cluster must not share a session
+// with a cluster actually named "default" (issue #381 review).
+//
 // The digest input length-prefixes each component: a fingerprint is untrusted
 // sender text and can carry NUL, so a bare "\x00" separator would let a
 // key/identity splice collide with a different incident's (issue #372 review).
@@ -305,7 +314,8 @@ func sessionId(g Group) string {
 	}
 	sort.Strings(ids)
 	h := sha256.New()
-	fmt.Fprintf(h, "%d:%s", len(g.Key), g.Key)
+	fmt.Fprintf(h, "%d:%s", len(g.Cluster), g.Cluster)
+	fmt.Fprintf(h, "|%d:%s", len(g.Key), g.Key)
 	for _, id := range ids {
 		fmt.Fprintf(h, "|%d:%s", len(id), id)
 	}
