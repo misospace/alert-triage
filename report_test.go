@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -540,6 +541,147 @@ func TestNarrateAnthropicEmptyTextFallsBackToThinking(t *testing.T) {
 	tri, _ := Narrate(context.Background(), cfg, r)
 	if tri.Narrative != "thinking block fallback narrative" {
 		t.Fatalf("expected fallback to thinking block text, got %q", tri.Narrative)
+	}
+}
+
+// TestSessionIdRejectsKeyIdentitySplice pins the length-prefixed digest
+// input: a fingerprint is untrusted sender text and JSON lets it carry a NUL,
+// so with a bare separator one alert whose fingerprint embeds
+// "\x00fp:..." hashes the same as two alerts (issue #372 review).
+func TestSessionIdRejectsKeyIdentitySplice(t *testing.T) {
+	one := Group{Key: "K", Alerts: []Alert{{Fingerprint: "a\x00fp:b"}}}
+	two := Group{Key: "K", Alerts: []Alert{{Fingerprint: "a"}, {Fingerprint: "b"}}}
+	if sessionId(one) == sessionId(two) {
+		t.Fatalf("an embedded-NUL fingerprint merged two incidents into session id %q", sessionId(one))
+	}
+}
+
+// TestSessionIdIncludesCluster pins the issue #381 review fix: the same
+// incident shape on two clusters — identical key and member fingerprints,
+// which is what two instances behind one LiteLLM emit when their alerts
+// carry no cluster label and each group's cluster comes from CLUSTER — must
+// not share a session id. An unset cluster must not fold into a cluster
+// actually named "default" either, the way Signature() does for history.
+func TestSessionIdIncludesCluster(t *testing.T) {
+	newGroup := func(cluster string) Group {
+		return Group{
+			Key:     "namespace/payments",
+			Cluster: cluster,
+			Alerts: []Alert{
+				{Fingerprint: "fp-a", Labels: map[string]string{"alertname": "HighCPU"}},
+			},
+		}
+	}
+	if sessionId(newGroup("primary")) == sessionId(newGroup("utility")) {
+		t.Fatalf("identical incidents on different clusters share session id %q", sessionId(newGroup("primary")))
+	}
+	if sessionId(newGroup("")) == sessionId(newGroup("default")) {
+		t.Fatalf("an unset cluster shares session id %q with a cluster named default", sessionId(newGroup("")))
+	}
+	if id := sessionId(newGroup("primary")); !litellmSessionIDRE.MatchString(id) {
+		t.Errorf("session id %q for a clustered group is not a shape LiteLLM accepts", id)
+	}
+	if sessionId(newGroup("primary")) != sessionId(newGroup("primary")) {
+		t.Error("a clustered group's session id changed between identical fires")
+	}
+}
+
+// litellmSessionIDRE is the shape LiteLLM accepts for session ids
+// (litellm/proxy/litellm_pre_call_utils.py: _SESSION_ID_VALUE_RE,
+// alphanumerics, hyphen and underscore, at least 8 chars). Upstream applies
+// it to inferred vendor headers, and non-conforming values are dropped
+// silently rather than rejected, so this pin is the load-bearing guard:
+// outside the shape, trace grouping is lost with no error anywhere.
+var litellmSessionIDRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,}$`)
+
+// TestNarrateSessionIdStableAcrossFires is the acceptance test for issue #372:
+// the model call must carry x-litellm-session-id, and repeated fires of the
+// same incident — including a replay whose members arrive in a different
+// order — must carry the same id so LiteLLM groups their traces into one
+// session, while a different incident must not reuse it.
+func TestNarrateSessionIdStableAcrossFires(t *testing.T) {
+	var mu sync.Mutex
+	var ids []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ids = append(ids, r.Header.Get("x-litellm-session-id"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"narrative\":\"n\",\"fix_location\":\"cluster\",\"confidence\":\"low\"}"}}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "openai", "m")
+
+	group := Group{Key: "alert/HighCPU", Alerts: []Alert{
+		{Fingerprint: "fp-b", Labels: map[string]string{"alertname": "HighCPU"}},
+		{Fingerprint: "fp-a", Labels: map[string]string{"alertname": "HighMem"}},
+	}}
+	fires := []Group{
+		group,
+		group,
+		// Same members, reversed arrival order: the id keys on who is in
+		// the group, not on payload order.
+		{Key: group.Key, Alerts: []Alert{group.Alerts[1], group.Alerts[0]}},
+	}
+	for i, g := range fires {
+		if _, ok := Narrate(context.Background(), cfg, Report{Group: g}); !ok {
+			t.Fatalf("fire %d: Narrate returned ok=false", i)
+		}
+	}
+	if _, ok := Narrate(context.Background(), cfg, Report{
+		Group: Group{Key: "namespace/other", Alerts: []Alert{{Fingerprint: "fp-c"}}},
+	}); !ok {
+		t.Fatal("different incident: Narrate returned ok=false")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 4 {
+		t.Fatalf("server saw %d requests, want 4", len(ids))
+	}
+	if !litellmSessionIDRE.MatchString(ids[0]) {
+		t.Errorf("session id %q is not a shape LiteLLM accepts", ids[0])
+	}
+	if ids[1] != ids[0] || ids[2] != ids[0] {
+		t.Errorf("session id changed across repeated fires: %q, %q, %q", ids[0], ids[1], ids[2])
+	}
+	if ids[3] == ids[0] {
+		t.Errorf("a different incident reused session id %q", ids[3])
+	}
+}
+
+// TestNarrateSessionIdReachesAnthropicFormat pins that the same header is set
+// on the /messages request, where the body shape differs but the proxy reads
+// the header before conversion. A fingerprint-less alert must still yield a
+// usable id (identity() falls back to a labels hash).
+func TestNarrateSessionIdReachesAnthropicFormat(t *testing.T) {
+	var mu sync.Mutex
+	var got, path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got, path = r.Header.Get("x-litellm-session-id"), r.URL.Path
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"narrative\":\"n\",\"fix_location\":\"cluster\",\"confidence\":\"low\"}"}]}`)
+	}))
+	defer srv.Close()
+	cfg := narrateCfg(srv.URL, "anthropic", "claude")
+	r := Report{Group: Group{Key: "single/DiskFull", Alerts: []Alert{
+		{Labels: map[string]string{"alertname": "DiskFull", "namespace": "n1"}},
+	}}}
+	if _, ok := Narrate(context.Background(), cfg, r); !ok {
+		t.Fatal("Narrate returned ok=false")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if path != "/messages" {
+		t.Fatalf("request went to %q, want the anthropic /messages route", path)
+	}
+	if !litellmSessionIDRE.MatchString(got) {
+		t.Fatalf("anthropic-format request carried session id %q, want a LiteLLM-acceptable id", got)
+	}
+	if got != sessionId(r.Group) {
+		t.Fatalf("header %q does not match sessionId(group) %q", got, sessionId(r.Group))
 	}
 }
 
