@@ -617,25 +617,10 @@ func (g *gitHubClient) listPRsByCreatedDesc(ctx context.Context, page, perPage i
 	q.Set("per_page", fmt.Sprintf("%d", perPage))
 	q.Set("page", fmt.Sprintf("%d", page))
 	u.RawQuery = q.Encode()
-	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, 0, githubStatusError("github pr list by created", resp)
-	}
-	body, err := readCappedBody(resp.Body, ghListBodyCap)
-	if err != nil {
-		return nil, 0, fmt.Errorf("github pr list by created: %w", err)
-	}
 	var raw []ghPR
-	if err := json.Unmarshal(body, &raw); err != nil {
+	next, err := g.listPage(ctx, u.String(), "github pr list by created", nil, &raw)
+	if err != nil {
 		return nil, 0, err
-	}
-	next := 0
-	if link := resp.Header.Get("Link"); link != "" {
-		next = parseNextPage(link)
 	}
 	return raw, next, nil
 }
@@ -697,25 +682,10 @@ func (g *gitHubClient) listPRs(ctx context.Context, page, perPage int) ([]ghPR, 
 	q.Set("per_page", fmt.Sprintf("%d", perPage))
 	q.Set("page", fmt.Sprintf("%d", page))
 	u.RawQuery = q.Encode()
-	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, 0, githubStatusError("github pr list", resp)
-	}
 	var raw []ghPR
-	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	next, err := g.listPage(ctx, u.String(), "github pr list", nil, &raw)
 	if err != nil {
-		return nil, 0, fmt.Errorf("github pr list: %w", err)
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, 0, err
-	}
-	next := 0
-	if link := resp.Header.Get("Link"); link != "" {
-		next = parseNextPage(link)
 	}
 	return raw, next, nil
 }
