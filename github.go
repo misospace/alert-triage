@@ -418,6 +418,42 @@ const ghListBodyCap = metricsBodyCap
 // endpoint, not a real reply.
 const ghSmallBodyCap = 64 << 10
 
+// listPage fetches one page of a paginated GitHub list endpoint, decodes the
+// reply into out, and returns the Link header's rel="next" page number (0
+// when there is none). The issue and PR listers share this read: each one
+// differs only in the query it builds and how it walks the rows, so the
+// request, the body cap and the pagination parse live here once.
+//
+// label prefixes both the status error and the wrapped read error, so every
+// caller keeps the message it produced before. notFound, when non-nil, is
+// the error returned for a 404 in place of the status error: the /issues
+// endpoint's 404 means this token cannot see the repository at all, which is
+// worth saying in its own words.
+func (g *gitHubClient) listPage(ctx context.Context, rawURL, label string, notFound error, out any) (int, error) {
+	resp, err := g.doRequest(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound && notFound != nil {
+		return 0, notFound
+	}
+	if resp.StatusCode >= 300 {
+		return 0, githubStatusError(label, resp)
+	}
+	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", label, err)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return 0, err
+	}
+	if link := resp.Header.Get("Link"); link != "" {
+		return parseNextPage(link), nil
+	}
+	return 0, nil
+}
+
 // listIssues returns one page of issues. The custom media type asks for the
 // issues' labels inline so we don't have to fan out a second request per row
 // just to compute the severity-change check.
@@ -430,24 +466,10 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 	q.Set("page", fmt.Sprintf("%d", page))
 	u.RawQuery = q.Encode()
 
-	resp, err := g.doRequest(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, 0, fmt.Errorf("github: repo %q not found or token lacks access", g.repo)
-	}
-	if resp.StatusCode >= 300 {
-		return nil, 0, githubStatusError("github list", resp)
-	}
-
 	var raw []ghIssue
-	body, err := readCappedBody(resp.Body, ghListBodyCap)
+	notFound := fmt.Errorf("github: repo %q not found or token lacks access", g.repo)
+	next, err := g.listPage(ctx, u.String(), "github list", notFound, &raw)
 	if err != nil {
-		return nil, 0, fmt.Errorf("github list: %w", err)
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, 0, err
 	}
 	// The /issues endpoint also returns pull requests; drop them on the
@@ -463,10 +485,6 @@ func (g *gitHubClient) listIssues(ctx context.Context, page, perPage int, state 
 			continue
 		}
 		issues = append(issues, i)
-	}
-	next := 0
-	if link := resp.Header.Get("Link"); link != "" {
-		next = parseNextPage(link)
 	}
 	return issues, next, nil
 }
