@@ -15,6 +15,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
 
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/alert-triage"
+
+COPY LICENSE NOTICE /usr/share/doc/alert-triage/
 COPY --from=builder /alert-triage /alert-triage
 
 USER 65534:65534
