@@ -250,3 +250,7 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/recent | jq '.[] | {key
 
 Each digest is also logged as a single line (`digest <key> [severity] <title> |
 <narrative>`), so the history survives a restart wherever logs are shipped.
+
+## License
+
+[AGPL-3.0-only](LICENSE). See [licensing and corresponding source](docs/licensing.md).
