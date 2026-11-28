@@ -41,8 +41,10 @@ type gitHubClient struct {
 	// not N (issue #375). Successes are content-addressed by sha;
 	// failures are cached so one refused sha degrades once per flush,
 	// the flushReads rule from #374. mu guards it because nothing in
-	// the type's contract keeps callers sequential.
-	commits map[string]commitFetch
+	// the type's contract keeps callers sequential, and the in-flight
+	// record it publishes keeps concurrent callers of one key sharing
+	// a single GET.
+	commits map[string]*commitFetch
 	mu      sync.Mutex
 }
 
@@ -924,9 +926,12 @@ func cleanRepoPath(p string) string {
 	return strings.Join(out, "/")
 }
 
-// commitFetch is one memoized commit-detail read: the changed file paths
-// across every page, plus the flattened first line of the commit message.
+// commitFetch is one commit-detail read, in flight or finished: the changed
+// file paths across every page, plus the flattened first line of the commit
+// message. done closes when the result fields are set, so a caller that finds
+// the record early waits and reads them after.
 type commitFetch struct {
+	done    chan struct{}
 	files   []string
 	message string
 	err     error
@@ -934,9 +939,13 @@ type commitFetch struct {
 
 // fetchCommitDetail returns the changed files and the first line of the
 // message of one commit, at most one commit-detail read per
-// "ownerRepo@sha" for the client's lifetime (issue #375). Failures are
+// "ownerRepo@sha" for the client's lifetime (issue #375). The record is
+// claimed under mu before the request starts, so callers arriving while it is
+// in flight wait on it instead of issuing their own GET. Failures are
 // memoized too: every group sharing a refused sha then degrades to the
-// same "unknown" reason without re-billing the rate limit.
+// same "unknown" reason without re-billing the rate limit. The first caller's
+// error is shared, so a first request its context canceled makes every caller
+// of that sha degrade — the flush is being torn down regardless.
 func (g *gitHubClient) fetchCommitDetail(ctx context.Context, ownerRepo, sha string) ([]string, string, error) {
 	if g == nil {
 		return nil, "", fmt.Errorf("github: no client")
@@ -949,19 +958,28 @@ func (g *gitHubClient) fetchCommitDetail(ctx context.Context, ownerRepo, sha str
 	}
 	key := ownerRepo + "@" + sha
 	g.mu.Lock()
-	rec, hit := g.commits[key]
-	g.mu.Unlock()
-	if hit {
-		return rec.files, rec.message, rec.err
-	}
-	files, message, err := g.requestCommitDetail(ctx, ownerRepo, sha)
-	g.mu.Lock()
 	if g.commits == nil {
-		g.commits = make(map[string]commitFetch)
+		g.commits = make(map[string]*commitFetch)
 	}
-	g.commits[key] = commitFetch{files: files, message: message, err: err}
+	rec, existing := g.commits[key]
+	if !existing {
+		rec = &commitFetch{done: make(chan struct{})}
+		g.commits[key] = rec
+	}
 	g.mu.Unlock()
-	return files, message, err
+	if existing {
+		// A waiter gives up on its own context: it must not be held for as
+		// long as another caller's request is, only for as long as its own.
+		select {
+		case <-rec.done:
+			return rec.files, rec.message, rec.err
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}
+	rec.files, rec.message, rec.err = g.requestCommitDetail(ctx, ownerRepo, sha)
+	close(rec.done)
+	return rec.files, rec.message, rec.err
 }
 
 // requestCommitDetail performs the paginated read behind

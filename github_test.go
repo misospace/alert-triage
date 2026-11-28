@@ -1834,6 +1834,142 @@ func TestClassifyCommitFailureMemoized(t *testing.T) {
 	}
 }
 
+// TestFetchCommitDetailConcurrentCallersShareOneRead pins the "at most one
+// read" claim under concurrency: with the first read held open in the
+// handler, callers arriving for the same key must wait on it rather than
+// each issuing their own GET, and every one of them must observe the
+// finished record, not a half-filled one.
+func TestFetchCommitDetailConcurrentCallersShareOneRead(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const callers = 8
+
+	var calls atomic.Int32
+	hold, releaseHold := context.WithCancel(context.Background())
+	firstRead := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		select {
+		case firstRead <- struct{}{}:
+		default:
+		}
+		// Keep the read in flight until the test has gathered every
+		// caller, so a missing in-flight record cannot hide behind a
+		// fast response.
+		<-hold.Done()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha":    sha,
+			"commit": map[string]any{"message": "roll payments forward\nbody"},
+			"files":  []map[string]string{{"filename": "apps/payments/deployment.yaml"}},
+		})
+	}))
+	t.Cleanup(releaseHold)
+
+	g := &gitHubClient{
+		token:  "t",
+		repo:   "owner/repo",
+		hc:     &http.Client{Timeout: 5 * time.Second},
+		apiURL: srv.URL,
+	}
+
+	var ready, done sync.WaitGroup
+	files := make([][]string, callers)
+	messages := make([]string, callers)
+	errs := make([]error, callers)
+	ready.Add(callers)
+	done.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer done.Done()
+			ready.Done()
+			files[i], messages[i], errs[i] = g.fetchCommitDetail(context.Background(), "owner/repo", sha)
+		}(i)
+	}
+	ready.Wait()
+	<-firstRead
+	// The waiters have no signal of their own; give them time to reach the
+	// memo while the first read is still open. Without in-flight sharing
+	// they each issue a GET here and the count below catches it.
+	time.Sleep(100 * time.Millisecond)
+	releaseHold()
+	done.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent callers cost %d commit GETs, want 1", got)
+	}
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("caller %d got error %v", i, errs[i])
+		}
+		if len(files[i]) != 1 || files[i][0] != "apps/payments/deployment.yaml" {
+			t.Fatalf("caller %d got files %v", i, files[i])
+		}
+		if messages[i] != "roll payments forward" {
+			t.Fatalf("caller %d got message %q", i, messages[i])
+		}
+	}
+}
+
+// TestFetchCommitDetailWaiterHonorsContextCancel pins that sharing one read
+// does not chain a caller's deadline to the leader's: a waiter whose own
+// context is canceled returns while the in-flight read is still open.
+func TestFetchCommitDetailWaiterHonorsContextCancel(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+
+	var calls atomic.Int32
+	hold, releaseHold := context.WithCancel(context.Background())
+	firstRead := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		select {
+		case firstRead <- struct{}{}:
+		default:
+		}
+		<-hold.Done()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha":    sha,
+			"commit": map[string]any{"message": "still rolling"},
+		})
+	}))
+	t.Cleanup(releaseHold)
+	g := &gitHubClient{
+		token:  "t",
+		repo:   "owner/repo",
+		hc:     &http.Client{Timeout: 5 * time.Second},
+		apiURL: srv.URL,
+	}
+
+	leader := make(chan struct{})
+	go func() {
+		defer close(leader)
+		_, _, _ = g.fetchCommitDetail(context.Background(), "owner/repo", sha)
+	}()
+	<-firstRead
+
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiter := make(chan error, 1)
+	go func() {
+		_, _, err := g.fetchCommitDetail(waiterCtx, "owner/repo", sha)
+		waiter <- err
+	}()
+	cancelWaiter()
+
+	select {
+	case err := <-waiter:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled waiter got %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled waiter stayed blocked on another caller's request")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("waiter issued its own read: %d commit GETs, want 1", got)
+	}
+	releaseHold()
+	<-leader
+}
+
 // TestCleanRepoPathTraversal drops leading "../" segments so a forged
 // Kustomization spec cannot smuggle a path escape through the workload field.
 func TestCleanRepoPathTraversal(t *testing.T) {
