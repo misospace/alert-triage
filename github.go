@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,17 @@ type gitHubClient struct {
 	repo   string // "owner/name"
 	hc     *http.Client
 	apiURL string // defaults to https://api.github.com
+	// commits memoizes commit details per "ownerRepo@sha" for this
+	// client's lifetime: enrichment builds one client per flush, so a
+	// rollout that classifies N groups at one revision costs one GET,
+	// not N (issue #375). Successes are content-addressed by sha;
+	// failures are cached so one refused sha degrades once per flush,
+	// the flushReads rule from #374. mu guards it because nothing in
+	// the type's contract keeps callers sequential, and the in-flight
+	// record it publishes keeps concurrent callers of one key sharing
+	// a single GET.
+	commits map[string]*commitFetch
+	mu      sync.Mutex
 }
 
 func newGitHub(cfg *Config) *gitHubClient {
@@ -914,12 +926,67 @@ func cleanRepoPath(p string) string {
 	return strings.Join(out, "/")
 }
 
-// fetchCommitFiles retrieves the full list of files changed in a single
-// commit, following the endpoint's pagination. ownerRepo is the
-// "owner/name" the commit belongs to — derived from the workload's
-// GitRepository URL, not necessarily the configured GITHUB_REPO the client
-// was built against (the token and HTTP client are reused across repos; only
-// the /repos/ path changes).
+// commitFetch is one commit-detail read, in flight or finished: the changed
+// file paths across every page, plus the flattened first line of the commit
+// message. done closes when the result fields are set, so a caller that finds
+// the record early waits and reads them after.
+type commitFetch struct {
+	done    chan struct{}
+	files   []string
+	message string
+	err     error
+}
+
+// fetchCommitDetail returns the changed files and the first line of the
+// message of one commit, at most one commit-detail read per
+// "ownerRepo@sha" for the client's lifetime (issue #375). The record is
+// claimed under mu before the request starts, so callers arriving while it is
+// in flight wait on it instead of issuing their own GET. Failures are
+// memoized too: every group sharing a refused sha then degrades to the
+// same "unknown" reason without re-billing the rate limit. The first caller's
+// error is shared, so a first request its context canceled makes every caller
+// of that sha degrade — the flush is being torn down regardless.
+func (g *gitHubClient) fetchCommitDetail(ctx context.Context, ownerRepo, sha string) ([]string, string, error) {
+	if g == nil {
+		return nil, "", fmt.Errorf("github: no client")
+	}
+	if ownerRepo == "" {
+		return nil, "", fmt.Errorf("github: empty repo")
+	}
+	if sha == "" {
+		return nil, "", fmt.Errorf("github: empty sha")
+	}
+	key := ownerRepo + "@" + sha
+	g.mu.Lock()
+	if g.commits == nil {
+		g.commits = make(map[string]*commitFetch)
+	}
+	rec, existing := g.commits[key]
+	if !existing {
+		rec = &commitFetch{done: make(chan struct{})}
+		g.commits[key] = rec
+	}
+	g.mu.Unlock()
+	if existing {
+		// A waiter gives up on its own context: it must not be held for as
+		// long as another caller's request is, only for as long as its own.
+		select {
+		case <-rec.done:
+			return rec.files, rec.message, rec.err
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}
+	rec.files, rec.message, rec.err = g.requestCommitDetail(ctx, ownerRepo, sha)
+	close(rec.done)
+	return rec.files, rec.message, rec.err
+}
+
+// requestCommitDetail performs the paginated read behind
+// fetchCommitDetail. ownerRepo is the "owner/name" the commit belongs to —
+// derived from the workload's GitRepository URL, not necessarily the
+// configured GITHUB_REPO the client was built against (the token and HTTP
+// client are reused across repos; only the /repos/ path changes).
 //
 // The commit endpoint is paginated: a large commit (a mass rename) can
 // spread its files across multiple pages of up to 300. We follow the Link
@@ -937,66 +1004,66 @@ func cleanRepoPath(p string) string {
 // whether to log them. The 1 MiB per-page decode cap (in fetchCommitPage)
 // keeps a misbehaving proxy returning a verbose error body from blowing
 // memory.
-func (g *gitHubClient) fetchCommitFiles(ctx context.Context, ownerRepo, sha string) ([]string, error) {
-	if g == nil {
-		return nil, fmt.Errorf("github: no client")
-	}
-	if ownerRepo == "" {
-		return nil, fmt.Errorf("github: empty repo")
-	}
-	if sha == "" {
-		return nil, fmt.Errorf("github: empty sha")
-	}
-
+//
+// The message comes from the first page: every page carries the same
+// commit object, so reading it never costs a request of its own.
+func (g *gitHubClient) requestCommitDetail(ctx context.Context, ownerRepo, sha string) ([]string, string, error) {
 	// 300 is the documented per-page maximum for this endpoint; per_page is
 	// fixed on the first page and carried forward in each rel="next" URL.
 	url := g.apiURL + "/repos/" + ownerRepo + "/commits/" + sha + "?per_page=300"
 	// 300 files/page * 100 pages = 30k files, far beyond any real commit.
 	const maxPages = 100
-	var out []string
+	var files []string
+	var message string
 	for i := 0; ; i++ {
 		if i >= maxPages {
-			return nil, fmt.Errorf("github: commit %s file list incomplete (reached %d pages)", sha, maxPages)
+			return nil, "", fmt.Errorf("github: commit %s file list incomplete (reached %d pages)", sha, maxPages)
 		}
-		files, next, err := g.fetchCommitPage(ctx, url)
+		pageFiles, pageMessage, next, err := g.fetchCommitPage(ctx, url)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		out = append(out, files...)
+		files = append(files, pageFiles...)
+		if i == 0 {
+			message = pageMessage
+		}
 		if next == "" {
 			break
 		}
 		url = next
 	}
-	return out, nil
+	return files, message, nil
 }
 
 // fetchCommitPage fetches one page of the commit endpoint and returns the
-// file names on that page plus the URL of the next page (from the Link
-// rel="next" header) or "" when there is no next page.
+// file names on that page, the page's commit message, and the URL of the
+// next page (from the Link rel="next" header) or "" when there is none.
 //
 // A renamed file contributes BOTH its new (filename) and old
 // (previous_filename) path: a move out of the workload still changes the
 // workload's Git surface, so dropping the old path would turn that into a
 // false "does not touch" (issue #185).
-func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]string, string, error) {
+func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]string, string, string, error) {
 	resp, err := g.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("github: commit not found or token lacks access")
+		return nil, "", "", fmt.Errorf("github: commit not found or token lacks access")
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		// Rate-limited or private-repo permission denied; the message
 		// is not actionable for the operator, so collapse to one shape.
-		return nil, "", fmt.Errorf("github: commit forbidden (rate limit or permissions)")
+		return nil, "", "", fmt.Errorf("github: commit forbidden (rate limit or permissions)")
 	}
 	if resp.StatusCode >= 300 {
-		return nil, "", githubStatusError("github commit", resp)
+		return nil, "", "", githubStatusError("github commit", resp)
 	}
 	var payload struct {
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
 		Files []struct {
 			Filename         string `json:"filename"`
 			Status           string `json:"status"`
@@ -1004,7 +1071,7 @@ func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]strin
 		} `json:"files"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return nil, "", fmt.Errorf("github commit decode: %w", err)
+		return nil, "", "", fmt.Errorf("github commit decode: %w", err)
 	}
 	out := make([]string, 0, len(payload.Files))
 	for _, f := range payload.Files {
@@ -1016,11 +1083,18 @@ func (g *gitHubClient) fetchCommitPage(ctx context.Context, url string) ([]strin
 			out = append(out, f.PreviousFilename)
 		}
 	}
+	// Flatten to one line at the source so no newline can smuggle a
+	// second line of untrusted commit text into the evidence; the
+	// renderer still fences the result.
+	message := payload.Commit.Message
+	if i := strings.IndexByte(message, '\n'); i >= 0 {
+		message = message[:i]
+	}
 	next := ""
 	if link := resp.Header.Get("Link"); link != "" {
 		next = parseLinkNext(link)
 	}
-	return out, next, nil
+	return out, strings.TrimSpace(message), next, nil
 }
 
 // parseLinkNext extracts the next-page URL from a GitHub Link header
@@ -1043,44 +1117,12 @@ func parseLinkNext(link string) string {
 	return ""
 }
 
-// fetchCommitMessage returns the first line of the commit message, capped
-// to a safe length and flattened so a single newline cannot smuggle a
-// second line into the evidence. ownerRepo carries the parsed source
-// "owner/name" (see fetchCommitFiles); the client's token and transport are
-// reused. Returns "" on any failure; the caller is responsible for the
-// untrusted fence and never has to gate on a missing message.
-func (g *gitHubClient) fetchCommitMessage(ctx context.Context, ownerRepo, sha string) string {
-	if g == nil || ownerRepo == "" || sha == "" {
-		return ""
-	}
-	u := g.apiURL + "/repos/" + ownerRepo + "/commits/" + sha
-	resp, err := g.doRequest(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return ""
-	}
-	var payload struct {
-		Commit struct {
-			Message string `json:"message"`
-		} `json:"commit"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
-		return ""
-	}
-	msg := payload.Commit.Message
-	if i := strings.IndexByte(msg, '\n'); i >= 0 {
-		msg = msg[:i]
-	}
-	return strings.TrimSpace(msg)
-}
-
 // classifyCommit is the convenience entry point the enrichment layer uses.
-// It parses the repo URL and revision, fetches the commit's files if both
-// parsed and the workload path is non-empty, and classifies the result as
-// touches/does_not_touch/unknown. Failures at any step degrade to a single
+// It parses the repo URL and revision, fetches the commit's changed files
+// and message if both parsed and the workload path is non-empty, and
+// classifies the result as touches/does_not_touch/unknown. The fetch is
+// memoized per client on (repo, sha), so groups sharing a revision share
+// one read (issue #375). Failures at any step degrade to a single
 // CommitRelevance with State == "unknown" so the renderer can present a
 // neutral note ("could not determine") rather than pretending the lookup
 // did not happen.
@@ -1141,7 +1183,7 @@ func classifyCommit(ctx context.Context, gh *gitHubClient, repoURL, revision, wo
 	out.WorkloadPath = cleanRepoPath(workloadPath)
 	out.ComponentPaths = append([]string(nil), resolved...)
 	out.SHA = sha
-	files, err := gh.fetchCommitFiles(ctx, ownerRepo, sha)
+	files, message, err := gh.fetchCommitDetail(ctx, ownerRepo, sha)
 	if err != nil {
 		out.Reason = truncate(err.Error(), 200)
 		return out
@@ -1152,7 +1194,7 @@ func classifyCommit(ctx context.Context, gh *gitHubClient, repoURL, revision, wo
 	if len(matches) > 0 {
 		out.State = commitRelevanceTouches
 	}
-	out.CommitMessage = gh.fetchCommitMessage(ctx, ownerRepo, sha)
+	out.CommitMessage = message
 	return out
 }
 

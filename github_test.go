@@ -1259,7 +1259,7 @@ type commitPayload struct {
 	files   []map[string]string
 	message string
 	// links, when non-empty, is set as the response Link header so the
-	// test can drive pagination (fetchCommitFiles follows rel="next").
+	// test can drive pagination (requestCommitDetail follows rel="next").
 	links string
 }
 
@@ -1736,6 +1736,238 @@ func TestClassifyCommitNoWorkloadPath(t *testing.T) {
 	if srv.calls.Load() != 0 {
 		t.Fatalf("expected no API calls when workload path is empty, got %d", srv.calls.Load())
 	}
+}
+
+// TestClassifyCommitSharedRevision is the regression for issue #375: a
+// rollout reconciles several workloads at one commit, and each group used
+// to re-fetch the same commit detail. The flush shares one client, so the
+// shared revision must cost exactly one commit-detail GET while every
+// group still classifies against its own workload path.
+func TestClassifyCommitSharedRevision(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	srv := newFakeCommitServer(t)
+	srv.payloads[sha] = commitPayload{
+		files:   []map[string]string{{"filename": "apps/payments/deployment.yaml"}},
+		message: "roll payments forward",
+	}
+	g := srv.client()
+	ctx := context.Background()
+	relPay := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+sha, "apps/payments", nil)
+	if relPay.State != commitRelevanceTouches || relPay.CommitMessage != "roll payments forward" {
+		t.Fatalf("payments classification = %+v", relPay)
+	}
+	relOrders := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+sha, "apps/orders", nil)
+	if relOrders.State != commitRelevanceDoesNotTouch || len(relOrders.MatchingPaths) != 0 {
+		t.Fatalf("orders classification = %+v", relOrders)
+	}
+	if relOrders.CommitMessage != "roll payments forward" {
+		t.Fatalf("second group lost the memoized message: %q", relOrders.CommitMessage)
+	}
+	if got := srv.calls.Load(); got != 1 {
+		t.Fatalf("shared revision cost %d commit GETs, want 1", got)
+	}
+}
+
+// TestClassifyCommitDistinctCommitsFetchSeparately pins the other half of
+// the memo contract: a different sha, or the same sha in a different repo,
+// is a different key and must still be fetched.
+func TestClassifyCommitDistinctCommitsFetchSeparately(t *testing.T) {
+	const shaA = "0123456789abcdef0123456789abcdef01234567"
+	const shaB = "89abcdef0123456789abcdef0123456789abcdef"
+	srv := newFakeCommitServer(t)
+	srv.payloads[shaA] = commitPayload{
+		files:   []map[string]string{{"filename": "apps/payments/a.yaml"}},
+		message: "A",
+	}
+	srv.payloads[shaB] = commitPayload{
+		files:   []map[string]string{{"filename": "apps/orders/b.yaml"}},
+		message: "B",
+	}
+	srv.payloads["other/thing/"+shaA] = commitPayload{
+		files:   []map[string]string{{"filename": "apps/payments/c.yaml"}},
+		message: "A elsewhere",
+	}
+	g := srv.client()
+	ctx := context.Background()
+	relA := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+shaA, "apps/payments", nil)
+	relB := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+shaB, "apps/orders", nil)
+	relX := classifyCommit(ctx, g, "https://github.com/other/thing",
+		"refs/heads/main@sha1:"+shaA, "apps/payments", nil)
+	if relA.State != commitRelevanceTouches || relB.State != commitRelevanceTouches || relX.State != commitRelevanceTouches {
+		t.Fatalf("states: A=%q B=%q X=%q (reasons %q %q %q)",
+			relA.State, relB.State, relX.State, relA.Reason, relB.Reason, relX.Reason)
+	}
+	if relA.CommitMessage != "A" || relB.CommitMessage != "B" || relX.CommitMessage != "A elsewhere" {
+		t.Fatalf("messages leaked across keys: %q %q %q", relA.CommitMessage, relB.CommitMessage, relX.CommitMessage)
+	}
+	if got := srv.calls.Load(); got != 3 {
+		t.Fatalf("distinct commits cost %d commit GETs, want 3", got)
+	}
+}
+
+// TestClassifyCommitFailureMemoized pins that a failed commit read is
+// memoized the way flushReads memoizes a refused pod list (#374): a sha
+// the API refuses is refused once per flush, and every later group sharing
+// it degrades to the same "unknown" reason without re-billing the limit.
+func TestClassifyCommitFailureMemoized(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	srv := newFakeCommitServer(t)
+	srv.status[sha] = http.StatusInternalServerError
+	g := srv.client()
+	ctx := context.Background()
+	first := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+sha, "apps/payments", nil)
+	second := classifyCommit(ctx, g, "https://github.com/owner/repo",
+		"refs/heads/main@sha1:"+sha, "apps/orders", nil)
+	if first.State != commitRelevanceUnknown || second.State != commitRelevanceUnknown {
+		t.Fatalf("states: %q %q, want both unknown", first.State, second.State)
+	}
+	if first.Reason == "" || second.Reason != first.Reason {
+		t.Fatalf("reasons must be set and identical: %q %q", first.Reason, second.Reason)
+	}
+	if got := srv.calls.Load(); got != 1 {
+		t.Fatalf("failed sha cost %d commit GETs, want 1", got)
+	}
+}
+
+// TestFetchCommitDetailConcurrentCallersShareOneRead pins the "at most one
+// read" claim under concurrency: with the first read held open in the
+// handler, callers arriving for the same key must wait on it rather than
+// each issuing their own GET, and every one of them must observe the
+// finished record, not a half-filled one.
+func TestFetchCommitDetailConcurrentCallersShareOneRead(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const callers = 8
+
+	var calls atomic.Int32
+	hold, releaseHold := context.WithCancel(context.Background())
+	firstRead := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		select {
+		case firstRead <- struct{}{}:
+		default:
+		}
+		// Keep the read in flight until the test has gathered every
+		// caller, so a missing in-flight record cannot hide behind a
+		// fast response.
+		<-hold.Done()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha":    sha,
+			"commit": map[string]any{"message": "roll payments forward\nbody"},
+			"files":  []map[string]string{{"filename": "apps/payments/deployment.yaml"}},
+		})
+	}))
+	t.Cleanup(releaseHold)
+
+	g := &gitHubClient{
+		token:  "t",
+		repo:   "owner/repo",
+		hc:     &http.Client{Timeout: 5 * time.Second},
+		apiURL: srv.URL,
+	}
+
+	var ready, done sync.WaitGroup
+	files := make([][]string, callers)
+	messages := make([]string, callers)
+	errs := make([]error, callers)
+	ready.Add(callers)
+	done.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer done.Done()
+			ready.Done()
+			files[i], messages[i], errs[i] = g.fetchCommitDetail(context.Background(), "owner/repo", sha)
+		}(i)
+	}
+	ready.Wait()
+	<-firstRead
+	// The waiters have no signal of their own; give them time to reach the
+	// memo while the first read is still open. Without in-flight sharing
+	// they each issue a GET here and the count below catches it.
+	time.Sleep(100 * time.Millisecond)
+	releaseHold()
+	done.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent callers cost %d commit GETs, want 1", got)
+	}
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("caller %d got error %v", i, errs[i])
+		}
+		if len(files[i]) != 1 || files[i][0] != "apps/payments/deployment.yaml" {
+			t.Fatalf("caller %d got files %v", i, files[i])
+		}
+		if messages[i] != "roll payments forward" {
+			t.Fatalf("caller %d got message %q", i, messages[i])
+		}
+	}
+}
+
+// TestFetchCommitDetailWaiterHonorsContextCancel pins that sharing one read
+// does not chain a caller's deadline to the leader's: a waiter whose own
+// context is canceled returns while the in-flight read is still open.
+func TestFetchCommitDetailWaiterHonorsContextCancel(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+
+	var calls atomic.Int32
+	hold, releaseHold := context.WithCancel(context.Background())
+	firstRead := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		select {
+		case firstRead <- struct{}{}:
+		default:
+		}
+		<-hold.Done()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha":    sha,
+			"commit": map[string]any{"message": "still rolling"},
+		})
+	}))
+	t.Cleanup(releaseHold)
+	g := &gitHubClient{
+		token:  "t",
+		repo:   "owner/repo",
+		hc:     &http.Client{Timeout: 5 * time.Second},
+		apiURL: srv.URL,
+	}
+
+	leader := make(chan struct{})
+	go func() {
+		defer close(leader)
+		_, _, _ = g.fetchCommitDetail(context.Background(), "owner/repo", sha)
+	}()
+	<-firstRead
+
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiter := make(chan error, 1)
+	go func() {
+		_, _, err := g.fetchCommitDetail(waiterCtx, "owner/repo", sha)
+		waiter <- err
+	}()
+	cancelWaiter()
+
+	select {
+	case err := <-waiter:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled waiter got %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled waiter stayed blocked on another caller's request")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("waiter issued its own read: %d commit GETs, want 1", got)
+	}
+	releaseHold()
+	<-leader
 }
 
 // TestCleanRepoPathTraversal drops leading "../" segments so a forged
