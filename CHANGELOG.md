@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.4.0](https://github.com/misospace/alert-triage/compare/v0.3.0...v0.4.0) (2026-11-28)
+
+
+### Features
+
+* **llm:** emit incident-scoped LiteLLM session ID ([#381](https://github.com/misospace/alert-triage/issues/381)) ([6146839](https://github.com/misospace/alert-triage/commit/6146839827480f4b24724d9fdf525142e5dad410))
+
+
+### Bug Fixes
+
+* **github-pr:** seed the daily-cap counter from this arm's PRs so restarts do not reset it ([#385](https://github.com/misospace/alert-triage/issues/385)) ([bb216ff](https://github.com/misospace/alert-triage/commit/bb216ff2f37a80d04425ed0ce3bb078c59e53109))
+* **grafana:** bound the incident window by every alert's own timestamps ([#363](https://github.com/misospace/alert-triage/issues/363)) ([#365](https://github.com/misospace/alert-triage/issues/365)) ([f77fd28](https://github.com/misospace/alert-triage/commit/f77fd2864070de269468768bbc926cf78e153796))
+* **grafana:** clamp a malformed alert's window so the range never inverts ([#364](https://github.com/misospace/alert-triage/issues/364)) ([#366](https://github.com/misospace/alert-triage/issues/366)) ([fe7156f](https://github.com/misospace/alert-triage/commit/fe7156f0b6cf9956b616bd1d4df98ec9213a09da))
+* **logs:** keep the group's log lines when one namespace's reply cannot be read (issue [#348](https://github.com/misospace/alert-triage/issues/348)) ([#360](https://github.com/misospace/alert-triage/issues/360)) ([d855dcb](https://github.com/misospace/alert-triage/commit/d855dcbd37483e1ceee54b0ed3d58f797d15cd02))
+* **logs:** state a no-record backend reply as a gap, not an empty scope (issue [#349](https://github.com/misospace/alert-triage/issues/349)) ([#359](https://github.com/misospace/alert-triage/issues/359)) ([c9f4244](https://github.com/misospace/alert-triage/commit/c9f4244772b61e4f1ea288713358dbe1df2fedfa))
+* **logs:** state an unqueried scope when a group names no namespace ([#373](https://github.com/misospace/alert-triage/issues/373)) ([#377](https://github.com/misospace/alert-triage/issues/377)) ([29f6a53](https://github.com/misospace/alert-triage/commit/29f6a536f9194f31ad58709e0b37077a9dfb47ad))
+* **logs:** surface group namespaces the pod-scoped query never covers (issue [#339](https://github.com/misospace/alert-triage/issues/339)) ([ad44072](https://github.com/misospace/alert-triage/commit/ad4407270564cc8110534dd9d4641f1ca862e066))
+* **metrics:** accept rules typed "alerting" so rule expressions resolve ([#353](https://github.com/misospace/alert-triage/issues/353)) ([#355](https://github.com/misospace/alert-triage/issues/355)) ([3cd7cc9](https://github.com/misospace/alert-triage/commit/3cd7cc978461223278b443b922e14cee80c120b8))
+* **metrics:** budget each source so one flood cannot evict fixed context or notes ([#344](https://github.com/misospace/alert-triage/issues/344)) ([#350](https://github.com/misospace/alert-triage/issues/350)) ([6382640](https://github.com/misospace/alert-triage/commit/63826403d63d5a9206f19c42a920d20a66dcaff4))
+* **metrics:** keep fixed context negatives ahead of rule notes on overflow (issue [#354](https://github.com/misospace/alert-triage/issues/354)) ([#356](https://github.com/misospace/alert-triage/issues/356)) ([eec2614](https://github.com/misospace/alert-triage/commit/eec261410c7e174b881fc1633c38207d9a9615a3))
+
+
+### Performance Improvements
+
+* **enrich:** read each namespace pod list and the node list once per flush ([#378](https://github.com/misospace/alert-triage/issues/378)) ([9e6f39e](https://github.com/misospace/alert-triage/commit/9e6f39e00db8348aaef8d425919de8a8ca261922)), closes [#374](https://github.com/misospace/alert-triage/issues/374)
+* **github:** fetch each commit detail once per flush when groups share a revision ([#375](https://github.com/misospace/alert-triage/issues/375)) ([#394](https://github.com/misospace/alert-triage/issues/394)) ([c99116b](https://github.com/misospace/alert-triage/commit/c99116bdd01289d8b64866e312ef733380d78e4a))
+
+
+### Chores
+
+* adopt AGPL-3.0-only ([#392](https://github.com/misospace/alert-triage/issues/392)) ([e9cdb4e](https://github.com/misospace/alert-triage/commit/e9cdb4e29f166413699ab8e45f9de4b1b782ca0e))
+* **container:** update image gcr.io/distroless/static-debian13 (25ac8f0 → aafe993) ([#358](https://github.com/misospace/alert-triage/issues/358)) ([70df6b0](https://github.com/misospace/alert-triage/commit/70df6b0658106947f032be069ce780b3c0b18cf1))
+* **container:** update image gcr.io/distroless/static-debian13 (aafe993 → 8ce6dd8) ([#380](https://github.com/misospace/alert-triage/issues/380)) ([e94c062](https://github.com/misospace/alert-triage/commit/e94c0622536d16a85fe61712242b66ecb32cf68a))
+* **grafana:** restore comments PR [#365](https://github.com/misospace/alert-triage/issues/365) paraphrased and drop duplicate zero-window test ([#371](https://github.com/misospace/alert-triage/issues/371)) ([bcf4c77](https://github.com/misospace/alert-triage/commit/bcf4c77dc56aea190c451410b50d060702573e99))
+
+
+### Documentation
+
+* require concise source comments ([#391](https://github.com/misospace/alert-triage/issues/391)) ([d93909d](https://github.com/misospace/alert-triage/commit/d93909d68961b49711d0746b5272dd2720511eb1))
+
 ## [0.3.0](https://github.com/misospace/alert-triage/compare/v0.2.0...v0.3.0) (2026-11-11)
 
 
