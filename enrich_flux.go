@@ -40,12 +40,15 @@ type fluxList struct {
 // State == "unknown" with a one-line Reason, leaving RepoPaths and the
 // rest of the evidence intact. The function does not touch RepoPaths
 // itself — it only reads the pods' annotations to find the Kustomizations
-// they belong to, so a future KustomizationTopology lookup (#134) can
-// populate ComponentPaths from the same Kustomization read.
+// they belong to.
 //
-// Component paths default to nil because the topology signal is not yet
-// available in this branch; once #134 lands, the caller can read the
-// spec.components out of the same Kustomization read and pass them in.
+// Groups commonly share a revision — a whole-app rollout or a cluster-wide
+// rollback reconciles many workloads at one commit. classifyCommit memoizes
+// the commit read per (repo, sha) on the per-flush client, so a shared
+// revision is fetched once per flush, not once per group (issue #375).
+//
+// Component paths come from the Kustomization's spec.components, read in
+// the same lookup as the revision.
 func (k *kube) resolveCommitRelevance(ctx context.Context, gh *gitHubClient, seenPods []podRef) []CommitRelevance {
 	if gh == nil {
 		return nil
